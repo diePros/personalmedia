@@ -34,6 +34,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
+            personal_media::harden::harden_process();
             let config = Config::from_env()?;
             config.require_public_url()?;
             println!("not implemented");

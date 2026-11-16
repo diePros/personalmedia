@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -21,11 +22,37 @@ const TESSERACT_TIMEOUT: Duration = Duration::from_secs(120);
 const OCR_LANG: &str = "deu+eng";
 const MIN_CHARS_PER_PAGE: usize = 50;
 
+/// Resource limits applied to every extraction subprocess (via `pre_exec`).
+/// Defence in depth against parser bugs, not a sandbox.
+#[derive(Clone, Copy, Debug)]
+pub struct ChildLimits {
+    /// `RLIMIT_AS`: address space.
+    pub as_bytes: u64,
+    /// `RLIMIT_FSIZE`: largest file the child may write.
+    pub fsize_bytes: u64,
+    /// `RLIMIT_NOFILE`: open file descriptors.
+    pub nofile: u64,
+    /// `RLIMIT_CPU` = the subprocess timeout in seconds plus this many.
+    pub extra_cpu_secs: u64,
+}
+
+impl Default for ChildLimits {
+    fn default() -> Self {
+        ChildLimits {
+            as_bytes: 2 << 30,
+            fsize_bytes: 1 << 30,
+            nofile: 64,
+            extra_cpu_secs: 5,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ExtractConfig {
     pub tmp_dir: PathBuf,
     pub max_pages: u32,
     pub job_timeout: Duration,
+    pub limits: ChildLimits,
 }
 
 impl ExtractConfig {
@@ -34,6 +61,7 @@ impl ExtractConfig {
             tmp_dir,
             max_pages: 200,
             job_timeout: Duration::from_secs(30 * 60),
+            limits: ChildLimits::default(),
         }
     }
 }
@@ -86,13 +114,55 @@ fn make_job_dir(tmp_dir: &Path) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+fn set_rlimit(resource: libc::c_int, value: u64) -> io::Result<()> {
+    let lim = libc::rlimit {
+        rlim_cur: value as libc::rlim_t,
+        rlim_max: value as libc::rlim_t,
+    };
+    // SAFETY: setrlimit is async-signal-safe and only reads `lim`.
+    if unsafe { libc::setrlimit(resource as _, &lim) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Runs a subprocess with a deadline, returning its stdout. The child is killed on timeout.
-fn run_cmd(program: &str, args: &[&std::ffi::OsStr], timeout: Duration) -> Result<Vec<u8>, String> {
-    let mut child = Command::new(program)
-        .args(args)
+///
+/// The child gets an empty environment except `PATH`, `OMP_THREAD_LIMIT=1`
+/// and `LANG`, runs in `cwd` (the job scratch dir) and is resource-limited
+/// per `limits`.
+pub fn run_cmd(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    timeout: Duration,
+    cwd: &Path,
+    limits: &ChildLimits,
+) -> Result<Vec<u8>, String> {
+    let limits = *limits;
+    let cpu_secs = timeout.as_secs() + limits.extra_cpu_secs;
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("OMP_THREAD_LIMIT", "1")
+        .env("LANG", "C.UTF-8")
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: the closure only calls setrlimit, which is async-signal-safe,
+    // and does not allocate.
+    unsafe {
+        cmd.pre_exec(move || {
+            set_rlimit(libc::RLIMIT_AS as libc::c_int, limits.as_bytes)?;
+            set_rlimit(libc::RLIMIT_CPU as libc::c_int, cpu_secs)?;
+            set_rlimit(libc::RLIMIT_FSIZE as libc::c_int, limits.fsize_bytes)?;
+            set_rlimit(libc::RLIMIT_NOFILE as libc::c_int, limits.nofile)?;
+            Ok(())
+        });
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("{program}: spawn failed: {e}"))?;
     let mut stdout = child.stdout.take().expect("stdout piped");
@@ -127,21 +197,31 @@ fn run_cmd(program: &str, args: &[&std::ffi::OsStr], timeout: Duration) -> Resul
     }
 }
 
-/// Per-job time budget shared by all subprocesses.
-struct Budget(Instant);
+/// Per-job time budget shared by all subprocesses, plus where and how they run.
+struct Budget<'a> {
+    deadline: Instant,
+    scratch: &'a Path,
+    limits: &'a ChildLimits,
+}
 
-impl Budget {
+impl Budget<'_> {
     fn run(
         &self,
         program: &str,
         args: &[&std::ffi::OsStr],
         limit: Duration,
     ) -> Result<Vec<u8>, String> {
-        let remaining = self.0.saturating_duration_since(Instant::now());
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err("job timed out".into());
         }
-        run_cmd(program, args, limit.min(remaining))
+        run_cmd(
+            program,
+            args,
+            limit.min(remaining),
+            self.scratch,
+            self.limits,
+        )
     }
 }
 
@@ -153,7 +233,7 @@ fn non_ws(s: &str) -> usize {
     s.chars().filter(|c| !c.is_whitespace()).count()
 }
 
-fn ocr_image(budget: &Budget, img: &Path) -> Result<String, String> {
+fn ocr_image(budget: &Budget<'_>, img: &Path) -> Result<String, String> {
     let out = budget.run(
         "tesseract",
         &[img.as_os_str(), os("-"), os("-l"), os(OCR_LANG)],
@@ -258,9 +338,13 @@ pub fn extract_text(
             page_count: None,
         });
     }
-    let budget = Budget(Instant::now() + cfg.job_timeout);
     let scratch = make_job_dir(&cfg.tmp_dir).map_err(|e| ExtractError::Failed(e.to_string()))?;
     let _guard = DirGuard(scratch.clone());
+    let budget = Budget {
+        deadline: Instant::now() + cfg.job_timeout,
+        scratch: &scratch,
+        limits: &cfg.limits,
+    };
     let res = if kind == 0 {
         extract_pdf(path, cfg, &budget, &scratch)
     } else {

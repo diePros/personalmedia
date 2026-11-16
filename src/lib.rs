@@ -3,6 +3,7 @@ pub mod config;
 pub mod crypto;
 pub mod documents;
 pub mod extract;
+pub mod harden;
 pub mod keyring;
 pub mod system_db;
 pub mod user_db;

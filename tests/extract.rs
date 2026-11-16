@@ -242,3 +242,85 @@ async fn pending_resumed_on_unlock() {
     wait_status(&u, &id, TextStatus::Done).await;
     let _ = &env.dir;
 }
+
+// ---- subprocess isolation (I5) ----
+
+use personal_media::extract::{ChildLimits, run_cmd};
+
+fn sh(script: &str, dir: &Path, limits: &ChildLimits) -> Result<Vec<u8>, String> {
+    run_cmd(
+        "sh",
+        &[std::ffi::OsStr::new("-c"), std::ffi::OsStr::new(script)],
+        Duration::from_secs(20),
+        dir,
+        limits,
+    )
+}
+
+#[test]
+fn child_limits_default_values() {
+    let l = ChildLimits::default();
+    assert_eq!(l.as_bytes, 2 << 30);
+    assert_eq!(l.fsize_bytes, 1 << 30);
+    assert_eq!(l.nofile, 64);
+    assert_eq!(l.extra_cpu_secs, 5);
+}
+
+#[test]
+fn child_gets_clean_env_and_scratch_cwd() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_cmd(
+        "env",
+        &[],
+        Duration::from_secs(10),
+        dir.path(),
+        &ChildLimits::default(),
+    )
+    .unwrap();
+    let mut lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+    lines.sort();
+    assert_eq!(
+        lines,
+        ["LANG=C.UTF-8", "OMP_THREAD_LIMIT=1", "PATH=/usr/bin:/bin"]
+    );
+    let out = run_cmd(
+        "pwd",
+        &[],
+        Duration::from_secs(10),
+        dir.path(),
+        &ChildLimits::default(),
+    )
+    .unwrap();
+    let cwd = std::str::from_utf8(&out).unwrap().trim();
+    assert_eq!(Path::new(cwd), dir.path().canonicalize().unwrap());
+}
+
+#[test]
+fn child_exceeding_fsize_limit_fails_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ChildLimits {
+        fsize_bytes: 1 << 20,
+        ..ChildLimits::default()
+    };
+    let err = sh("head -c 8000000 /dev/zero > big", dir.path(), &limits).unwrap_err();
+    assert!(err.contains("exited"), "{err}");
+    let len = std::fs::metadata(dir.path().join("big")).unwrap().len();
+    assert!(len <= 1 << 20, "wrote {len} bytes");
+    // Within the limit it works.
+    sh("head -c 1000 /dev/zero > ok", dir.path(), &limits).unwrap();
+}
+
+#[test]
+fn child_exceeding_address_space_limit_fails_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"x=$(head -c 300000000 /dev/zero | tr '\0' a); echo ${#x}"#;
+    // Unrestricted it succeeds ...
+    let out = sh(script, dir.path(), &ChildLimits::default()).unwrap();
+    assert_eq!(String::from_utf8_lossy(&out).trim(), "300000000");
+    // ... under a 128 MiB address-space limit it fails.
+    let limits = ChildLimits {
+        as_bytes: 128 << 20,
+        ..ChildLimits::default()
+    };
+    assert!(sh(script, dir.path(), &limits).is_err());
+}

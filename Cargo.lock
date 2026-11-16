@@ -1390,6 +1390,7 @@ dependencies = [
  "hex",
  "hkdf",
  "http-body-util",
+ "libc",
  "mime_guess",
  "rand",
  "rmcp",
