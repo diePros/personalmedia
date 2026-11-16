@@ -127,6 +127,7 @@ impl TestApp {
                     ("username", username),
                     ("password", PASSWORD),
                     ("password_confirm", PASSWORD),
+                    ("understand", "on"),
                 ],
                 &Client::anon(),
             )

@@ -526,3 +526,32 @@ fn deleted_tag_ids_are_never_reused() {
         a[1]
     );
 }
+
+#[test]
+fn hidden_from_lists_documents_whose_effective_level_is_off() {
+    let (_d, conn) = db();
+    for (id, created) in [("a1", 10), ("b1", 20), ("c1", 30), ("d1", 40)] {
+        insert_document(&conn, &nd(id, id, &format!("{id}.pdf"), &["t"], created)).unwrap();
+    }
+    set_document_access(&conn, "a1", Channel::Web, Some(Level::Off)).unwrap();
+    set_document_access(&conn, "b1", Channel::Web, Some(Level::Metadata)).unwrap();
+    set_document_access(&conn, "c1", Channel::Mcp, Some(Level::Off)).unwrap();
+    set_document_access(&conn, "d1", Channel::Web, Some(Level::Off)).unwrap();
+    let ids = |ch| -> Vec<String> {
+        hidden_from(&conn, ch)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect()
+    };
+    // Newest first; only an effective level of off counts.
+    assert_eq!(ids(Channel::Web), ["d1", "a1"]);
+    assert_eq!(ids(Channel::Mcp), ["c1"]);
+    assert_eq!(hidden_from(&conn, Channel::Web).unwrap()[0].tags, ["t"]);
+
+    // Documents without an override follow the channel default.
+    let mut defaults = get_access_defaults(&conn).unwrap();
+    defaults.0.insert(Channel::Web, Level::Off);
+    set_access_defaults(&conn, &defaults).unwrap();
+    assert_eq!(ids(Channel::Web), ["d1", "c1", "a1"]);
+}

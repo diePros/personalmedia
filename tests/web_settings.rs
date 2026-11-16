@@ -145,6 +145,7 @@ async fn change_password_flow() {
     assert_eq!(t.get("/settings", &other).await.status(), 303);
     let page = body_string(t.get("/settings?notice=password", &c).await).await;
     assert!(page.contains("Password changed."));
+    assert!(page.contains("Existing MCP tokens keep working; revoke them in Settings if needed."));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -243,7 +244,11 @@ async fn totp_enable_disable() {
 
     // Enabling without starting the setup fails.
     let early = t
-        .post_form("/settings/totp/enable", &[("code", "123456")], &c)
+        .post_form(
+            "/settings/totp/enable",
+            &[("code", "123456"), ("password", PASSWORD)],
+            &c,
+        )
         .await;
     assert_eq!(early.status(), 400);
 
@@ -257,11 +262,42 @@ async fn totp_enable_disable() {
         .get(&c.cookie)
         .unwrap()
         .pending_totp_secret
-        .unwrap();
+        .unwrap()
+        .to_string();
     assert!(html.contains(&secret));
 
+    // A right code with the wrong password is refused, the setup stays on screen.
+    let wrong_pw = t
+        .post_form(
+            "/settings/totp/enable",
+            &[
+                ("code", &totp_code(&secret)),
+                ("password", "not the password"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(wrong_pw.status(), 401);
+    let wrong_pw_html = body_string(wrong_pw).await;
+    assert!(wrong_pw_html.contains("The password is wrong"));
+    assert!(wrong_pw_html.contains(&secret));
+    assert!(!t.state.accounts.totp_enabled(&uid));
+    // No password at all is the same.
+    let none = t
+        .post_form(
+            "/settings/totp/enable",
+            &[("code", &totp_code(&secret))],
+            &c,
+        )
+        .await;
+    assert_eq!(none.status(), 401);
+
     let bad = t
-        .post_form("/settings/totp/enable", &[("code", "000000")], &c)
+        .post_form(
+            "/settings/totp/enable",
+            &[("code", "000000"), ("password", PASSWORD)],
+            &c,
+        )
         .await;
     assert_eq!(bad.status(), 401);
     let bad_html = body_string(bad).await;
@@ -272,7 +308,7 @@ async fn totp_enable_disable() {
     let ok = t
         .post_form(
             "/settings/totp/enable",
-            &[("code", &totp_code(&secret))],
+            &[("code", &totp_code(&secret)), ("password", PASSWORD)],
             &c,
         )
         .await;
@@ -333,6 +369,7 @@ async fn create_token_shows_once_and_lists_without_secret() {
                 ("access", "read_write"),
                 ("content", "full_text"),
                 ("tags[]", &tag_id.to_string()),
+                ("password", PASSWORD),
             ],
             &c,
         )
@@ -394,12 +431,18 @@ async fn create_token_validates_input_and_defaults_to_least_access() {
         vec![("name", "x"), ("tags[]", "999")],
         vec![("name", "x"), ("tags[]", "abc")],
     ] {
+        let mut fields = fields;
+        fields.push(("password", PASSWORD));
         let resp = t.post_form("/settings/tokens", &fields, &c).await;
         assert_eq!(resp.status(), 400, "{fields:?}");
     }
     let long = "n".repeat(101);
     let resp = t
-        .post_form("/settings/tokens", &[("name", &long)], &c)
+        .post_form(
+            "/settings/tokens",
+            &[("name", &long), ("password", PASSWORD)],
+            &c,
+        )
         .await;
     assert_eq!(resp.status(), 400);
     assert!(u.with_db(|conn| list_token_meta(conn).unwrap()).is_empty());
@@ -412,7 +455,11 @@ async fn create_token_validates_input_and_defaults_to_least_access() {
     );
 
     let ok = t
-        .post_form("/settings/tokens", &[("name", "plain")], &c)
+        .post_form(
+            "/settings/tokens",
+            &[("name", "plain"), ("password", PASSWORD)],
+            &c,
+        )
         .await;
     assert_eq!(ok.status(), 200);
     let metas = u.with_db(|conn| list_token_meta(conn).unwrap());
@@ -432,8 +479,12 @@ async fn revoke_token_removes_rows() {
     let c = t.session_for("alice");
     let bob = t.session_for("bob");
     let u = unlocked(&t, &c);
-    t.post_form("/settings/tokens", &[("name", "one")], &c)
-        .await;
+    t.post_form(
+        "/settings/tokens",
+        &[("name", "one"), ("password", PASSWORD)],
+        &c,
+    )
+    .await;
     let id = u.with_db(|conn| list_token_meta(conn).unwrap())[0]
         .id
         .clone();
@@ -468,7 +519,11 @@ async fn token_rows_have_no_plaintext_name_in_system_db() {
     let t = TestApp::new();
     let c = t.session_for("alice");
     let resp = t
-        .post_form("/settings/tokens", &[("name", "HermesMedical")], &c)
+        .post_form(
+            "/settings/tokens",
+            &[("name", "HermesMedical"), ("password", PASSWORD)],
+            &c,
+        )
         .await;
     assert_eq!(resp.status(), 200);
     let uid = t.state.sessions.get(&c.cookie).unwrap().user_id;
@@ -480,6 +535,11 @@ async fn token_rows_have_no_plaintext_name_in_system_db() {
             assert!(!bytes.windows(13).any(|w| w == b"HermesMedical"));
         }
     }
+}
+
+async fn export(t: &TestApp, c: &Client) -> axum::response::Response {
+    t.post_form("/settings/export", &[("password", PASSWORD)], c)
+        .await
 }
 
 fn entry_names(zip: &zip::ZipArchive<std::io::Cursor<Vec<u8>>>) -> Vec<String> {
@@ -516,7 +576,7 @@ async fn export_zip_contains_all_files_and_metadata() {
     unlocked(&t, &c)
         .with_db(|conn| set_document_access(conn, &b, Channel::Web, Some(Level::Off)).unwrap());
 
-    let resp = t.get("/settings/export.zip", &c).await;
+    let resp = export(&t, &c).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(header_str(&resp, "content-type"), "application/zip");
     assert_eq!(
@@ -579,7 +639,7 @@ async fn export_zip_entry_names_are_safe_and_unique() {
     let c = t.session_for("alice");
     upload_named(&t, &c, "../a.pdf", PDF, "first").await;
     upload_named(&t, &c, "a.pdf", b"%PDF-1.4 second", "second").await;
-    let resp = t.get("/settings/export.zip", &c).await;
+    let resp = export(&t, &c).await;
     let zip = read_zip(body_bytes(resp).await);
     let names = entry_names(&zip);
     assert_eq!(names, ["files/a (2).pdf", "files/a.pdf", "metadata.json"]);
@@ -594,14 +654,103 @@ async fn export_zip_entry_names_are_safe_and_unique() {
 async fn export_of_empty_vault_is_a_valid_zip() {
     let t = TestApp::new();
     let c = t.session_for("alice");
-    let zip = read_zip(body_bytes(t.get("/settings/export.zip", &c).await).await);
+    let zip = read_zip(body_bytes(export(&t, &c).await).await);
     assert_eq!(entry_names(&zip), ["metadata.json"]);
-    assert_eq!(
-        t.get("/settings/export.zip", &Client::anon())
-            .await
-            .status(),
-        303
+    assert_eq!(export(&t, &Client::anon()).await.status(), 303);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_requires_the_account_password() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    upload_named(&t, &c, "a.pdf", PDF, "Doc").await;
+    // The old GET download is gone.
+    assert_eq!(t.get("/settings/export.zip", &c).await.status(), 404);
+    for fields in [
+        vec![("password", "not the password")],
+        vec![("password", "")],
+    ] {
+        let resp = t.post_form("/settings/export", &fields, &c).await;
+        assert_eq!(resp.status(), 401, "{fields:?}");
+        assert_ne!(
+            resp.headers().get("content-type").map(|v| v.as_bytes()),
+            Some(&b"application/zip"[..])
+        );
+    }
+    let ok = t
+        .post_form("/settings/export", &[("password", PASSWORD)], &c)
+        .await;
+    assert_eq!(ok.status(), 200);
+    assert_eq!(header_str(&ok, "content-type"), "application/zip");
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(html.contains("Exports include every document, also those hidden from the web."));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_and_totp_enrolment_require_the_password() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    for fields in [
+        vec![("name", "x"), ("password", "wrong wrong wrong")],
+        vec![("name", "x")],
+    ] {
+        let resp = t.post_form("/settings/tokens", &fields, &c).await;
+        assert_eq!(resp.status(), 401, "{fields:?}");
+        assert!(body_string(resp).await.contains("The password is wrong"));
+    }
+    assert!(u.with_db(|conn| list_token_meta(conn).unwrap()).is_empty());
+    assert!(
+        t.state
+            .sys
+            .token_ids_for_user(&u.user_id)
+            .unwrap()
+            .is_empty()
     );
+    let ok = t
+        .post_form(
+            "/settings/tokens",
+            &[("name", "x"), ("password", PASSWORD)],
+            &c,
+        )
+        .await;
+    assert_eq!(ok.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_form_lists_only_tags_on_documents() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    t.post_multipart(
+        "/api/upload",
+        &[("tags", "visible-tag")],
+        &[("file", "a.pdf", "application/pdf", PDF)],
+        &c,
+    )
+    .await;
+    let hidden = t
+        .post_multipart(
+            "/api/upload",
+            &[("tags", "hidden-only")],
+            &[("file", "b.pdf", "application/pdf", b"%PDF-1.4 b")],
+            &c,
+        )
+        .await;
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(hidden).await).unwrap();
+    let hidden_id = v["id"].as_str().unwrap().to_owned();
+    u.with_db(|conn| {
+        set_document_access(conn, &hidden_id, Channel::Web, Some(Level::Off)).unwrap();
+        // An orphan tag: it exists but no document carries it.
+        let orphan = personal_media::user_db::tag_ids(conn, &["orphan".to_owned()]).unwrap();
+        assert_eq!(orphan.len(), 1);
+    });
+    let html = body_string(t.get("/settings", &c).await).await;
+    let form = &html[html.find("New token").unwrap()..];
+    assert!(form.contains("visible-tag"));
+    assert!(!form.contains("orphan"), "orphan tags are not offered");
+    // Tags on web-hidden documents are still attached to a document.
+    assert!(form.contains("hidden-only"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

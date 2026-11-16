@@ -19,7 +19,7 @@ pub use access::{
 };
 pub use documents::{
     Document, ListFilter, NewDocument, SearchHit, TextStatus, delete_document, find_by_sha256,
-    find_by_sha256_visible, get_document, insert_document, list_documents, list_tags,
+    find_by_sha256_visible, get_document, hidden_from, insert_document, list_documents, list_tags,
     list_tags_visible, pending_document_ids, search, set_text, tag_ids, update_document_meta,
 };
 pub use meta::{

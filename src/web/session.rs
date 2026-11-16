@@ -42,6 +42,7 @@ use axum::response::{IntoResponse, Response};
 use data_encoding::BASE64URL_NOPAD;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use zeroize::Zeroizing;
 
 use super::{AppState, is_htmx};
 use crate::crypto::{RecoveryKey, fill_random};
@@ -74,7 +75,7 @@ pub struct Session {
     /// only [`PendingUser`] routes are reachable.
     pub must_confirm_recovery: Option<RecoveryKey>,
     /// TOTP secret (base32) between "begin setup" and "confirm code".
-    pub pending_totp_secret: Option<String>,
+    pub pending_totp_secret: Option<Zeroizing<String>>,
 }
 
 impl Session {
@@ -178,7 +179,7 @@ impl SessionStore {
         drop(old);
     }
 
-    pub fn set_pending_totp(&self, id: &str, secret: Option<String>) {
+    pub fn set_pending_totp(&self, id: &str, secret: Option<Zeroizing<String>>) {
         if let Some(s) = self.lock().get_mut(id) {
             s.pending_totp_secret = secret;
         }

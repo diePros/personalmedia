@@ -3,7 +3,7 @@
 {% block content %}
 <section class="auth">
 <h1>Create your account</h1>
-<p class="notice">Your files are encrypted with a key only your password or recovery key can unlock. The server operator cannot read them at rest. While you are logged in, the server holds your key in memory to search and OCR your documents. If you lose both your password and your recovery key, your documents are gone for good.</p>
+<p class="notice">Your files are encrypted with a key only your password or recovery key can unlock. The server operator cannot read them at rest. While you are logged in, the server holds your key in memory; someone who controls the server could read your documents during that time. If you lose both your password and your recovery key, your documents are gone for good.</p>
 {% if let Some(error) = error -%}
 <p class="error" role="alert">{{ error }}</p>
 {% endif -%}
@@ -21,6 +21,10 @@
 <div>
 <label for="password_confirm">Confirm password</label>
 <input type="password" id="password_confirm" name="password_confirm" autocomplete="new-password" minlength="10" required>
+</div>
+<div class="check">
+<input type="checkbox" id="understand" name="understand" required>
+<label for="understand">I understand that my documents are lost if I lose both my password and my recovery key</label>
 </div>
 <button type="submit">Create account</button>
 </form>

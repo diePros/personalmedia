@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use super::docs::{channel_body, format_date};
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
@@ -31,10 +32,11 @@ use crate::accounts::{AccountError, TotpSetup};
 use crate::export;
 use crate::tokens::{create_token, revoke_token};
 use crate::user_db::{
-    Access, Channel, Content, Level, TokenScope, document_overrides, effective_level,
-    get_access_defaults, get_token_meta, list_tags, list_token_meta, set_access_defaults,
+    Access, Channel, Content, Level, TokenScope, document_overrides, get_access_defaults,
+    get_token_meta, hidden_from, list_tags, list_tags_visible, list_token_meta,
+    set_access_defaults,
 };
-use crate::user_db::{AccessDefaults, TokenMeta};
+use crate::user_db::{AccessDefaults, ListFilter, TokenMeta};
 
 const CHUNK: usize = 64 * 1024;
 const TOKEN_NAME_MAX_CHARS: usize = 100;
@@ -50,7 +52,7 @@ pub fn routes() -> Router<AppState> {
         .route("/settings/totp/disable", post(totp_disable))
         .route("/settings/tokens", post(create_token_route))
         .route("/settings/tokens/{id}/revoke", post(revoke_token_route))
-        .route("/settings/export.zip", get(export_zip))
+        .route("/settings/export", post(export_zip))
 }
 
 fn now() -> i64 {
@@ -79,6 +81,18 @@ fn limiter_keys(
 ) -> [String; 2] {
     let ip = client_ip(peer, headers, state.cfg.trusted_proxy);
     [ip_key(ip), user_key(&session.username)]
+}
+
+/// Checks the account password under the KDF semaphore. `Err` is a ready
+/// response (503 or 500); `Ok(Err(..))` is the verification result.
+async fn check_password(
+    state: &AppState,
+    session: &Session,
+    password: String,
+) -> Result<Result<(), AccountError>, Response> {
+    let accounts = state.accounts.clone();
+    let user_id = session.user_id.clone();
+    kdf_blocking(state, move || accounts.verify_password(&user_id, &password)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +167,9 @@ struct TokenCreatedPage {
 fn notice_text(key: &str) -> Option<&'static str> {
     Some(match key {
         "access" => "Access defaults saved.",
-        "password" => "Password changed. Other sessions were logged out.",
+        "password" => {
+            "Password changed. Other sessions were logged out. Existing MCP tokens keep working; revoke them in Settings if needed."
+        }
         "totp_on" => "Two-factor authentication is on.",
         "totp_off" => "Two-factor authentication is off.",
         "token_revoked" => "Token revoked.",
@@ -200,14 +216,10 @@ fn override_value(over: Option<Level>) -> &'static str {
 
 fn hidden_rows(
     c: &rusqlite::Connection,
-    docs: &[crate::user_db::Document],
     defaults: &AccessDefaults,
 ) -> anyhow::Result<Vec<HiddenRow>> {
     let mut rows = Vec::new();
-    for d in docs.iter().rev() {
-        if effective_level(c, &d.id, Channel::Web, Level::Full)? != Level::Off {
-            continue;
-        }
+    for d in hidden_from(c, Channel::Web)? {
         let over = document_overrides(c, &d.id)?;
         rows.push(HiddenRow {
             id: d.id.clone(),
@@ -278,15 +290,16 @@ async fn settings_response(
     let (u, accounts) = (session.unlocked.clone(), state.accounts.clone());
     let user_id = session.user_id.clone();
     let loaded = blocking(move || -> anyhow::Result<_> {
-        let docs = export::all_documents(&u)?;
         let (defaults, hidden, tokens, tags) = u.with_db(|c| -> anyhow::Result<_> {
             let defaults = get_access_defaults(c)?;
-            let hidden = hidden_rows(c, &docs, &defaults)?;
-            let tags = list_tags(c)?;
+            let hidden = hidden_rows(c, &defaults)?;
+            let all_tags = list_tags(c)?;
             let tokens: Vec<TokenRow> = list_token_meta(c)?
                 .iter()
-                .map(|t| token_row(t, &tags))
+                .map(|t| token_row(t, &all_tags))
                 .collect();
+            // The token form offers tags attached to at least one document.
+            let tags = list_tags_visible(c, &ListFilter::default())?;
             Ok((defaults, hidden, tokens, tags))
         })?;
         Ok((
@@ -549,6 +562,13 @@ struct CodeForm {
     code: String,
 }
 
+#[derive(Deserialize)]
+struct TotpEnableForm {
+    code: String,
+    #[serde(default)]
+    password: String,
+}
+
 async fn totp_begin(
     State(state): State<AppState>,
     CurrentUser(session): CurrentUser,
@@ -568,7 +588,7 @@ async fn totp_begin(
         Ok(Some(setup)) => {
             state
                 .sessions
-                .set_pending_totp(&session.id, Some(setup.secret_b32.clone()));
+                .set_pending_totp(&session.id, Some(Zeroizing::new(setup.secret_b32.clone())));
             settings_response(
                 &state,
                 &session,
@@ -593,18 +613,41 @@ async fn totp_begin(
     }
 }
 
+/// Re-renders the settings page with the pending TOTP setup still on screen
+/// (the same secret, so the authenticator stays valid) and an error.
+async fn totp_setup_error(
+    state: &AppState,
+    session: &Session,
+    secret: Zeroizing<String>,
+    status: StatusCode,
+    msg: &str,
+) -> Response {
+    let accounts = state.accounts.clone();
+    let username = session.username.clone();
+    let setup = blocking(move || accounts.totp_resume(&username, &secret).ok())
+        .await
+        .ok()
+        .flatten();
+    settings_response(
+        state,
+        session,
+        status,
+        View {
+            error: Some(msg.to_owned()),
+            setup,
+            ..View::default()
+        },
+    )
+    .await
+}
+
 async fn totp_enable(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     CurrentUser(session): CurrentUser,
-    CsrfForm(form): CsrfForm<CodeForm>,
+    CsrfForm(form): CsrfForm<TotpEnableForm>,
 ) -> Response {
-    let keys = limiter_keys(&state, peer, &headers, &session);
-    let attempt = match state.limiter.begin(&keys) {
-        Ok(a) => a,
-        Err(retry) => return too_many_requests(retry),
-    };
     let Some(secret) = session.pending_totp_secret.clone() else {
         return failure(
             &state,
@@ -614,6 +657,27 @@ async fn totp_enable(
         )
         .await;
     };
+    let keys = limiter_keys(&state, peer, &headers, &session);
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
+    match check_password(&state, &session, form.password).await {
+        Err(r) => return r,
+        Ok(Err(AccountError::InvalidCredentials)) => {
+            attempt.failure();
+            return totp_setup_error(
+                &state,
+                &session,
+                secret,
+                StatusCode::UNAUTHORIZED,
+                "The password is wrong",
+            )
+            .await;
+        }
+        Ok(Err(e)) => return internal(e),
+        Ok(Ok(())) => {}
+    }
     let accounts = state.accounts.clone();
     let (u, code, secret2) = (session.unlocked.clone(), form.code, secret.clone());
     let result = match blocking(move || accounts.totp_enable(&u, &secret2, &code)).await {
@@ -628,22 +692,12 @@ async fn totp_enable(
         }
         Err(AccountError::InvalidCredentials) => {
             attempt.failure();
-            // Keep the same secret on screen so the authenticator stays valid.
-            let accounts = state.accounts.clone();
-            let username = session.username.clone();
-            let setup = blocking(move || accounts.totp_resume(&username, &secret).ok())
-                .await
-                .ok()
-                .flatten();
-            settings_response(
+            totp_setup_error(
                 &state,
                 &session,
+                secret,
                 StatusCode::UNAUTHORIZED,
-                View {
-                    error: Some("That code is not correct. Try the next one.".to_owned()),
-                    setup,
-                    ..View::default()
-                },
+                "That code is not correct. Try the next one.",
             )
             .await
         }
@@ -716,6 +770,8 @@ fn field<'a>(pairs: &'a Pairs, name: &str) -> Option<&'a str> {
 
 async fn create_token_route(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     CurrentUser(session): CurrentUser,
     CsrfForm(pairs): CsrfForm<Pairs>,
 ) -> Response {
@@ -745,9 +801,33 @@ async fn create_token_route(
         }
     }
 
+    // A token outlives logout and password changes, so minting one asks for
+    // the password again.
+    let keys = limiter_keys(&state, peer, &headers, &session);
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
+    let password = field(&pairs, "password").unwrap_or_default().to_owned();
+    match check_password(&state, &session, password).await {
+        Err(r) => return r,
+        Ok(Err(AccountError::InvalidCredentials)) => {
+            attempt.failure();
+            return failure(
+                &state,
+                &session,
+                StatusCode::UNAUTHORIZED,
+                "The password is wrong",
+            )
+            .await;
+        }
+        Ok(Err(e)) => return internal(e),
+        Ok(Ok(())) => attempt.success(),
+    }
+
     let (u, sys, display_name) = (session.unlocked.clone(), state.sys.clone(), name.clone());
     let created = blocking(move || -> anyhow::Result<Option<String>> {
-        let known = u.with_db(list_tags)?;
+        let known = u.with_db(|c| list_tags_visible(c, &ListFilter::default()))?;
         if tag_ids.iter().any(|id| !known.iter().any(|(k, _)| k == id)) {
             return Ok(None);
         }
@@ -841,9 +921,42 @@ impl Write for ChannelWriter {
     }
 }
 
-/// Streams the export ZIP. If it fails half way the body ends with an error,
-/// so the browser reports a failed download instead of keeping a cut-off file.
-async fn export_zip(State(state): State<AppState>, CurrentUser(session): CurrentUser) -> Response {
+#[derive(Deserialize)]
+struct ExportForm {
+    password: String,
+}
+
+/// Streams the export ZIP after the account password was checked (the export
+/// holds every document, also those hidden from the web). If it fails half
+/// way the body ends with an error, so the browser reports a failed download
+/// instead of keeping a cut-off file.
+async fn export_zip(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    CurrentUser(session): CurrentUser,
+    CsrfForm(form): CsrfForm<ExportForm>,
+) -> Response {
+    let keys = limiter_keys(&state, peer, &headers, &session);
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
+    match check_password(&state, &session, form.password).await {
+        Err(r) => return r,
+        Ok(Err(AccountError::InvalidCredentials)) => {
+            attempt.failure();
+            return failure(
+                &state,
+                &session,
+                StatusCode::UNAUTHORIZED,
+                "The password is wrong",
+            )
+            .await;
+        }
+        Ok(Err(e)) => return internal(e),
+        Ok(Ok(())) => attempt.success(),
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(4);
     let (docs, u): (Arc<_>, Arc<_>) = (state.docs.clone(), session.unlocked.clone());
     tokio::task::spawn_blocking(move || {

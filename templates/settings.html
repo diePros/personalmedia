@@ -93,6 +93,10 @@
 <option value="full_text">Full text</option>
 </select>
 </div>
+<div>
+<label for="token-password">Your password</label>
+<input type="password" id="token-password" name="password" autocomplete="current-password" required>
+</div>
 {% if !tags.is_empty() -%}
 <fieldset>
 <legend>Only these tags (none selected means all documents)</legend>
@@ -129,6 +133,10 @@
 <div>
 <label for="totp-enable-code">Code</label>
 <input type="text" id="totp-enable-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+</div>
+<div>
+<label for="totp-enable-password">Your password</label>
+<input type="password" id="totp-enable-password" name="password" autocomplete="current-password" required>
 </div>
 <button type="submit">Turn on</button>
 </form>
@@ -177,7 +185,14 @@
 
 <section id="export">
 <h2>Export</h2>
-<p class="muted">Download all your documents, including those hidden from the web, as one ZIP file with a metadata.json.</p>
-<p><a class="button" href="/settings/export.zip">Download ZIP</a></p>
+<p class="muted">Download all your documents as one ZIP file with a metadata.json. Exports include every document, also those hidden from the web.</p>
+<form method="post" action="/settings/export" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="export-password">Your password</label>
+<input type="password" id="export-password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit">Download ZIP</button>
+</form>
 </section>
 {% endblock %}

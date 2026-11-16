@@ -223,9 +223,10 @@ async fn session_store_removal_and_pending_totp() {
     let bob = app.session_for("bob");
     let user_id = app.state.sessions.get(&a1.cookie).unwrap().user_id;
 
-    app.state
-        .sessions
-        .set_pending_totp(&a1.cookie, Some("SECRET".into()));
+    app.state.sessions.set_pending_totp(
+        &a1.cookie,
+        Some(zeroize::Zeroizing::new("SECRET".to_owned())),
+    );
     let pending = |app: &TestApp| {
         app.state
             .sessions
@@ -233,7 +234,7 @@ async fn session_store_removal_and_pending_totp() {
             .unwrap()
             .pending_totp_secret
     };
-    assert_eq!(pending(&app).as_deref(), Some("SECRET"));
+    assert_eq!(pending(&app).as_ref().map(|s| s.as_str()), Some("SECRET"));
     app.state.sessions.set_pending_totp(&a1.cookie, None);
     assert!(pending(&app).is_none());
 

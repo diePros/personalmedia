@@ -128,6 +128,9 @@ struct SignupForm {
     username: String,
     password: String,
     password_confirm: String,
+    /// "on" when the "I understand my documents are lost" box is ticked.
+    #[serde(default)]
+    understand: String,
 }
 
 fn invite_hash(token: &str) -> Option<[u8; 32]> {
@@ -173,6 +176,14 @@ async fn signup(
         return rerender(
             StatusCode::BAD_REQUEST,
             "The passwords do not match",
+            token,
+            form.username,
+        );
+    }
+    if form.understand != "on" {
+        return rerender(
+            StatusCode::BAD_REQUEST,
+            "Confirm that you understand your documents are lost without your password and recovery key",
             token,
             form.username,
         );

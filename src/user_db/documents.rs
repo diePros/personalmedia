@@ -5,7 +5,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 
-use super::access::{AccessFilter, Level, get_access_defaults};
+use super::access::{AccessFilter, Channel, Level, get_access_defaults};
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -365,6 +365,26 @@ pub fn list_documents(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>
     let mut stmt = conn.prepare(&sql)?;
     let mut docs: Vec<Document> = stmt
         .query_map(params_from_iter(params), map_doc)?
+        .collect::<rusqlite::Result<_>>()?;
+    for d in &mut docs {
+        load_tags(conn, d)?;
+    }
+    Ok(docs)
+}
+
+/// Documents whose effective level on `channel` is off (the raw level, or the
+/// channel default when there is no override), newest first. One query.
+pub fn hidden_from(conn: &Connection, channel: Channel) -> Result<Vec<Document>> {
+    let default = get_access_defaults(conn)?.level(channel);
+    let sql = format!(
+        "SELECT {DOC_COLS} FROM documents d \
+         LEFT JOIN document_access a ON a.document_id = d.id AND a.channel = ?1 \
+         WHERE COALESCE(a.level, ?2) = 'off' \
+         ORDER BY d.created_at DESC, d.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut docs: Vec<Document> = stmt
+        .query_map(params![channel.as_str(), default.as_str()], map_doc)?
         .collect::<rusqlite::Result<_>>()?;
     for d in &mut docs {
         load_tags(conn, d)?;

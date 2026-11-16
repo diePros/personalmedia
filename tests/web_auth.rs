@@ -25,6 +25,7 @@ async fn signup(app: &TestApp, username: &str) -> (Client, String) {
                 ("username", username),
                 ("password", PASSWORD),
                 ("password_confirm", PASSWORD),
+                ("understand", "on"),
             ],
             &Client::anon(),
         )
@@ -51,6 +52,8 @@ async fn full_signup_flow_requires_recovery_confirmation() {
     let path = invite_path(&app);
     let page = body_string(app.get(&path, &Client::anon()).await).await;
     assert!(page.contains("The server operator cannot read them at rest."));
+    assert!(page.contains("someone who controls the server could read your documents"));
+    assert!(page.contains(r#"name="understand" required"#));
     assert!(page.contains(r#"autocomplete="new-password""#));
 
     let (client, html) = signup(&app, "alice").await;
@@ -86,7 +89,12 @@ async fn signup_form_errors() {
             let r = app
                 .post_form(
                     &path,
-                    &[("username", u), ("password", p), ("password_confirm", c)],
+                    &[
+                        ("username", u),
+                        ("password", p),
+                        ("password_confirm", c),
+                        ("understand", "on"),
+                    ],
                     &Client::anon(),
                 )
                 .await;
@@ -105,6 +113,20 @@ async fn signup_form_errors() {
     let (s, b) = post("fresh", PASSWORD, "different password").await;
     assert_eq!(s, 400);
     assert!(b.contains("do not match"));
+    // The acknowledgement box is required.
+    let r = app
+        .post_form(
+            &path,
+            &[
+                ("username", "fresh"),
+                ("password", PASSWORD),
+                ("password_confirm", PASSWORD),
+            ],
+            &Client::anon(),
+        )
+        .await;
+    assert_eq!(r.status(), 400);
+    assert!(body_string(r).await.contains("you understand"));
     // The invite survived all of that.
     let (s, _) = post("fresh", PASSWORD, PASSWORD).await;
     assert_eq!(s, 303);
@@ -299,6 +321,7 @@ async fn invite_token_invalid_404() {
                 ("username", "alice"),
                 ("password", PASSWORD),
                 ("password_confirm", PASSWORD),
+                ("understand", "on"),
             ],
             &anon,
         )
@@ -311,6 +334,7 @@ async fn invite_token_invalid_404() {
         ("username", "alice"),
         ("password", PASSWORD),
         ("password_confirm", PASSWORD),
+        ("understand", "on"),
     ];
     assert_eq!(app.post_form(&path, &fields, &anon).await.status(), 303);
     assert_eq!(app.get(&path, &anon).await.status(), 404);
