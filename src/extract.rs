@@ -278,33 +278,30 @@ fn extract_pdf(
         });
     }
 
+    // OCR one page at a time so the scratch dir never holds more than one PNG.
+    // A page failure or an exhausted job budget stops the loop and keeps the
+    // text gathered so far.
     let prefix = scratch.join("p");
-    budget.run(
-        "pdftoppm",
-        &[
-            os("-r"),
-            os("300"),
-            os("-l"),
-            os(&max),
-            os("-png"),
-            path.as_os_str(),
-            prefix.as_os_str(),
-        ],
-        PDFTOPPM_TIMEOUT,
-    )?;
-    let mut images: Vec<PathBuf> = fs::read_dir(scratch)
-        .map_err(|e| format!("read scratch: {e}"))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "png"))
-        .collect();
-    images.sort();
     let mut ocr = String::new();
-    for img in &images {
-        let page = ocr_image(budget, img)?;
-        if !ocr.is_empty() {
-            ocr.push('\n');
+    let mut pages_done = 0u32;
+    let mut first_error: Option<String> = None;
+    for n in 1..=pages {
+        match ocr_page(budget, path, scratch, &prefix, n) {
+            Ok(page) => {
+                if !ocr.is_empty() {
+                    ocr.push('\n');
+                }
+                ocr.push_str(&page);
+                pages_done += 1;
+            }
+            Err(e) => {
+                first_error = Some(e);
+                break;
+            }
         }
-        ocr.push_str(&page);
+    }
+    if pages_done == 0 && non_ws(&text) == 0 {
+        return Err(first_error.unwrap_or_else(|| "no pages to OCR".into()));
     }
     // Keep whichever source produced more text.
     let text = if non_ws(&ocr) > non_ws(&text) {
@@ -316,6 +313,54 @@ fn extract_pdf(
         text,
         page_count: Some(pages),
     })
+}
+
+/// Renders page `n` to a PNG in `scratch`, OCRs it and deletes the PNG again
+/// (also on failure).
+fn ocr_page(
+    budget: &Budget<'_>,
+    pdf: &Path,
+    scratch: &Path,
+    prefix: &Path,
+    n: u32,
+) -> Result<String, String> {
+    debug_assert!(png_files(scratch)?.is_empty(), "stale page PNG in scratch");
+    let page = n.to_string();
+    let rendered = budget.run(
+        "pdftoppm",
+        &[
+            os("-r"),
+            os("300"),
+            os("-f"),
+            os(&page),
+            os("-l"),
+            os(&page),
+            os("-png"),
+            pdf.as_os_str(),
+            prefix.as_os_str(),
+        ],
+        PDFTOPPM_TIMEOUT,
+    );
+    let result = rendered.and_then(|_| {
+        let imgs = png_files(scratch)?;
+        let [img] = imgs.as_slice() else {
+            return Err(format!("pdftoppm produced {} images", imgs.len()));
+        };
+        ocr_image(budget, img)
+    });
+    // Whatever happened, no PNG outlives its page.
+    for img in png_files(scratch).unwrap_or_default() {
+        let _ = fs::remove_file(img);
+    }
+    result
+}
+
+fn png_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(fs::read_dir(dir)
+        .map_err(|e| format!("read scratch: {e}"))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "png"))
+        .collect())
 }
 
 /// Extracts text from the file at `path` (blocking).

@@ -324,3 +324,113 @@ fn child_exceeding_address_space_limit_fails_cleanly() {
     };
     assert!(sh(script, dir.path(), &limits).is_err());
 }
+
+// ---- page-by-page OCR (I6) ----
+
+/// A 3-page scanned PDF built from the one-page fixture with pdfunite.
+fn scanned3(dir: &Path) -> PathBuf {
+    let one = fixture("scanned.pdf");
+    let out = dir.join("scanned3.pdf");
+    let st = std::process::Command::new("pdfunite")
+        .arg(&one)
+        .arg(&one)
+        .arg(&one)
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    out
+}
+
+fn count_pngs(dir: &Path) -> usize {
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                n += count_pngs(&p);
+            } else if p.extension().is_some_and(|x| x == "png") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn scratch_never_holds_more_than_one_page_png() {
+    if !have_tesseract() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let pdf = scanned3(work.path());
+    let tmp = tempfile::tempdir().unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let watcher = {
+        let (stop, max_seen, dir) = (stop.clone(), max_seen.clone(), tmp.path().to_path_buf());
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering::SeqCst;
+            while !stop.load(SeqCst) {
+                max_seen.fetch_max(count_pngs(&dir), SeqCst);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    let r = extract_text(&pdf, "application/pdf", &cfg(tmp.path())).unwrap();
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    watcher.join().unwrap();
+    assert_eq!(r.page_count, Some(3));
+    assert_eq!(
+        r.text.matches("Versicherungsnummer").count(),
+        3,
+        "{:?}",
+        r.text
+    );
+    assert!(max_seen.load(std::sync::atomic::Ordering::SeqCst) <= 1);
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn ocr_keeps_partial_text_on_budget_exhaustion() {
+    if !have_tesseract() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let pdf = scanned3(work.path());
+    let tmp = tempfile::tempdir().unwrap();
+    // Time a full run, then give the job about half of that.
+    let t = Instant::now();
+    extract_text(&pdf, "application/pdf", &cfg(tmp.path())).unwrap();
+    let full = t.elapsed();
+    let mut c = cfg(tmp.path());
+    c.job_timeout = full / 2;
+    let r = extract_text(&pdf, "application/pdf", &c).unwrap();
+    let pages_done = r.text.matches("Versicherungsnummer").count();
+    assert!(
+        (1..3).contains(&pages_done),
+        "expected partial text, got {pages_done} pages: {:?}",
+        r.text
+    );
+    assert_eq!(r.page_count, Some(3));
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn ocr_fails_when_no_page_succeeds_and_no_text_layer() {
+    if !have_tesseract() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let pdf = scanned3(work.path());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = cfg(tmp.path());
+    // Enough for pdfinfo + pdftotext, nowhere near enough for a page.
+    c.job_timeout = Duration::from_millis(150);
+    match extract_text(&pdf, "application/pdf", &c) {
+        Err(ExtractError::Failed(_)) => {}
+        Ok(r) => assert!(r.text.trim().is_empty()),
+        Err(e) => panic!("{e:?}"),
+    }
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
