@@ -351,14 +351,22 @@ impl SystemDb {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Delete the open invite whose hash starts with `hash_prefix` (lowercase hex).
+    /// Delete the open invite whose hash starts with `hash_prefix`. The prefix
+    /// must be exactly 8 lowercase hex characters, and the invite is deleted
+    /// only when exactly one open invite matches it.
     pub fn revoke_invite(&self, hash_prefix: &str) -> anyhow::Result<()> {
-        if hash_prefix.is_empty() || !hash_prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if hash_prefix.len() != 8
+            || !hash_prefix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
             return Ok(());
         }
         self.lock().execute(
-            "DELETE FROM invites WHERE used_at IS NULL AND lower(hex(token_hash)) LIKE ?1 || '%'",
-            [hash_prefix.to_lowercase()],
+            "DELETE FROM invites WHERE used_at IS NULL AND substr(lower(hex(token_hash)),1,8) = ?1 \
+             AND (SELECT count(*) FROM invites WHERE used_at IS NULL \
+                  AND substr(lower(hex(token_hash)),1,8) = ?1) = 1",
+            [hash_prefix],
         )?;
         Ok(())
     }
@@ -527,6 +535,25 @@ mod tests {
         assert_eq!(open[0].2, 100);
         db.revoke_invite("abababab").unwrap();
         assert_eq!(db.consume_invite(h, 1).unwrap_err(), InviteError::NotFound);
+    }
+
+    #[test]
+    fn revoke_invite_requires_exact_unique_prefix() {
+        let (_d, db) = db();
+        let mut h1 = [0xab; 32];
+        let mut h2 = [0xab; 32];
+        h2[31] = 0x01; // same first 8 hex chars as h1
+        db.create_invite(h1, Role::User, 0, 100).unwrap();
+        db.create_invite(h2, Role::User, 0, 100).unwrap();
+        h1[0] = 0xcd;
+        db.create_invite(h1, Role::User, 0, 100).unwrap();
+        // Short, uppercase, non-hex and ambiguous prefixes delete nothing.
+        for p in ["", "ab", "abababa", "ABABABAB", "abababag", "abababab"] {
+            db.revoke_invite(p).unwrap();
+        }
+        assert_eq!(db.list_open_invites(1).unwrap().len(), 3);
+        db.revoke_invite("cdababab").unwrap();
+        assert_eq!(db.list_open_invites(1).unwrap().len(), 2);
     }
 
     #[test]

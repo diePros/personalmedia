@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Admin · Personal Media{% endblock %}
+{% block content %}
+<h1>Admin</h1>
+{% if let Some(notice) = notice -%}
+<p class="notice" role="status">{{ notice }}</p>
+{% endif -%}
+{% if let Some(error) = error -%}
+<p class="error" role="alert">{{ error }}</p>
+{% endif -%}
+<p class="muted">Admins cannot read users' documents or reset their passwords. A user who loses both password and recovery key loses their documents.</p>
+
+<section id="invites">
+<h2>Invites</h2>
+{% if let Some(url) = new_invite -%}
+<div class="notice" role="status">
+<p>Invite created. Copy this link now; it is shown only once.</p>
+<p><code>{{ url }}</code></p>
+</div>
+{% endif -%}
+{% if invites.is_empty() -%}
+<p class="muted">No open invites.</p>
+{% else -%}
+<ul class="doc-list">
+{% for inv in invites -%}
+<li class="doc-item">
+<span class="doc-title"><code>{{ inv.prefix }}</code></span>
+<span class="muted doc-meta">{{ inv.role }} · expires {{ inv.expires }}</span>
+<form method="post" action="/admin/invites/{{ inv.prefix }}/revoke">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit" class="danger">Revoke</button>
+</form>
+</li>
+{% endfor -%}
+</ul>
+{% endif -%}
+<h3>New invite</h3>
+<form method="post" action="/admin/invites" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="invite-role">Role</label>
+<select id="invite-role" name="role">
+<option value="user" selected>user</option>
+<option value="admin">admin</option>
+</select>
+</div>
+<button type="submit">Create invite</button>
+</form>
+</section>
+
+<section id="users">
+<h2>Users</h2>
+<ul class="doc-list">
+{% for u in users -%}
+<li class="doc-item">
+<span class="doc-title">{{ u.username }}</span>
+<span class="muted doc-meta">{{ u.role }} · created {{ u.created }} · {{ u.storage }}{% if u.disabled %} · disabled{% endif %}</span>
+{% if u.is_self -%}
+<span class="muted doc-meta">This is you.</span>
+{% else -%}
+{% if u.disabled -%}
+<form method="post" action="/admin/users/{{ u.id }}/enable">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit">Enable</button>
+</form>
+{% else -%}
+<form method="post" action="/admin/users/{{ u.id }}/disable">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit">Disable</button>
+</form>
+{% endif -%}
+<form method="post" action="/admin/users/{{ u.id }}/delete">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<label for="confirm-{{ u.id }}" class="muted">Type "{{ u.username }}" to delete the account and all its documents</label>
+<input type="text" id="confirm-{{ u.id }}" name="confirm_username" autocomplete="off" required>
+<button type="submit" class="danger">Delete</button>
+</form>
+{% endif -%}
+</li>
+{% endfor -%}
+</ul>
+</section>
+{% endblock %}

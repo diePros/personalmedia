@@ -10,6 +10,7 @@
 //!   [`session::CsrfForm`].
 //! * Redirect after a POST with [`redirect`], which also works for htmx.
 
+pub mod admin;
 pub mod auth;
 pub mod docs;
 pub mod ratelimit;
@@ -116,6 +117,7 @@ fn spawn_sweeper(sessions: &Arc<SessionStore>, limiter: &Arc<RateLimiter>) {
 /// limit need the peer address.
 pub fn build_app(state: AppState) -> Router {
     Router::new()
+        .merge(admin::routes())
         .merge(auth::routes())
         .merge(docs::routes(&state))
         .merge(settings::routes())
