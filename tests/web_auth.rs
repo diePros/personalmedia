@@ -499,14 +499,28 @@ async fn same_origin_login_post_ok() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn bearer_request_without_cookie_skips_origin_check() {
+async fn bearer_request_without_cookie_skips_origin_check_only_on_bearer_paths() {
     let app = TestApp::new();
     let hdrs = [
         ("authorization", "Bearer pm_x"),
         ("origin", "https://evil.example"),
     ];
-    // Passes the guard (the login handler then answers, not a 403).
-    assert_ne!(login_with(&app, &hdrs).await.status(), 403);
+    // A bearer header does not exempt a path that takes no bearer auth.
+    assert_eq!(login_with(&app, &hdrs).await.status(), 403);
+    // `/mcp` and `/api/upload` accept bearer tokens and pass the guard.
+    {
+        use axum::body::Body;
+        use axum::http::{Method, header};
+        for path in ["/mcp", "/api/upload"] {
+            let req = common::builder(Method::POST, path, &common::Client::anon())
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("authorization", "Bearer pm_x")
+                .header("origin", "https://evil.example")
+                .body(Body::from("{}"))
+                .unwrap();
+            assert_eq!(app.request(req).await.status(), 401, "{path}");
+        }
+    }
     // With a session cookie the exemption does not apply.
     // The body is a valid urlencoded form with the right CSRF field, so only
     // the origin guard can answer 403.

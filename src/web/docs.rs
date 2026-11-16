@@ -11,6 +11,7 @@
 
 #![allow(clippy::result_large_err)] // helpers return a ready `Response` as the error
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -18,7 +19,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use askama::Template;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, State};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query, Request,
+    State,
+};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -26,7 +30,7 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 
-use super::session::{CsrfForm, CurrentUser, NoFields};
+use super::session::{AuthRejection, CsrfForm, CurrentUser, NoFields};
 use super::{AppState, CspOverride, Page, is_htmx, render};
 use crate::documents::{DocError, OnDuplicate, UploadMeta};
 use crate::keyring::Unlocked;
@@ -263,10 +267,36 @@ async fn read_text_field(
 
 async fn upload(
     State(state): State<AppState>,
-    CurrentUser(session): CurrentUser,
-    multipart: Multipart,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
 ) -> Response {
-    handle_upload(&state, session.unlocked.clone(), multipart).await
+    let (mut parts, body) = req.into_parts();
+    let user = CurrentUser::from_request_parts(&mut parts, &state).await;
+    let has_bearer = parts.headers.contains_key(header::AUTHORIZATION);
+    // Auth runs before the body is looked at.
+    let (unlocked, principal) = match user {
+        Ok(CurrentUser(session)) => (session.unlocked.clone(), None),
+        Err(AuthRejection::Login { .. }) if has_bearer => {
+            match crate::mcp::bearer_principal(&state, peer, &parts.headers).await {
+                Ok(p) => (p.unlocked.clone(), Some(p)),
+                Err(resp) => return resp,
+            }
+        }
+        Err(e) => return e.into_response(),
+    };
+    let multipart = match Multipart::from_request(Request::from_parts(parts, body), &state).await {
+        Ok(m) => m,
+        Err(e) => return e.into_response(),
+    };
+    match principal {
+        None => handle_upload(&state, unlocked, multipart).await,
+        Some(p) => {
+            if !p.can_write() {
+                return json_error(StatusCode::FORBIDDEN, "token is read-only");
+            }
+            handle_upload_inner(&state, unlocked, multipart, Some(&p)).await
+        }
+    }
 }
 
 /// Stores one uploaded file for `unlocked` and answers with the JSON
@@ -280,7 +310,18 @@ async fn upload(
 pub async fn handle_upload(
     state: &AppState,
     unlocked: Arc<Unlocked>,
+    multipart: Multipart,
+) -> Response {
+    handle_upload_inner(state, unlocked, multipart, None).await
+}
+
+/// With a `principal` (bearer upload): duplicate detection only sees what the
+/// token may see, and the tags are forced to include an allowed one.
+async fn handle_upload_inner(
+    state: &AppState,
+    unlocked: Arc<Unlocked>,
     mut multipart: Multipart,
+    principal: Option<&crate::tokens::Principal>,
 ) -> Response {
     let (mut title, mut tags, mut date, mut on_dup) = (None, Vec::new(), None, OnDuplicate::Skip);
     loop {
@@ -291,6 +332,19 @@ pub async fn handle_upload(
         };
         let name = field.name().unwrap_or_default().to_owned();
         if name == "file" {
+            let tags = match principal {
+                Some(p) => {
+                    let (p, given) = (p.clone(), std::mem::take(&mut tags));
+                    match db(&unlocked, move |c| p.tags_for_upload(c, given)).await {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(_)) => {
+                            return json_error(StatusCode::FORBIDDEN, "token has no usable tag");
+                        }
+                        Err(r) => return r,
+                    }
+                }
+                None => std::mem::take(&mut tags),
+            };
             let meta = UploadMeta {
                 filename: field
                     .file_name()
@@ -299,10 +353,10 @@ pub async fn handle_upload(
                     .to_owned(),
                 mime: field.content_type().map(str::to_owned),
                 title: title.take(),
-                tags: std::mem::take(&mut tags),
+                tags,
                 document_date: date.take(),
             };
-            let filter = web_filter();
+            let filter = principal.map_or_else(web_filter, |p| p.filter());
             // A body error while the file streams in means the client went away.
             let client_gone = Arc::new(AtomicBool::new(false));
             let flag = client_gone.clone();

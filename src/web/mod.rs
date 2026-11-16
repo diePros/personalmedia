@@ -89,7 +89,8 @@ impl AppState {
 
         let sessions = Arc::new(SessionStore::new(cfg.session_idle, cfg.session_max));
         let limiter = Arc::new(RateLimiter::new());
-        spawn_sweeper(&sessions, &limiter);
+        let tokens = Arc::new(TokenCache::default());
+        spawn_sweeper(&sessions, &limiter, &tokens);
 
         Ok(AppState {
             cfg: Arc::new(cfg),
@@ -99,24 +100,35 @@ impl AppState {
             docs,
             sessions,
             limiter,
-            tokens: Arc::new(TokenCache::default()),
+            tokens,
             kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
         })
     }
 }
 
 /// Background task that ends when the state it sweeps is dropped.
-fn spawn_sweeper(sessions: &Arc<SessionStore>, limiter: &Arc<RateLimiter>) {
-    let (sessions, limiter) = (Arc::downgrade(sessions), Arc::downgrade(limiter));
+fn spawn_sweeper(
+    sessions: &Arc<SessionStore>,
+    limiter: &Arc<RateLimiter>,
+    tokens: &Arc<TokenCache>,
+) {
+    let (sessions, limiter, tokens) = (
+        Arc::downgrade(sessions),
+        Arc::downgrade(limiter),
+        Arc::downgrade(tokens),
+    );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             tick.tick().await;
-            let (Some(sessions), Some(limiter)) = (sessions.upgrade(), limiter.upgrade()) else {
+            let (Some(sessions), Some(limiter), Some(tokens)) =
+                (sessions.upgrade(), limiter.upgrade(), tokens.upgrade())
+            else {
                 break;
             };
             sessions.sweep();
             limiter.sweep();
+            tokens.sweep();
         }
     });
 }
@@ -130,6 +142,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(docs::routes(&state))
         .merge(settings::routes())
+        .merge(crate::mcp::routes(&state))
         .route("/static/{file}", get(static_file))
         // Layers run bottom-up: access log, then headers, then session + CSRF.
         .layer(middleware::from_fn_with_state(
@@ -308,6 +321,10 @@ pub fn render(template: &impl Template) -> Response {
 /// an OS share target). Empty for now; Task 18 adds `/share`.
 const ORIGIN_EXEMPT_PATHS: &[&str] = &[];
 
+/// The only paths that accept bearer-token authentication. A bearer header on
+/// any other path gets no origin-guard exemption.
+const BEARER_PATHS: &[&str] = &["/mcp", "/api/upload"];
+
 /// `scheme://host[:port]` of a URL, lowercased, without the scheme's default
 /// port (`https` 443, `http` 80), so `https://h:443` and `https://h` compare equal.
 fn origin_of(url: &str) -> String {
@@ -336,7 +353,8 @@ fn origin_of(url: &str) -> String {
 /// Only without it, an `Origin` header must equal the origin of
 /// `cfg.public_url` (`null` is rejected). Requests with neither header pass
 /// (curl, old browsers). Bearer-authenticated
-/// requests without a session cookie and [`ORIGIN_EXEMPT_PATHS`] are exempt.
+/// requests without a session cookie to [`BEARER_PATHS`], and
+/// [`ORIGIN_EXEMPT_PATHS`], are exempt.
 async fn origin_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
         return next.run(req).await;
@@ -346,7 +364,9 @@ async fn origin_guard(State(state): State<AppState>, req: Request, next: Next) -
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer "));
-    if (bearer && session::session_id(headers).is_none())
+    if (bearer
+        && session::session_id(headers).is_none()
+        && BEARER_PATHS.contains(&req.uri().path()))
         || ORIGIN_EXEMPT_PATHS.contains(&req.uri().path())
     {
         return next.run(req).await;

@@ -112,6 +112,19 @@ async fn invite_create_and_revoke() {
     assert_eq!(t.state.sys.list_open_invites(now()).unwrap().len(), 1);
 }
 
+async fn mcp_ping(t: &TestApp, token: &str) -> u16 {
+    use axum::body::Body;
+    use axum::http::{Method, Request, header};
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+        .unwrap();
+    t.request(req).await.status().as_u16()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn disable_and_delete_kill_sessions_and_tokens() {
     let t = TestApp::new();
@@ -124,9 +137,10 @@ async fn disable_and_delete_kill_sessions_and_tokens() {
         content: Content::FullText,
         tags: None,
     };
-    create_token(&t.state.sys, &unlocked, "hermes", scope, now()).unwrap();
+    let token = create_token(&t.state.sys, &unlocked, "hermes", scope, now()).unwrap();
     let token_id = t.state.sys.token_ids_for_user(&id).unwrap().remove(0);
     assert_eq!(t.get("/documents", &b).await.status(), 200);
+    assert_eq!(mcp_ping(&t, &token).await, 200);
 
     let resp = t
         .post_form(&format!("/admin/users/{id}/disable"), &[], &admin)
@@ -136,13 +150,14 @@ async fn disable_and_delete_kill_sessions_and_tokens() {
     let resp = t.get("/documents", &b).await;
     assert_eq!(resp.status(), 303);
     assert_eq!(header_str(&resp, "location"), "/login");
-    // Task 14 extends this to a `/mcp` request with B's token returning 401.
+    assert_eq!(mcp_ping(&t, &token).await, 401);
 
     let resp = t
         .post_form(&format!("/admin/users/{id}/enable"), &[], &admin)
         .await;
     assert_eq!(resp.status(), 303);
     assert!(!t.state.sys.user_by_id(&id).unwrap().unwrap().disabled);
+    assert_eq!(mcp_ping(&t, &token).await, 200);
 
     let b2 = t.session_for("carol");
     let cid = user_id(&t, "carol");
@@ -158,8 +173,8 @@ async fn disable_and_delete_kill_sessions_and_tokens() {
     assert_eq!(resp.status(), 303);
     assert!(!dir.exists());
     assert!(t.state.sys.user_by_id(&id).unwrap().is_none());
-    // Task 14 extends this to a `/mcp` 401; for now the token row is gone.
     assert!(t.state.sys.token(&token_id).unwrap().is_none());
+    assert_eq!(mcp_ping(&t, &token).await, 401);
     assert_eq!(
         header_str(&t.get("/documents", &b).await, "location"),
         "/login"

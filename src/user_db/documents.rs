@@ -17,7 +17,7 @@ pub enum TextStatus {
 }
 
 impl TextStatus {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             TextStatus::Pending => "pending",
             TextStatus::Done => "done",
@@ -464,6 +464,17 @@ pub fn set_text(
     reindex(&tx, id)?;
     tx.commit()?;
     Ok(())
+}
+
+/// The extracted text of a document, if extraction produced any.
+pub fn get_document_text(conn: &Connection, id: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT content FROM document_text WHERE document_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 pub fn pending_document_ids(conn: &Connection) -> Result<Vec<String>> {
