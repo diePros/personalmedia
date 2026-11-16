@@ -12,7 +12,7 @@ use anyhow::Context;
 use rusqlite::Connection;
 
 use crate::crypto::{Key32, aad, unwrap_key};
-use crate::user_db::open_user_db;
+use crate::user_db::{open_user_db, open_user_db_readonly};
 
 /// Notified once for every fresh unlock (not when an existing unlock is reused).
 pub trait OnUnlock: Send + Sync {
@@ -35,9 +35,35 @@ impl Unlocked {
         umk: Key32,
         index_key_wrapped: &[u8],
     ) -> anyhow::Result<Unlocked> {
+        Self::open_with(data_dir, user_id, umk, index_key_wrapped, false)
+    }
+
+    /// Like [`Unlocked::open`], but the index DB is opened read-only (no
+    /// migrations, nothing written), so a read-only backup works.
+    pub fn open_readonly(
+        data_dir: &Path,
+        user_id: &str,
+        umk: Key32,
+        index_key_wrapped: &[u8],
+    ) -> anyhow::Result<Unlocked> {
+        Self::open_with(data_dir, user_id, umk, index_key_wrapped, true)
+    }
+
+    fn open_with(
+        data_dir: &Path,
+        user_id: &str,
+        umk: Key32,
+        index_key_wrapped: &[u8],
+        readonly: bool,
+    ) -> anyhow::Result<Unlocked> {
         let index_key = unwrap_key(&umk, index_key_wrapped, aad::index_key(user_id).as_bytes())
             .context("unwrapping index key")?;
-        let conn = open_user_db(&index_db_path(data_dir, user_id), &index_key)?;
+        let path = index_db_path(data_dir, user_id);
+        let conn = if readonly {
+            open_user_db_readonly(&path, &index_key)?
+        } else {
+            open_user_db(&path, &index_key)?
+        };
         Ok(Unlocked {
             user_id: user_id.to_string(),
             umk,

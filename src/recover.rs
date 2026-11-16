@@ -130,12 +130,12 @@ pub fn recover(
     if !sys_path.exists() {
         return Err(anyhow::anyhow!("no {SYSTEM_DB_FILE} in {}", data_dir.display()).into());
     }
-    let sys = SystemDb::open(&sys_path)?;
+    let sys = SystemDb::open_readonly(&sys_path)?;
     let row = sys
         .user_by_name(&username.to_lowercase())?
         .ok_or(RecoverError::CouldNotUnlock)?;
     let umk = unwrap_umk(&row, secret).ok_or(RecoverError::CouldNotUnlock)?;
-    let u = Unlocked::open(data_dir, &row.id, umk, &row.index_key_wrapped)?;
+    let u = Unlocked::open_readonly(data_dir, &row.id, umk, &row.index_key_wrapped)?;
 
     let all = all_documents(&u)?;
     let plan = plan_entries(&all);

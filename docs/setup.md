@@ -46,7 +46,7 @@ mkdir -p /DATA/AppData/personal-media
 chown -R 10001:10001 /DATA/AppData/personal-media   # the container runs as uid/gid 10001
 ```
 
-Everything the app stores there is encrypted per user. You can back it up as-is (see section 7).
+Everything the app stores there is encrypted per user. You can back it up as-is (see section 8).
 
 ## 3. Deploy the app
 
@@ -78,10 +78,29 @@ services:
 
 Edit `PM_PUBLIC_URL` to your real `https://<node>.<tailnet>.ts.net` address first; the app refuses to start without it. The root filesystem is read-only; only `/data` and the tmpfs are writable.
 
+Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` is unverified):
+
+- **With git on the board:**
+
+  ```bash
+  git clone <this repo> && cd personalmedia
+  docker compose up -d --build      # first Rust build on the N150 takes a while; it also runs the tests
+  ```
+
+- **Without git:** build the image on your dev machine and transfer it, then start it from the compose file without `--build`:
+
+  ```bash
+  # on the dev machine
+  docker build -t personal-media .
+  docker save personal-media | ssh zima docker load
+  # on the ZimaBoard, with docker-compose.yml copied over
+  docker compose up -d
+  ```
+
+Then check it answers locally:
+
 ```bash
-git clone <this repo> && cd personalmedia
-docker compose up -d --build      # first Rust build on the N150 takes a while; it also runs the tests
-curl -sI http://127.0.0.1:8080/login   # should answer 200 locally
+curl -sI http://127.0.0.1:8080/login   # should answer 200
 ```
 
 The image installs German and English OCR data (`tesseract-ocr-deu`, `tesseract-ocr-eng`) and has a built-in health check (`personal-media healthcheck`).
@@ -194,13 +213,19 @@ Treat the token like a key: it can unlock your documents within its scope. If it
 
 ## 8. Backups
 
-`/DATA/AppData/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle. Test a restore with the recovery CLI. It prompts for the account password (add `--recovery-key` to be asked for the recovery key instead) and refuses a non-empty `--out` directory:
+`/DATA/AppData/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle.
+
+Test a restore with the recovery CLI against a **copy of the backup**, in a one-off container. It does not need the app to be running, it never writes to the backup (both databases are opened read-only, so a read-only mount or restic mount works), and it has no network:
 
 ```bash
-docker exec -it personal-media personal-media recover --data /data --user <name> --out /data/tmp/restore-test
+mkdir -p /path/to/restore && chown 10001:10001 /path/to/restore
+docker run --rm -it --network none \
+  -v /path/to/backup:/data:ro \
+  -v /path/to/restore:/out \
+  personal-media recover --data /data --user NAME --out /out/NAME
 ```
 
-`/data/tmp` is RAM-backed, so restore a small account or point `--out` at a path you can write to. Anything you decrypt there is plaintext; delete it afterwards.
+It prompts for the account password (add `--recovery-key` to be asked for the recovery key instead) and refuses a non-empty `--out` directory. The output directory must be on the host, **outside** `/data` and outside the backed-up pool: what lands there is plaintext, so delete it when you are done, and never write it under `/data` (it would be encrypted-pool storage that the next backup picks up).
 
 ## Verify after deploy
 

@@ -96,3 +96,70 @@ pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
     }
     Ok(conn)
 }
+
+/// Open `path` read-only and run `init` (key pragma, probe query). A WAL-mode
+/// database in a directory that cannot be written cannot be opened the normal
+/// way (SQLite wants to create `-shm`), so on failure the open is retried with
+/// `immutable=1`, which takes no locks and writes nothing. Only safe for a
+/// backup nobody is writing to; a non-empty `-wal` file would be ignored, so
+/// that case is reported on stderr.
+pub(crate) fn open_readonly_with(
+    path: &Path,
+    init: impl Fn(&Connection) -> Result<()>,
+) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let plain = Connection::open_with_flags(path, flags)
+        .map_err(anyhow::Error::from)
+        .and_then(|c| init(&c).map(|()| c));
+    match plain {
+        Ok(c) => Ok(c),
+        Err(_) => {
+            let mut uri = String::from("file:");
+            for b in std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()) {
+                match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' | b'~' => {
+                        uri.push(*b as char)
+                    }
+                    _ => uri.push_str(&format!("%{b:02X}")),
+                }
+            }
+            uri.push_str("?immutable=1");
+            let mut wal = path.as_os_str().to_owned();
+            wal.push("-wal");
+            if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+                eprintln!(
+                    "warning: {} has a non-empty -wal file that cannot be applied read-only; \
+                     recent changes may be missing",
+                    path.display()
+                );
+            }
+            let c = Connection::open_with_flags(&uri, flags)
+                .with_context(|| format!("opening {} read-only", path.display()))?;
+            init(&c)?;
+            Ok(c)
+        }
+    }
+}
+
+/// Open the user's SQLCipher index read-only: no migrations, no writes of any
+/// kind, temp structures in memory. For offline recovery from a backup.
+pub fn open_user_db_readonly(path: &Path, key: &Key32) -> Result<Connection> {
+    open_readonly_with(path, |conn| {
+        let key_hex = Zeroizing::new(hex::encode(key.as_bytes()));
+        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", key_hex.as_str()));
+        conn.execute_batch(&pragma)?;
+        conn.execute_batch("PRAGMA temp_store = MEMORY;")?;
+        // Reading the schema fails here if the key is wrong.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("user db: wrong key or not a database")?;
+        // user_version alone can succeed on some failures; touch the schema.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .context("user db: wrong key or not a database")?;
+        anyhow::ensure!(version >= 1, "user db: not initialised");
+        Ok(())
+    })
+}

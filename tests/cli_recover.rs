@@ -150,3 +150,57 @@ async fn refuses_non_empty_out_dir() {
     recover(dir.path(), &out, PASSWORD, &[]).success();
     check_output(&out);
 }
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let dest = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_tree(&e.path(), &dest);
+        } else {
+            std::fs::copy(e.path(), &dest).unwrap();
+        }
+    }
+}
+
+fn set_tree_mode(path: &Path, dir_mode: u32, file_mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    if meta.is_dir() {
+        // Make the directory traversable before touching what is inside.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for e in std::fs::read_dir(path).unwrap() {
+            set_tree_mode(&e.unwrap().path(), dir_mode, file_mode);
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(dir_mode)).unwrap();
+    } else {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(file_mode)).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_works_on_read_only_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    setup(&data).await;
+    let backup = dir.path().join("backup");
+    copy_tree(&data, &backup);
+    set_tree_mode(&backup, 0o555, 0o444);
+    let out = dir.path().join("out");
+    let before = std::fs::read(backup.join(SYSTEM_DB_FILE)).unwrap();
+    let a = recover(&backup, &out, PASSWORD, &[]);
+    // Restore write access so the tempdir can be removed, then assert.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        a.success();
+        check_output(&out);
+        assert_eq!(std::fs::read(backup.join(SYSTEM_DB_FILE)).unwrap(), before);
+        // Nothing (journal, shm, wal) was added to the backup.
+        assert_eq!(std::fs::read_dir(&backup).unwrap().count(), 2);
+    }));
+    set_tree_mode(&backup, 0o755, 0o644);
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}

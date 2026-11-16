@@ -162,6 +162,22 @@ impl SystemDb {
         })
     }
 
+    /// Open an existing system database read-only (no schema creation, no WAL
+    /// pragma, nothing written). For offline recovery from a backup.
+    pub fn open_readonly(path: &Path) -> anyhow::Result<SystemDb> {
+        let conn = crate::user_db::open_readonly_with(path, |c| {
+            let version: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            c.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                r.get::<_, i64>(0)
+            })?;
+            anyhow::ensure!(version >= 1, "not a system database");
+            Ok(())
+        })?;
+        Ok(SystemDb {
+            conn: Mutex::new(conn),
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         // A poisoned lock only means another thread panicked; the connection is still valid.
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
