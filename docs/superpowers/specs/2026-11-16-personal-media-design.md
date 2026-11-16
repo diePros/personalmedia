@@ -287,7 +287,7 @@ Meaning-based search over each user's documents, exposed through MCP so that **e
 - **The model** must be:
   - small, multilingual (German + English), CPU-only, run in-process (e.g. ONNX via `ort`/`fastembed`, or `candle`)
   - at most ~150 MB quantized
-  - stored in `/data/models` (not user data) or baked into the image
+  - stored in `/data/models` (not user data), downloaded once from a pinned URL and verified against a pinned SHA-256; not baked into the image (GHCR free private storage is 500 MB) *(Ruling U, 2026-11-17)*
   - loaded lazily and unloaded after 10 minutes idle, so the idle footprint stays small; memory while embedding of a few hundred MB is acceptable
   - Exact model choice is left to the builder, after a short benchmark on the N150.
 - **Indexing:**
