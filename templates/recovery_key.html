@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Recovery key · Personal Media{% endblock %}
+{% block content %}
+<section class="auth">
+<h1>Your recovery key</h1>
+<p>This is the only time it is shown. Store it in a password manager or write it on paper and keep it somewhere safe. It is the only way back into your documents if you forget your password.</p>
+<p><code class="recovery-key">{{ key }}</code></p>
+{% if let Some(error) = error -%}
+<p class="error" role="alert">{{ error }}</p>
+{% endif -%}
+<form method="post" action="/recovery-key" class="stack">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="check">
+<input type="checkbox" id="saved" name="saved" value="on" required>
+<label for="saved">I have saved my recovery key</label>
+</div>
+<button type="submit">Continue</button>
+</form>
+</section>
+{% endblock %}

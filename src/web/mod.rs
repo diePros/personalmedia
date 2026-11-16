@@ -10,6 +10,7 @@
 //!   [`session::CsrfForm`].
 //! * Redirect after a POST with [`redirect`], which also works for htmx.
 
+pub mod auth;
 pub mod ratelimit;
 pub mod session;
 
@@ -19,11 +20,11 @@ use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{MatchedPath, Path, Request, State};
+use axum::extract::{MatchedPath, Path, Request};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 
 use crate::accounts::Accounts;
 use crate::config::Config;
@@ -33,9 +34,7 @@ use crate::keyring::Keyring;
 use crate::system_db::{SYSTEM_DB_FILE, SystemDb};
 use crate::tokens::TokenCache;
 use ratelimit::RateLimiter;
-use session::{
-    CsrfForm, CurrentUser, NoFields, PendingUser, Session, SessionStore, clear_session_cookie,
-};
+use session::{CurrentUser, Session, SessionStore};
 
 /// Default `Content-Security-Policy`. A route may replace it with [`CspOverride`].
 pub const CSP: &str = "default-src 'self'; img-src 'self' data:; object-src 'self'; \
@@ -115,8 +114,7 @@ fn spawn_sweeper(sessions: &Arc<SessionStore>, limiter: &Arc<RateLimiter>) {
 /// limit need the peer address.
 pub fn build_app(state: AppState) -> Router {
     Router::new()
-        .route("/login", get(login_stub))
-        .route("/logout", post(logout))
+        .merge(auth::routes())
         .route("/documents", get(documents_stub))
         .route("/static/{file}", get(static_file))
         // Layers run bottom-up: access log, then headers, then session + CSRF.
@@ -328,18 +326,6 @@ async fn static_file(Path(file): Path<String>) -> Response {
 // ---------------------------------------------------------------------------
 
 #[derive(Template)]
-#[template(path = "login.html")]
-struct LoginStub {
-    page: Page,
-}
-
-async fn login_stub() -> Response {
-    render(&LoginStub {
-        page: Page::anonymous(),
-    })
-}
-
-#[derive(Template)]
 #[template(path = "documents.html")]
 struct DocumentsStub {
     page: Page,
@@ -349,18 +335,4 @@ async fn documents_stub(CurrentUser(session): CurrentUser) -> Response {
     render(&DocumentsStub {
         page: Page::for_session(&session),
     })
-}
-
-/// Ends the session. Dropping it releases the user's unlocked keys.
-async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    PendingUser(session): PendingUser,
-    CsrfForm(_): CsrfForm<NoFields>,
-) -> Response {
-    state.sessions.remove(&session.id);
-    let mut resp = redirect(&headers, "/login");
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, clear_session_cookie());
-    resp
 }

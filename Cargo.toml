@@ -36,5 +36,6 @@ zeroize = { version = "1.9.1", features = ["derive"] }
 zip = "9.6.0"
 
 [dev-dependencies]
+assert_cmd = "2"
 tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }

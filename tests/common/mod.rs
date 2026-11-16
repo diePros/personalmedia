@@ -110,10 +110,33 @@ impl TestApp {
         Client { cookie, csrf }
     }
 
-    /// Signs up and logs in. Until Task 10 adds the real routes this is
-    /// [`TestApp::session_for`].
+    /// Signs up through the real routes, confirms the recovery key and logs in.
     pub async fn signup_and_login(&self, username: &str) -> Client {
-        self.session_for(username)
+        let url = self
+            .state
+            .accounts
+            .create_invite(Role::User, now())
+            .unwrap();
+        let path = url.strip_prefix("https://test.example").unwrap();
+        let resp = self
+            .post_form(
+                path,
+                &[
+                    ("username", username),
+                    ("password", PASSWORD),
+                    ("password_confirm", PASSWORD),
+                ],
+                &Client::anon(),
+            )
+            .await;
+        let mut client = client_from_response(&resp);
+        let page = self.get("/recovery-key", &client).await;
+        client.csrf = csrf_from_html(&body_string(page).await);
+        let resp = self
+            .post_form("/recovery-key", &[("saved", "on")], &client)
+            .await;
+        assert_eq!(resp.status(), 303);
+        client
     }
 
     pub async fn get(&self, path: &str, client: &Client) -> Response {
@@ -239,6 +262,29 @@ pub async fn body_bytes(resp: Response) -> Vec<u8> {
 
 pub async fn body_string(resp: Response) -> String {
     String::from_utf8(body_bytes(resp).await).unwrap()
+}
+
+/// The `pm_session` cookie a response sets, as a client without a CSRF token.
+pub fn client_from_response(resp: &Response) -> Client {
+    let cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|v| v.strip_prefix("pm_session="))
+        .map(|v| v.split(';').next().unwrap().to_owned())
+        .expect("no pm_session cookie set");
+    Client {
+        cookie,
+        csrf: String::new(),
+    }
+}
+
+/// The token from `<meta name="csrf-token" content="...">`.
+pub fn csrf_from_html(html: &str) -> String {
+    let marker = "<meta name=\"csrf-token\" content=\"";
+    let start = html.find(marker).expect("no csrf meta tag") + marker.len();
+    html[start..].split('"').next().unwrap().to_owned()
 }
 
 fn urlencode(s: &str) -> String {

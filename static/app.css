@@ -113,6 +113,7 @@ button {
 
 input[type="text"],
 input[type="password"],
+input[type="email"],
 input[type="search"],
 input[type="date"],
 select,
@@ -175,4 +176,46 @@ button.danger {
   main {
     padding: calc(var(--gap) * 1.5);
   }
+}
+
+.auth {
+  max-width: 28rem;
+  margin: 0 auto;
+}
+
+.stack > * + * {
+  margin-top: var(--gap);
+}
+
+.notice {
+  padding: 0.75rem var(--gap);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.check label {
+  margin: 0;
+}
+
+.check input {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+code.recovery-key {
+  display: block;
+  padding: 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 1.125rem;
+  overflow-wrap: anywhere;
+  user-select: all;
 }
