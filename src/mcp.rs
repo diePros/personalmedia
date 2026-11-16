@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
-use crate::tokens::{Principal, authenticate};
+use crate::tokens::{Principal, authenticate, parse_bearer};
 use crate::user_db::{
     Document, Level, effective_level, get_document, get_document_text, list_documents,
     list_tags_visible, search, update_document_meta,
@@ -81,8 +81,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Authenticates the bearer token of a request, rate limited per client IP
-/// (`mcp-ip:{ip}`; only a successful authentication settles as success).
-/// Every failure is a `401` with an empty body; a locked IP gets `429`.
+/// (`mcp-ip:{ip}`). Only failures of a well-formed `pm_` token count (a
+/// missing or malformed header says nothing about guessing), nothing is
+/// reserved while a request is in flight, and a successful authentication
+/// clears the address's failures. Every failure is a `401` with an empty
+/// body; a locked IP gets `429`.
 #[allow(clippy::result_large_err)] // the error is a ready `Response`
 pub async fn bearer_principal(
     state: &AppState,
@@ -90,22 +93,22 @@ pub async fn bearer_principal(
     headers: &HeaderMap,
 ) -> Result<Principal, Response> {
     let ip = client_ip(peer, headers, state.cfg.trusted_proxy);
-    let attempt = state
-        .limiter
-        .begin(&[mcp_ip_key(ip)])
-        .map_err(too_many_requests)?;
+    let keys = [mcp_ip_key(ip)];
+    state.limiter.check(&keys).map_err(too_many_requests)?;
     let Some(token) = bearer_token(headers).map(str::to_owned) else {
-        attempt.failure();
         return Err(unauthorized());
     };
+    let well_formed = parse_bearer(&token).is_some();
     let st = state.clone();
     match tokio::task::spawn_blocking(move || authenticate(&st, &token)).await {
         Ok(Ok(p)) => {
-            attempt.success();
+            state.limiter.clear(&keys);
             Ok(p)
         }
         _ => {
-            attempt.failure();
+            if well_formed {
+                state.limiter.record_failure(&keys);
+            }
             Err(unauthorized())
         }
     }

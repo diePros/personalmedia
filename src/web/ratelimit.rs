@@ -193,6 +193,47 @@ impl RateLimiter {
         })
     }
 
+    /// `Err(retry_after)` if any key is locked. Reserves nothing: for callers
+    /// that only record failures ([`RateLimiter::record_failure`]) and so never
+    /// count attempts in flight.
+    pub fn check(&self, keys: &[String]) -> Result<(), Duration> {
+        let now = Instant::now();
+        let entries = self.lock();
+        let wait = keys
+            .iter()
+            .filter_map(|k| entries.get(k))
+            .filter_map(|e| e.locked_until.and_then(|u| u.checked_duration_since(now)))
+            .filter(|d| !d.is_zero())
+            .max();
+        wait.map_or(Ok(()), Err)
+    }
+
+    /// Count one failure on every key without having reserved an attempt.
+    pub fn record_failure(&self, keys: &[String]) {
+        let now = Instant::now();
+        let mut entries = self.lock();
+        for key in keys {
+            let e = entries.entry(key.clone()).or_default();
+            e.failures.retain(|t| now.duration_since(*t) < WINDOW);
+            e.failures.push(now);
+            if e.failures.len() >= MAX_FAILURES {
+                e.failures.clear();
+                e.locked_until = Some(now + LOCK);
+            }
+        }
+    }
+
+    /// Forget the failures (and any lock) of every key.
+    pub fn clear(&self, keys: &[String]) {
+        let mut entries = self.lock();
+        for key in keys {
+            if let Some(e) = entries.get_mut(key) {
+                e.failures.clear();
+                e.locked_until = None;
+            }
+        }
+    }
+
     fn settle(&self, keys: &[String], success: bool) {
         let now = Instant::now();
         let mut entries = self.lock();

@@ -203,8 +203,10 @@ async fn mcp_auth_failures_rate_limited() {
     let f = Fx::new();
     let tok = f.token(Access::Read, Content::FullText, None);
     let body = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+    // Ruling O: only well-formed (but wrong) `pm_` tokens count.
+    let bad = format!("pm_{}_{}", "a".repeat(32), "b".repeat(64));
     for _ in 0..10 {
-        assert_eq!(f.post(Some("bad"), &body).await.0, 401);
+        assert_eq!(f.post(Some(&bad), &body).await.0, 401);
     }
     // Locked: even the right token is refused with 429.
     assert_eq!(f.post(Some(&tok), &body).await.0, 429);
@@ -947,4 +949,43 @@ async fn upload_documents_are_serialised_by_write_permits() {
     drop(held);
     let (err, out) = job.await.unwrap();
     assert!(!err, "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn valid_token_not_locked_out_by_parallel_requests() {
+    let f = Fx::new();
+    let tok = f.token(Access::Read, Content::FullText, None);
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+    let results = futures_util::future::join_all((0..30).map(|_| f.post(Some(&tok), &body))).await;
+    for (status, _) in results {
+        assert_eq!(status, 200);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_wellformed_failures_count_and_success_clears() {
+    let f = Fx::new();
+    let tok = f.token(Access::Read, Content::FullText, None);
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+    // Malformed or missing bearers never count, however many arrive.
+    for _ in 0..25 {
+        assert_eq!(f.post(Some("garbage"), &body).await.0, 401);
+        assert_eq!(f.post(None, &body).await.0, 401);
+    }
+    assert_eq!(f.post(Some(&tok), &body).await.0, 200);
+    // Nine wrong-but-wellformed tokens, then a good one clears the count.
+    let bad = format!("pm_{}_{}", "a".repeat(32), "b".repeat(64));
+    for _ in 0..9 {
+        assert_eq!(f.post(Some(&bad), &body).await.0, 401);
+    }
+    assert_eq!(f.post(Some(&tok), &body).await.0, 200);
+    for _ in 0..9 {
+        assert_eq!(f.post(Some(&bad), &body).await.0, 401);
+    }
+    assert_eq!(f.post(Some(&tok), &body).await.0, 200);
+    // Ten in a row lock the address.
+    for _ in 0..10 {
+        f.post(Some(&bad), &body).await;
+    }
+    assert_eq!(f.post(Some(&bad), &body).await.0, 429);
 }

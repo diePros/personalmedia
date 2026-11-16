@@ -149,7 +149,7 @@ impl Principal {
 #[derive(Debug)]
 pub struct AuthFail;
 
-fn parse_bearer(bearer: &str) -> Option<&str> {
+pub(crate) fn parse_bearer(bearer: &str) -> Option<&str> {
     let rest = bearer.strip_prefix("pm_")?;
     let (id, secret) = rest.split_once('_')?;
     let hex_ok = |s: &str, n: usize| {
