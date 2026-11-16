@@ -87,12 +87,16 @@ Edit `PM_PUBLIC_URL` to your real `https://<node>.<tailnet>.ts.net` address firs
 
 Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` is unverified):
 
+> **Keep code and data in separate folders.** The data folder `/DATA/AppData/personal-media` must contain only what the app writes, because it belongs to uid 10001 and is what you back up. Put the source checkout somewhere else, for example `/DATA/personal-media-src`. Never clone into the data folder.
+
 - **With git on the board:**
 
   ```bash
-  git clone <this repo> && cd personalmedia
+  git clone <this repo> /DATA/personal-media-src && cd /DATA/personal-media-src
   docker compose up -d --build      # first Rust build on the N150 takes a while; it also runs the tests
   ```
+
+  If docker prints `WARNING: Error loading config file: open /DATA/.docker/config.json: permission denied`, your docker client config folder belongs to root (usually because `sudo docker …` ran once). It's harmless for builds, but fix it before logging in to a registry: `sudo chown -R "$(id -u):$(id -g)" /DATA/.docker`.
 
 - **Without git:** build the image on your dev machine and transfer it, then start it from the compose file without `--build`:
 
