@@ -32,7 +32,7 @@ use serde::Deserialize;
 
 use super::session::{AuthRejection, CsrfForm, CurrentUser, NoFields};
 use super::{AppState, CspOverride, Page, is_htmx, render};
-use crate::documents::{DocError, OnDuplicate, UploadMeta};
+use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
 use crate::user_db::{
     AccessFilter, Channel, Document, Level, ListFilter, TextStatus, document_overrides,
@@ -112,6 +112,7 @@ fn doc_error(e: DocError) -> Response {
         DocError::TooLarge => json_error(StatusCode::PAYLOAD_TOO_LARGE, "upload too large"),
         DocError::NotFound => StatusCode::NOT_FOUND.into_response(),
         DocError::InvalidDate => json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid date"),
+        DocError::InvalidInput(msg) => json_error(StatusCode::UNPROCESSABLE_ENTITY, msg),
         DocError::Internal(e) => internal(e),
     }
 }
@@ -332,6 +333,14 @@ async fn handle_upload_inner(
         };
         let name = field.name().unwrap_or_default().to_owned();
         if name == "file" {
+            let filename = field
+                .file_name()
+                .filter(|f| !f.is_empty())
+                .unwrap_or("upload")
+                .to_owned();
+            if let Err(e) = validate_meta(title.as_deref(), Some(&filename), &tags) {
+                return doc_error(e);
+            }
             let tags = match principal {
                 Some(p) => {
                     let (p, given) = (p.clone(), std::mem::take(&mut tags));
@@ -346,11 +355,7 @@ async fn handle_upload_inner(
                 None => std::mem::take(&mut tags),
             };
             let meta = UploadMeta {
-                filename: field
-                    .file_name()
-                    .filter(|f| !f.is_empty())
-                    .unwrap_or("upload")
-                    .to_owned(),
+                filename,
                 mime: field.content_type().map(str::to_owned),
                 title: title.take(),
                 tags,

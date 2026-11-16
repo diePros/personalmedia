@@ -64,7 +64,13 @@ pub struct AppState {
     pub tokens: Arc<TokenCache>,
     /// Bounds concurrent password KDF work (Argon2 uses 64 MiB per run).
     pub kdf_permits: Arc<Semaphore>,
+    /// Bounds concurrent MCP `upload_document` calls (each holds the base64
+    /// text and the decoded bytes in memory).
+    pub mcp_write_permits: Arc<Semaphore>,
 }
+
+/// Concurrent MCP uploads.
+const MCP_WRITE_PERMITS: usize = 2;
 
 impl AppState {
     /// Opens the data directory, wipes OCR scratch left by a previous run and
@@ -102,6 +108,7 @@ impl AppState {
             limiter,
             tokens,
             kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
+            mcp_write_permits: Arc::new(Semaphore::new(MCP_WRITE_PERMITS)),
         })
     }
 }

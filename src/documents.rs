@@ -58,6 +58,9 @@ pub enum DocError {
     NotFound,
     #[error("invalid date")]
     InvalidDate,
+    /// A text field is over its length cap (see [`validate_meta`]).
+    #[error("{0}")]
+    InvalidInput(&'static str),
     #[error("internal error: {0}")]
     Internal(anyhow::Error),
 }
@@ -93,6 +96,42 @@ impl Drop for FileGuard {
             let _ = fs::remove_file(p);
         }
     }
+}
+
+/// Caps on user-supplied metadata, shared by the web and MCP paths.
+pub const TITLE_MAX_CHARS: usize = 300;
+pub const FILENAME_MAX_CHARS: usize = 255;
+pub const TAGS_MAX: usize = 50;
+pub const TAG_MAX_CHARS: usize = 64;
+
+/// Title <= 300 chars, filename <= 255, at most 50 tags of <= 64 chars each
+/// (after trimming; empty tags do not count).
+pub fn validate_meta(
+    title: Option<&str>,
+    filename: Option<&str>,
+    tags: &[String],
+) -> Result<(), DocError> {
+    if title.is_some_and(|t| t.trim().chars().count() > TITLE_MAX_CHARS) {
+        return Err(DocError::InvalidInput(
+            "title too long (max 300 characters)",
+        ));
+    }
+    if filename.is_some_and(|f| f.trim().chars().count() > FILENAME_MAX_CHARS) {
+        return Err(DocError::InvalidInput(
+            "filename too long (max 255 characters)",
+        ));
+    }
+    let mut count = 0;
+    for t in tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        count += 1;
+        if count > TAGS_MAX {
+            return Err(DocError::InvalidInput("too many tags (max 50)"));
+        }
+        if t.chars().count() > TAG_MAX_CHARS {
+            return Err(DocError::InvalidInput("tag too long (max 64 characters)"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_date(s: &str) -> Result<(), DocError> {
@@ -347,6 +386,7 @@ impl Documents {
         if let Some(Some(d)) = date {
             validate_date(d)?;
         }
+        validate_meta(title, None, tags.unwrap_or_default())?;
         u.with_db(|c| get_document(c, id))
             .map_err(DocError::Internal)?
             .ok_or(DocError::NotFound)?;

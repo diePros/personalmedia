@@ -839,3 +839,112 @@ async fn restricted_update_preserves_hidden_tags() {
     let doc = f.u.with_db(|c| get_document(c, &id)).unwrap().unwrap();
     assert_eq!(doc.tags, vec!["extra", "hiv-therapy", "work"]);
 }
+
+fn rpc_call(tool: &str, args: Value) -> Value {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn input_caps_are_invalid_params() {
+    let f = Fx::new();
+    let tok = f.token(Access::ReadWrite, Content::FullText, None);
+    let id = f.doc("a.txt", "x", &[], Some(Level::Full)).await;
+    let b64 = BASE64.encode(b"hello");
+    let many: Vec<String> = (0..51).map(|i| format!("t{i}")).collect();
+    let cases = [
+        (
+            "upload_document",
+            json!({"filename":"a","content_base64":b64,"title":"t".repeat(301)}),
+        ),
+        (
+            "upload_document",
+            json!({"filename":"f".repeat(256),"content_base64":b64}),
+        ),
+        (
+            "upload_document",
+            json!({"filename":"a","content_base64":b64,"tags":many}),
+        ),
+        (
+            "upload_document",
+            json!({"filename":"a","content_base64":b64,"tags":["x".repeat(65)]}),
+        ),
+        ("update_document", json!({"id":id,"title":"t".repeat(301)})),
+        ("update_document", json!({"id":id,"tags":many})),
+        ("update_document", json!({"id":id,"tags":["x".repeat(65)]})),
+    ];
+    for (tool, args) in cases {
+        let (status, v) = f.post(Some(&tok), &rpc_call(tool, args.clone())).await;
+        assert_eq!(status, 200);
+        assert_eq!(v["error"]["code"], -32602, "{tool} {v}");
+    }
+    // At the limits everything passes.
+    let fifty: Vec<String> = (0..50).map(|i| format!("t{i}")).collect();
+    let (err, out) = f
+        .call(
+            &tok,
+            "upload_document",
+            json!({"filename":"g".repeat(255),"content_base64":b64,"title":"t".repeat(300),"tags":fifty}),
+        )
+        .await;
+    assert!(!err, "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_token_write_call_rejected_without_parsing_arguments() {
+    let f = Fx::new();
+    let read = f.token(Access::Read, Content::FullText, None);
+    let write = f.token(Access::ReadWrite, Content::FullText, None);
+    // Valid JSON, wrong shape for the tool: parsing it as arguments would
+    // answer "invalid arguments".
+    let garbage = json!({"filename": 1, "junk": "z".repeat(5 * 1024 * 1024)});
+    let started = std::time::Instant::now();
+    let (err, msg) = f.call(&read, "upload_document", garbage.clone()).await;
+    assert!(err);
+    assert_eq!(msg, "token is read-only");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    let (_, msg) = f.call(&write, "upload_document", garbage).await;
+    assert_eq!(msg, "invalid arguments");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_body_limit_follows_max_upload() {
+    let t = TestApp::with_config(|c| c.max_upload_bytes = 3 * 1024 * 1024);
+    let c = t.session_for("alice");
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    let f = Fx { t, u };
+    let tok = f.token(Access::Read, Content::FullText, None);
+    // limit = ceil(3 MiB * 4 / 3) + 1 MiB = 5 MiB.
+    let limit = 5 * 1024 * 1024;
+    let pad = |n: usize| json!({"jsonrpc":"2.0","id":1,"method":"ping","pad":"p".repeat(n)});
+    let over = pad(limit);
+    assert_eq!(f.post(Some(&tok), &over).await.0, 413);
+    let under = pad(limit - 1024);
+    assert_eq!(f.post(Some(&tok), &under).await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_documents_are_serialised_by_write_permits() {
+    let f = Arc::new(Fx::new());
+    let tok = f.token(Access::ReadWrite, Content::FullText, None);
+    let held =
+        f.t.state
+            .mcp_write_permits
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+    let (f2, tok2) = (f.clone(), tok.clone());
+    let job = tokio::spawn(async move {
+        f2.call(
+            &tok2,
+            "upload_document",
+            json!({"filename":"a.dat","content_base64":BASE64.encode(b"x")}),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!job.is_finished(), "upload ran without a permit");
+    drop(held);
+    let (err, out) = job.await.unwrap();
+    assert!(!err, "{out}");
+}

@@ -238,7 +238,18 @@ async fn oversized_text_field_before_the_file_is_413() {
         )
         .await;
     assert_eq!(resp.status(), 413);
-    let ok = "x".repeat(8 * 1024);
+    // 8 KiB passes the field cap but is over the 300-character title cap.
+    let at_cap = "x".repeat(8 * 1024);
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[("title", &at_cap)],
+            &[("file", "a.bin", "application/octet-stream", b"hi")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 422);
+    let ok = "x".repeat(300);
     let resp = t
         .post_multipart(
             "/api/upload",
@@ -642,4 +653,73 @@ async fn end_to_end_ocr_search() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_input_caps_are_422() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let up = |fields: Vec<(&'static str, String)>, name: String| {
+        let (t, c) = (&t, &c);
+        async move {
+            let f: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            t.post_multipart(
+                "/api/upload",
+                &f,
+                &[("file", &name, "application/octet-stream", b"hi")],
+                c,
+            )
+            .await
+            .status()
+        }
+    };
+    assert_eq!(
+        up(vec![("title", "t".repeat(301))], "a.bin".into()).await,
+        422
+    );
+    assert_eq!(up(vec![], "f".repeat(256)).await, 422);
+    let many = (0..51)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(up(vec![("tags", many)], "a.bin".into()).await, 422);
+    assert_eq!(
+        up(vec![("tags", "x".repeat(65))], "a.bin".into()).await,
+        422
+    );
+    // The limits themselves are fine.
+    let fifty = (0..50)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(
+        up(
+            vec![("title", "t".repeat(300)), ("tags", fifty)],
+            "g".repeat(255)
+        )
+        .await,
+        200
+    );
+
+    let id = upload_id(&t, &c, "b.bin", "application/octet-stream", b"data2").await;
+    let edit = |title: String, tags: String| {
+        let (t, c, id) = (&t, &c, &id);
+        async move {
+            t.post_form(
+                &format!("/documents/{id}"),
+                &[("title", &title), ("date", ""), ("tags", &tags)],
+                c,
+            )
+            .await
+            .status()
+        }
+    };
+    assert_eq!(edit("t".repeat(301), String::new()).await, 422);
+    let many = (0..51)
+        .map(|i| format!("t{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(edit("ok".into(), many).await, 422);
+    assert_eq!(edit("ok".into(), "x".repeat(65)).await, 422);
+    assert_eq!(edit("t".repeat(300), "x".repeat(64)).await, 303);
 }

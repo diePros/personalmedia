@@ -30,9 +30,10 @@ use data_encoding::BASE64;
 use futures_util::stream;
 use rusqlite::Connection;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
-use crate::documents::{DocError, OnDuplicate, UploadMeta};
+use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
 use crate::tokens::{Principal, authenticate};
 use crate::user_db::{
@@ -47,11 +48,15 @@ const LATEST_PROTOCOL: &str = "2025-06-18";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Longest document text returned by `get_document`, in characters.
 const TEXT_MAX_CHARS: usize = 100_000;
-const BODY_SLACK: usize = 64 * 1024;
+/// Room for the JSON envelope and the other fields around the base64 payload.
+const BODY_SLACK: usize = 1024 * 1024;
 
 pub fn routes(state: &AppState) -> Router<AppState> {
-    // base64 inflates by 4/3.
-    let limit = (state.cfg.max_upload_bytes as usize).saturating_mul(4) / 3 + BODY_SLACK;
+    // base64 inflates by 4/3: ceil(max * 4 / 3) + 1 MiB.
+    let limit = (state.cfg.max_upload_bytes as usize)
+        .saturating_mul(4)
+        .div_ceil(3)
+        .saturating_add(BODY_SLACK);
     // Layered on the method router, not the `Router`: a router-level layer
     // would also wrap the fallback and 401 every unknown path.
     Router::new().route(
@@ -139,40 +144,74 @@ fn json_response(status: StatusCode, body: &Value) -> Response {
     (status, axum::Json(body.clone())).into_response()
 }
 
+/// The JSON-RPC envelope. `params` stays raw so that tool arguments are not
+/// materialised (or deserialised) until the call has been authorised.
+#[derive(Deserialize)]
+struct Envelope<'a> {
+    method: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    id: Option<Value>,
+    #[serde(borrow, default)]
+    params: Option<&'a RawValue>,
+}
+
+/// `Some(value)` whenever the key exists, even when it is `null`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+#[derive(Deserialize)]
+struct InitParams {
+    #[serde(rename = "protocolVersion")]
+    protocol_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CallParams<'a> {
+    name: Option<String>,
+    #[serde(borrow, default)]
+    arguments: Option<&'a RawValue>,
+}
+
 async fn rpc(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> Response {
-    let msg: Value = match serde_json::from_slice(&body) {
+    let env: Envelope = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                &rpc_error(Value::Null, -32700, "parse error"),
-            );
+            return match serde_json::from_slice::<Value>(&body) {
+                // An object that is not a usable envelope: ignore it.
+                Ok(Value::Object(_)) => StatusCode::ACCEPTED.into_response(),
+                // Batches are not part of protocol 2025-06-18.
+                Ok(_) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &rpc_error(Value::Null, -32600, "invalid request"),
+                ),
+                Err(_) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    &rpc_error(Value::Null, -32700, "parse error"),
+                ),
+            };
         }
     };
-    let Some(obj) = msg.as_object() else {
-        // Batches are not part of protocol 2025-06-18.
-        return json_response(
-            StatusCode::BAD_REQUEST,
-            &rpc_error(Value::Null, -32600, "invalid request"),
-        );
-    };
-    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+    let Some(method) = env.method.as_deref() else {
         // A response or garbage from the client: acknowledge and ignore.
         return StatusCode::ACCEPTED.into_response();
     };
-    let Some(id) = obj.get("id").cloned() else {
+    let Some(id) = env.id else {
         // Notification (e.g. notifications/initialized).
         return StatusCode::ACCEPTED.into_response();
     };
-    let params = obj.get("params").cloned().unwrap_or(Value::Null);
     let reply = match method {
         "initialize" => {
-            let wanted = params.get("protocolVersion").and_then(Value::as_str);
+            let wanted = env
+                .params
+                .and_then(|p| serde_json::from_str::<InitParams>(p.get()).ok())
+                .and_then(|p| p.protocol_version);
             let version = wanted
+                .as_deref()
                 .filter(|v| SUPPORTED_PROTOCOLS.contains(v))
                 .unwrap_or(LATEST_PROTOCOL);
             rpc_result(
@@ -187,23 +226,51 @@ async fn rpc(
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(id, json!({"tools": tool_definitions()})),
         "tools/call" => {
-            let Some(name) = params.get("name").and_then(Value::as_str) else {
+            let params = env
+                .params
+                .and_then(|p| serde_json::from_str::<CallParams>(p.get()).ok());
+            let Some(name) = params.as_ref().and_then(|p| p.name.as_deref()) else {
                 return json_response(StatusCode::OK, &rpc_error(id, -32602, "missing tool name"));
             };
             if !TOOL_NAMES.contains(&name) {
                 return json_response(StatusCode::OK, &rpc_error(id, -32602, "unknown tool"));
             }
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let outcome = call_tool(&state, &principal, name, args).await;
+            // Write tools are refused for read-only tokens before the
+            // arguments are looked at.
+            let outcome = if WRITE_TOOLS.contains(&name) && !principal.can_write() {
+                Err(ToolError::Tool(READ_ONLY.into()))
+            } else {
+                let args = params.as_ref().and_then(|p| p.arguments);
+                call_tool(&state, &principal, name, args).await
+            };
             tracing::info!(tool = name, ok = outcome.is_ok(), "mcp tool call");
-            rpc_result(id, tool_result(outcome))
+            match outcome {
+                Err(ToolError::Params(msg)) => rpc_error(id, -32602, msg),
+                other => rpc_result(
+                    id,
+                    tool_result(other.map_err(|e| match e {
+                        ToolError::Tool(m) => m,
+                        ToolError::Params(m) => m.to_owned(),
+                    })),
+                ),
+            }
         }
         _ => rpc_error(id, -32601, "method not found"),
     };
     json_response(StatusCode::OK, &reply)
+}
+
+/// A failed tool call: either a tool-level error (`isError`) or a JSON-RPC
+/// invalid-params error.
+enum ToolError {
+    Tool(String),
+    Params(&'static str),
+}
+
+impl From<String> for ToolError {
+    fn from(m: String) -> Self {
+        ToolError::Tool(m)
+    }
 }
 
 fn tool_result(outcome: Result<Value, String>) -> Value {
@@ -217,6 +284,8 @@ fn tool_result(outcome: Result<Value, String>) -> Value {
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
+
+const WRITE_TOOLS: &[&str] = &["upload_document", "update_document"];
 
 const TOOL_NAMES: &[&str] = &[
     "search_documents",
@@ -325,8 +394,9 @@ struct UpdateArgs {
     date: Option<String>,
 }
 
-fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
-    serde_json::from_value(args).map_err(|_| "invalid arguments".to_owned())
+fn parse<T: serde::de::DeserializeOwned>(args: Option<&RawValue>) -> Result<T, String> {
+    serde_json::from_str(args.map_or("{}", RawValue::get))
+        .map_err(|_| "invalid arguments".to_owned())
 }
 
 fn internal(e: impl std::fmt::Display) -> String {
@@ -353,26 +423,16 @@ async fn call_tool(
     state: &AppState,
     p: &Principal,
     name: &str,
-    args: Value,
-) -> Result<Value, String> {
+    args: Option<&RawValue>,
+) -> Result<Value, ToolError> {
     match name {
-        "search_documents" => search_documents(p, parse(args)?).await,
-        "list_documents" => list_docs(p, parse(args)?).await,
-        "get_document" => get_doc(p, parse(args)?).await,
-        "list_tags" => list_tag_names(p).await,
-        "upload_document" => {
-            if !p.can_write() {
-                return Err(READ_ONLY.into());
-            }
-            upload_document(state, p, parse(args)?).await
-        }
-        "update_document" => {
-            if !p.can_write() {
-                return Err(READ_ONLY.into());
-            }
-            update_document(p, parse(args)?).await
-        }
-        _ => Err("unknown tool".into()),
+        "search_documents" => Ok(search_documents(p, parse(args)?).await?),
+        "list_documents" => Ok(list_docs(p, parse(args)?).await?),
+        "get_document" => Ok(get_doc(p, parse(args)?).await?),
+        "list_tags" => Ok(list_tag_names(p).await?),
+        "upload_document" => upload_document(state, p, parse(args)?).await,
+        "update_document" => update_document(p, parse(args)?).await,
+        _ => Err(ToolError::Tool("unknown tool".into())),
     }
 }
 
@@ -532,21 +592,30 @@ async fn list_tag_names(p: &Principal) -> Result<Value, String> {
     ))
 }
 
-async fn upload_document(state: &AppState, p: &Principal, a: UploadArgs) -> Result<Value, String> {
+async fn upload_document(
+    state: &AppState,
+    p: &Principal,
+    a: UploadArgs,
+) -> Result<Value, ToolError> {
     let max = state.cfg.max_upload_bytes;
     // Reject oversized input before decoding it.
     if a.content_base64.len() as u64 > max.saturating_mul(4) / 3 + 8 {
-        return Err("upload too large".into());
-    }
-    let bytes = BASE64
-        .decode(a.content_base64.trim().as_bytes())
-        .map_err(|_| "content_base64 is not valid base64".to_owned())?;
-    if bytes.len() as u64 > max {
-        return Err("upload too large".into());
+        return Err("upload too large".to_owned().into());
     }
     let filename = a.filename.trim().to_owned();
     if filename.is_empty() {
-        return Err("filename must not be empty".into());
+        return Err("filename must not be empty".to_owned().into());
+    }
+    validate_meta(a.title.as_deref(), Some(&filename), &a.tags).map_err(invalid_input)?;
+    // At most a couple of uploads hold the base64 text and the decoded bytes
+    // in memory at once.
+    let _permit = state.mcp_write_permits.acquire().await.map_err(internal)?;
+    let bytes = BASE64
+        .decode(a.content_base64.trim().as_bytes())
+        .map_err(|_| "content_base64 is not valid base64".to_owned())?;
+    drop(a.content_base64);
+    if bytes.len() as u64 > max {
+        return Err("upload too large".to_owned().into());
     }
     let (p2, tags) = (p.clone(), a.tags);
     let tags = blocking(&p.unlocked, move |c| p2.tags_for_upload(c, tags))
@@ -575,21 +644,29 @@ async fn upload_document(state: &AppState, p: &Principal, a: UploadArgs) -> Resu
         )
         .await
     {
-        Ok(outcome) => serde_json::to_value(outcome).map_err(internal),
+        Ok(outcome) => serde_json::to_value(outcome).map_err(|e| ToolError::Tool(internal(e))),
         Err(e) => Err(doc_err(e)),
     }
 }
 
-fn doc_err(e: DocError) -> String {
+fn invalid_input(e: DocError) -> ToolError {
     match e {
-        DocError::TooLarge => "upload too large".into(),
-        DocError::NotFound => NOT_FOUND.into(),
-        DocError::InvalidDate => "invalid date (use YYYY-MM-DD)".into(),
-        DocError::Internal(e) => internal(e),
+        DocError::InvalidInput(msg) => ToolError::Params(msg),
+        other => doc_err(other),
     }
 }
 
-async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, String> {
+fn doc_err(e: DocError) -> ToolError {
+    ToolError::Tool(match e {
+        DocError::TooLarge => "upload too large".into(),
+        DocError::NotFound => NOT_FOUND.into(),
+        DocError::InvalidDate => "invalid date (use YYYY-MM-DD)".into(),
+        DocError::InvalidInput(msg) => return ToolError::Params(msg),
+        DocError::Internal(e) => internal(e),
+    })
+}
+
+async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, ToolError> {
     let p2 = p.clone();
     let id = a.id.clone();
     let date = a.date.map(|d| d.trim().to_owned());
@@ -597,12 +674,17 @@ async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, String> 
     // inside one blocking task.
     let verdict = blocking(&p.unlocked, move |c| {
         let Some((doc, _)) = visible_doc(c, &p2, &id)? else {
-            return Ok(Err(NOT_FOUND.to_owned()));
+            return Ok(Err(ToolError::Tool(NOT_FOUND.to_owned())));
         };
+        if let Err(e) = validate_meta(a.title.as_deref(), None, a.tags.as_deref().unwrap_or(&[])) {
+            return Ok(Err(invalid_input(e)));
+        }
         let mut tags = a.tags;
         if let (Some(tags), Some(allowed)) = (tags.as_mut(), p2.allowed_tag_names(c)?) {
             if !tags.iter().any(|t| allowed.iter().any(|x| x == t.trim())) {
-                return Ok(Err("tags must include an allowed tag".to_owned()));
+                return Ok(Err(ToolError::Tool(
+                    "tags must include an allowed tag".to_owned(),
+                )));
             }
             // Tags the token cannot see stay on the document.
             for hidden in doc.tags.iter().filter(|t| !allowed.contains(t)) {
@@ -620,7 +702,8 @@ async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, String> 
         update_document_meta(c, &id, a.title.as_deref(), date, tags.as_deref(), now())?;
         Ok(Ok(()))
     })
-    .await?;
+    .await
+    .map_err(ToolError::Tool)?;
     verdict?;
     Ok(json!({"id": a.id, "updated": true}))
 }
