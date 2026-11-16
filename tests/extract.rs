@@ -156,7 +156,14 @@ impl Env {
         let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(bytes))]);
         match self
             .docs
-            .store(self.u.as_ref().unwrap(), meta, body, OnDuplicate::Keep, NOW)
+            .store(
+                self.u.as_ref().unwrap(),
+                meta,
+                body,
+                OnDuplicate::Keep,
+                None,
+                NOW,
+            )
             .await
             .unwrap()
         {

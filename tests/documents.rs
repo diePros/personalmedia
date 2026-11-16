@@ -101,7 +101,14 @@ async fn store_and_read_back_identical() {
     let data = random_bytes(300_000);
     let id = stored_id(
         e.docs
-            .store(&e.u, meta("scan.pdf"), body(&data), OnDuplicate::Skip, NOW)
+            .store(
+                &e.u,
+                meta("scan.pdf"),
+                body(&data),
+                OnDuplicate::Skip,
+                None,
+                NOW,
+            )
             .await
             .unwrap(),
     );
@@ -125,13 +132,27 @@ async fn duplicate_skip_and_keep() {
     let data = random_bytes(5000);
     let first = stored_id(
         e.docs
-            .store(&e.u, meta("a.pdf"), body(&data), OnDuplicate::Skip, NOW)
+            .store(
+                &e.u,
+                meta("a.pdf"),
+                body(&data),
+                OnDuplicate::Skip,
+                None,
+                NOW,
+            )
             .await
             .unwrap(),
     );
     match e
         .docs
-        .store(&e.u, meta("b.pdf"), body(&data), OnDuplicate::Skip, NOW)
+        .store(
+            &e.u,
+            meta("b.pdf"),
+            body(&data),
+            OnDuplicate::Skip,
+            None,
+            NOW,
+        )
         .await
         .unwrap()
     {
@@ -147,7 +168,14 @@ async fn duplicate_skip_and_keep() {
     assert_eq!(blob_files(&e).len(), 1);
     let second = stored_id(
         e.docs
-            .store(&e.u, meta("b.pdf"), body(&data), OnDuplicate::Keep, NOW)
+            .store(
+                &e.u,
+                meta("b.pdf"),
+                body(&data),
+                OnDuplicate::Keep,
+                None,
+                NOW,
+            )
             .await
             .unwrap(),
     );
@@ -165,6 +193,7 @@ async fn too_large_rejected_and_no_part_file_left() {
             meta("big.pdf"),
             body(&random_bytes(50_000)),
             OnDuplicate::Skip,
+            None,
             NOW,
         )
         .await
@@ -183,7 +212,7 @@ async fn stream_error_leaves_no_part_file() {
     ]);
     let err = e
         .docs
-        .store(&e.u, meta("x.pdf"), s, OnDuplicate::Skip, NOW)
+        .store(&e.u, meta("x.pdf"), s, OnDuplicate::Skip, None, NOW)
         .await
         .unwrap_err();
     assert!(matches!(err, DocError::Internal(_)));
@@ -195,7 +224,14 @@ async fn unsupported_type_not_enqueued() {
     let e = env(1_000_000);
     let id = stored_id(
         e.docs
-            .store(&e.u, meta("a.zip"), body(b"PK"), OnDuplicate::Skip, NOW)
+            .store(
+                &e.u,
+                meta("a.zip"),
+                body(b"PK"),
+                OnDuplicate::Skip,
+                None,
+                NOW,
+            )
             .await
             .unwrap(),
     );
@@ -214,6 +250,7 @@ async fn pdf_enqueued() {
                 meta("a.PDF"),
                 body(b"%PDF-1.4"),
                 OnDuplicate::Skip,
+                None,
                 NOW,
             )
             .await
@@ -232,7 +269,14 @@ async fn delete_removes_blob_and_row() {
     let e = env(1_000_000);
     let id = stored_id(
         e.docs
-            .store(&e.u, meta("a.txt"), body(b"hello"), OnDuplicate::Skip, NOW)
+            .store(
+                &e.u,
+                meta("a.txt"),
+                body(b"hello"),
+                OnDuplicate::Skip,
+                None,
+                NOW,
+            )
             .await
             .unwrap(),
     );
@@ -260,7 +304,7 @@ async fn invalid_date_rejected() {
         m.document_date = Some(bad.into());
         let err = e
             .docs
-            .store(&e.u, m, body(b"x"), OnDuplicate::Keep, NOW)
+            .store(&e.u, m, body(b"x"), OnDuplicate::Keep, None, NOW)
             .await
             .unwrap_err();
         assert!(matches!(err, DocError::InvalidDate), "{bad}");
@@ -269,7 +313,7 @@ async fn invalid_date_rejected() {
     m.document_date = Some("2024-02-29".into());
     let id = stored_id(
         e.docs
-            .store(&e.u, m, body(b"x"), OnDuplicate::Keep, NOW)
+            .store(&e.u, m, body(b"x"), OnDuplicate::Keep, None, NOW)
             .await
             .unwrap(),
     );
@@ -291,7 +335,14 @@ async fn retry_extraction_sets_pending_and_enqueues() {
     let e = env(1_000_000);
     let id = stored_id(
         e.docs
-            .store(&e.u, meta("a.zip"), body(b"PK"), OnDuplicate::Skip, NOW)
+            .store(
+                &e.u,
+                meta("a.zip"),
+                body(b"PK"),
+                OnDuplicate::Skip,
+                None,
+                NOW,
+            )
             .await
             .unwrap(),
     );
@@ -331,6 +382,7 @@ async fn nothing_plaintext_at_rest() {
                 m,
                 body(b"Diagnose vertraulich"),
                 OnDuplicate::Skip,
+                None,
                 NOW,
             )
             .await
@@ -371,4 +423,90 @@ async fn nothing_plaintext_at_rest() {
     );
     drop(td);
     assert!(hits.is_empty(), "{hits:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_check_ignores_documents_hidden_from_the_caller() {
+    use personal_media::user_db::{AccessFilter, Channel, Level, ListFilter, set_document_access};
+    let e = env(10_000_000);
+    let data = random_bytes(5000);
+    let mcp = ListFilter {
+        access: Some(AccessFilter {
+            channel: Channel::Mcp,
+            cap: Level::Full,
+        }),
+        ..Default::default()
+    };
+    let hidden = stored_id(
+        e.docs
+            .store(
+                &e.u,
+                meta("secret-name.pdf"),
+                body(&data),
+                OnDuplicate::Skip,
+                None,
+                NOW,
+            )
+            .await
+            .unwrap(),
+    );
+    e.u.with_db(|c| set_document_access(c, &hidden, Channel::Mcp, Some(Level::Off)))
+        .unwrap();
+
+    // Hidden from MCP: behaves like Keep, and reveals nothing about the hidden doc.
+    let out = e
+        .docs
+        .store(
+            &e.u,
+            meta("other.pdf"),
+            body(&data),
+            OnDuplicate::Skip,
+            Some(&mcp),
+            NOW,
+        )
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&out).unwrap();
+    let second = stored_id(out);
+    assert!(!json.contains(&hidden) && !json.contains("secret-name"));
+    assert_ne!(second, hidden);
+
+    // Now a visible copy exists, so the MCP caller does get a Duplicate for it.
+    e.u.with_db(|c| set_document_access(c, &second, Channel::Mcp, Some(Level::Full)))
+        .unwrap();
+    match e
+        .docs
+        .store(
+            &e.u,
+            meta("third.pdf"),
+            body(&data),
+            OnDuplicate::Skip,
+            Some(&mcp),
+            NOW,
+        )
+        .await
+        .unwrap()
+    {
+        StoreOutcome::Duplicate { existing_id, .. } => assert_eq!(existing_id, second),
+        other => panic!("{other:?}"),
+    }
+    // None = all documents (owner upload) considers every copy.
+    match e
+        .docs
+        .store(
+            &e.u,
+            meta("fourth.pdf"),
+            body(&data),
+            OnDuplicate::Skip,
+            None,
+            NOW,
+        )
+        .await
+        .unwrap()
+    {
+        StoreOutcome::Duplicate { existing_id, .. } => {
+            assert!(existing_id == hidden || existing_id == second)
+        }
+        other => panic!("{other:?}"),
+    }
 }

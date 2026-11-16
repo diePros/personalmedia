@@ -15,8 +15,8 @@ use crate::crypto::stream::{DecryptReader, EncryptWriter};
 use crate::crypto::{Key32, aad, unwrap_key, wrap_key};
 use crate::keyring::{Unlocked, user_dir};
 use crate::user_db::{
-    Document, NewDocument, TextStatus, delete_document, find_by_sha256, get_document,
-    insert_document, set_text, update_document_meta,
+    Document, ListFilter, NewDocument, TextStatus, delete_document, find_by_sha256_visible,
+    get_document, insert_document, set_text, update_document_meta,
 };
 
 /// Queue for text extraction, implemented by the extraction workers.
@@ -166,12 +166,17 @@ impl Documents {
         }
     }
 
+    /// Store an upload. Duplicate detection (for `OnDuplicate::Skip`) only
+    /// considers documents visible under `visibility` (`None` = all documents,
+    /// for the owner's web upload); a duplicate the caller cannot see is
+    /// treated as `Keep`, so a hidden document's id and title never leak.
     pub async fn store<S, E>(
         &self,
         u: &Arc<Unlocked>,
         meta: UploadMeta,
         mut body: S,
         on_dup: OnDuplicate,
+        visibility: Option<&ListFilter>,
         now: i64,
     ) -> Result<StoreOutcome, DocError>
     where
@@ -227,7 +232,9 @@ impl Documents {
 
         if matches!(on_dup, OnDuplicate::Skip)
             && let Some(existing) = u
-                .with_db(|c| find_by_sha256(c, &sha))
+                .with_db(|c| {
+                    find_by_sha256_visible(c, &sha, visibility.unwrap_or(&ListFilter::default()))
+                })
                 .map_err(DocError::Internal)?
         {
             return Ok(StoreOutcome::Duplicate {
