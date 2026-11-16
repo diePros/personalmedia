@@ -3,7 +3,7 @@
 //!
 //! # How a request gets its session
 //!
-//! [`session_layer`] runs for every request. It looks up the `pm_session`
+//! [`session_layer`] runs for every request. It looks up the `__Host-pm_session`
 //! cookie once and, if the session is alive, puts a [`Session`] snapshot into
 //! the request extensions. The extractors below only read that extension.
 //!
@@ -48,7 +48,10 @@ use crate::crypto::{RecoveryKey, fill_random};
 use crate::keyring::Unlocked;
 use crate::system_db::{Role, UserRow};
 
-pub const SESSION_COOKIE: &str = "pm_session";
+/// The `__Host-` prefix makes browsers refuse a cookie set by a sibling
+/// subdomain (other nodes of the tailnet share the `ts.net` parent): it must
+/// be `Secure`, have `Path=/` and no `Domain`.
+pub const SESSION_COOKIE: &str = "__Host-pm_session";
 pub const CSRF_HEADER: &str = "x-csrf-token";
 /// Name of the hidden form field carrying the CSRF token.
 pub const CSRF_FIELD: &str = "csrf";
@@ -228,7 +231,9 @@ pub fn session_cookie(value: &str) -> HeaderValue {
 
 /// `Set-Cookie` value that deletes the session cookie.
 pub fn clear_session_cookie() -> HeaderValue {
-    HeaderValue::from_static("pm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0")
+    HeaderValue::from_static(
+        "__Host-pm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
+    )
 }
 
 pub(crate) fn session_id(headers: &HeaderMap) -> Option<&str> {

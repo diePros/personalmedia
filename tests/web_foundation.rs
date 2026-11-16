@@ -49,7 +49,7 @@ async fn base_template_carries_csrf_meta_and_nav() {
         alice.csrf
     )));
     assert!(html.contains(
-        r#"<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false}'>"#
+        r#"<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"historyCacheSize":0,"allowScriptTags":false}'>"#
     ));
     assert!(html.contains(r#"href="/static/app.css""#));
     assert!(html.contains(r#"src="/static/htmx.min.js""#));
@@ -176,7 +176,7 @@ async fn post_without_csrf_is_403() {
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     assert_eq!(header_str(&resp, "location"), "/login");
     let cleared = header_str(&resp, "set-cookie");
-    assert!(cleared.starts_with("pm_session=;"));
+    assert!(cleared.starts_with("__Host-pm_session=;"));
     assert!(cleared.contains("Max-Age=0"));
     assert!(!still_logged_in(&app));
 
@@ -210,7 +210,7 @@ async fn session_cookie_flags_and_id_format() {
     assert_eq!(
         session_cookie(&alice.cookie).to_str().unwrap(),
         format!(
-            "pm_session={}; HttpOnly; Secure; SameSite=Strict; Path=/",
+            "__Host-pm_session={}; HttpOnly; Secure; SameSite=Strict; Path=/",
             alice.cookie
         )
     );
@@ -371,6 +371,33 @@ fn rate_limit_locks_after_10_failures_and_reports_retry_after() {
     limiter.begin(&carol).unwrap().success();
     limiter.begin(&carol).unwrap().failure();
     assert!(limiter.begin(&carol).is_ok());
+}
+
+#[test]
+fn ipv6_clients_are_keyed_by_their_64_prefix() {
+    let a = ip_key("2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap());
+    let b = ip_key("2001:db8:1:2:1::1".parse().unwrap());
+    let other = ip_key("2001:db8:1:3::1".parse().unwrap());
+    assert_eq!(a, "ip:2001:db8:1:2::/64");
+    assert_eq!(a, b);
+    assert_ne!(a, other);
+    // An IPv4-mapped address is keyed as the IPv4 address.
+    assert_eq!(
+        ip_key("::ffff:203.0.113.9".parse().unwrap()),
+        "ip:203.0.113.9"
+    );
+}
+
+#[test]
+fn user_key_is_lowercased_and_capped_at_64_chars() {
+    assert_eq!(user_key("ALice"), "user:alice");
+    let long = "A".repeat(2_000_000);
+    let key = user_key(&long);
+    assert_eq!(key, format!("user:{}", "a".repeat(64)));
+    assert_eq!(
+        user_key(&"é".repeat(100)).chars().count(),
+        "user:".len() + 64
+    );
 }
 
 #[test]

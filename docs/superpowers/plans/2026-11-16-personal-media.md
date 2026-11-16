@@ -45,7 +45,7 @@
 - **Usernames:** lowercase `^[a-z0-9_.-]{3,32}$` (input is lowercased first), unique.
 - **Passwords:** at least 10 characters.
 - **Cookies:**
-  - `pm_session`: `HttpOnly; Secure; SameSite=Strict; Path=/`. v1.1 may relax this to `Lax` (Task 18).
+  - `__Host-pm_session`: `HttpOnly; Secure; SameSite=Strict; Path=/`, no `Domain` (the `__Host-` prefix stops sibling `ts.net` nodes from planting a session cookie). v1.1 may relax this to `Lax` (Task 18).
   - `pm_continue`: used in Task 18.
 - **Security headers on every response:**
   - `Content-Security-Policy: default-src 'self'; img-src 'self' data:; object-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`
@@ -840,7 +840,7 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
   - It never writes to disk.
   - With a valid session it redirects 303 to `/share/{staging_id}`. Without one, it sets the cookie `pm_continue={staging_id}` (`HttpOnly; Secure; SameSite=Lax; Max-Age=900`) and redirects to `/login`. After login, `pm_continue` redirects to `/share/{id}` and the cookie is cleared.
 - **`GET /share/{id}`** (`CurrentUser`; the staging entry is bound to the first user who opens it and is 404 for anyone else): lists the files with title and tag inputs and a CSRF form. `POST /share/{id}` stores each file through the same `Documents::store` path as `/api/upload` and redirects to `/documents`. `POST /share/{id}/discard` drops it.
-- **Session cookie:** if the manual test in Step 3 shows Android Chrome doesn't send `pm_session` on the share POST, switch `pm_session` to `SameSite=Lax`. CSRF tokens stay mandatory. Record the outcome in a code comment and in `docs/setup.md`.
+- **Session cookie:** if the manual test in Step 3 shows Android Chrome doesn't send `__Host-pm_session` on the share POST, switch `__Host-pm_session` to `SameSite=Lax`. CSRF tokens stay mandatory. Record the outcome in a code comment and in `docs/setup.md`.
 - **`docs/ios-shortcut.md`:** step-by-step instructions for an iOS Shortcut "Share to Personal Media":
   - It receives Files/Images from the share sheet.
   - It sends "Get Contents of URL" `POST {PM_PUBLIC_URL}/api/upload` with `Authorization: Bearer pm_…` (a `read_write` token, ideally tag-restricted to a tag such as `inbox`) and a multipart field `file`.

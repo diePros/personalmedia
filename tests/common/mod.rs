@@ -247,7 +247,10 @@ pub fn builder(method: Method, path: &str, client: &Client) -> axum::http::reque
     if client.cookie.is_empty() {
         b
     } else {
-        b.header(header::COOKIE, format!("pm_session={}", client.cookie))
+        b.header(
+            header::COOKIE,
+            format!("__Host-pm_session={}", client.cookie),
+        )
     }
 }
 
@@ -272,16 +275,16 @@ pub async fn body_string(resp: Response) -> String {
     String::from_utf8(body_bytes(resp).await).unwrap()
 }
 
-/// The `pm_session` cookie a response sets, as a client without a CSRF token.
+/// The `__Host-pm_session` cookie a response sets, as a client without a CSRF token.
 pub fn client_from_response(resp: &Response) -> Client {
     let cookie = resp
         .headers()
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find_map(|v| v.strip_prefix("pm_session="))
+        .find_map(|v| v.strip_prefix("__Host-pm_session="))
         .map(|v| v.split(';').next().unwrap().to_owned())
-        .expect("no pm_session cookie set");
+        .expect("no __Host-pm_session cookie set");
     Client {
         cookie,
         csrf: String::new(),

@@ -15,7 +15,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -29,17 +29,38 @@ pub const WINDOW: Duration = Duration::from_secs(15 * 60);
 /// How long a key stays locked.
 pub const LOCK: Duration = Duration::from_secs(15 * 60);
 
-pub fn ip_key(ip: IpAddr) -> String {
-    format!("ip:{ip}")
+/// Longest username that still makes a distinct key. Longer input is cut so
+/// one request cannot park megabytes in the limiter map.
+const USER_KEY_MAX_CHARS: usize = 64;
+
+/// IPv4 addresses are keyed as they are. An IPv6 client usually owns a whole
+/// /64, so those are keyed by their /64 prefix (`ip:2001:db8:1:2::/64`).
+fn ip_part(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{}/64", Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
 }
 
-/// `username` is lowercased so case variants share one key.
+pub fn ip_key(ip: IpAddr) -> String {
+    format!("ip:{}", ip_part(ip))
+}
+
+/// `username` is lowercased (so case variants share one key) and cut to 64 characters.
 pub fn user_key(username: &str) -> String {
-    format!("user:{}", username.to_lowercase())
+    let name: String = username
+        .to_lowercase()
+        .chars()
+        .take(USER_KEY_MAX_CHARS)
+        .collect();
+    format!("user:{name}")
 }
 
 pub fn mcp_ip_key(ip: IpAddr) -> String {
-    format!("mcp-ip:{ip}")
+    format!("mcp-ip:{}", ip_part(ip))
 }
 
 /// The address rate limiting should attribute a request to.

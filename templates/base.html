@@ -6,7 +6,7 @@
 {% if let Some(csrf) = page.csrf -%}
 <meta name="csrf-token" content="{{ csrf }}">
 {% endif -%}
-<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false}'>
+<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"historyCacheSize":0,"allowScriptTags":false}'>
 <title>{% block title %}Personal Media{% endblock %}</title>
 <link rel="stylesheet" href="/static/app.css">
 <script src="/static/htmx.min.js" defer></script>
