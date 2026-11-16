@@ -5,7 +5,8 @@
 //! [`web_filter`] (`channel = Web`, `cap = Full`). A document whose effective
 //! web level is `Off` is hidden: absent from list and search, and its detail,
 //! raw and download pages are 404. At `Metadata` only the metadata and the
-//! switchboard form are shown. Edit, delete and retry need `Full`.
+//! switchboard form are shown. Edit, delete and retry work at `Metadata` too
+//! (they reveal no content); preview, raw and download need `Full`.
 //! `POST /documents/{id}/access` is exempt so the owner can always change it.
 
 #![allow(clippy::result_large_err)] // helpers return a ready `Response` as the error
@@ -618,7 +619,7 @@ async fn detail_page(CurrentUser(session): CurrentUser, Path(id): Path<String>) 
         tags: doc.tags,
         created: format_date(doc.created_at),
         status: status_words(doc.text_status),
-        can_retry: full && doc.text_status == TextStatus::Failed,
+        can_retry: doc.text_status == TextStatus::Failed,
         preview_pdf: full && essence == "application/pdf",
         preview_image: full
             && essence != "application/pdf"
@@ -773,7 +774,7 @@ async fn edit(
     headers: HeaderMap,
     CsrfForm(form): CsrfForm<EditForm>,
 ) -> Response {
-    match visible(&session.unlocked, &id, Level::Full).await {
+    match visible(&session.unlocked, &id, Level::Metadata).await {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(r) => return r,
@@ -813,7 +814,7 @@ async fn delete(
     headers: HeaderMap,
     CsrfForm(form): CsrfForm<DeleteForm>,
 ) -> Response {
-    match visible(&session.unlocked, &id, Level::Full).await {
+    match visible(&session.unlocked, &id, Level::Metadata).await {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(r) => return r,
@@ -839,7 +840,7 @@ async fn retry(
     headers: HeaderMap,
     CsrfForm(_): CsrfForm<NoFields>,
 ) -> Response {
-    let doc = match visible(&session.unlocked, &id, Level::Full).await {
+    let doc = match visible(&session.unlocked, &id, Level::Metadata).await {
         Ok(Some((d, _))) => d,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(r) => return r,

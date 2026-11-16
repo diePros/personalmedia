@@ -476,6 +476,7 @@ async fn metadata_level_detail_has_no_preview_or_download() {
     assert!(html.contains("<h1>a</h1>"));
     assert!(!html.contains("<iframe") && !html.contains("<img"));
     assert!(!html.contains("/download") && !html.contains("/raw"));
+    assert!(html.contains(&format!("action=\"/documents/{id}/delete\"")));
     assert!(html.contains(&format!("/documents/{id}/access")));
     assert_eq!(
         t.get(&format!("/documents/{id}/raw"), &c).await.status(),

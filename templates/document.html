@@ -22,6 +22,9 @@
 
 {% if full -%}
 <p><a class="button" href="/documents/{{ id }}/download">Download</a></p>
+{% else -%}
+<p class="notice">The web view of this document is limited to its metadata. Change the access below to see more.</p>
+{% endif -%}
 
 {% if can_retry -%}
 <form method="post" action="/documents/{{ id }}/retry">
@@ -47,9 +50,6 @@
 </div>
 <button type="submit">Save</button>
 </form>
-{% else -%}
-<p class="notice">The web view of this document is limited to its metadata. Change the access below to see more.</p>
-{% endif -%}
 
 <h2>Access</h2>
 <form method="post" action="/documents/{{ id }}/access" class="stack">
@@ -67,7 +67,6 @@
 <button type="submit">Save access</button>
 </form>
 
-{% if full -%}
 <h2>Delete</h2>
 <form method="post" action="/documents/{{ id }}/delete" class="stack">
 <input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
@@ -77,5 +76,4 @@
 </div>
 <button type="submit" class="danger">Delete</button>
 </form>
-{% endif -%}
 {% endblock %}
