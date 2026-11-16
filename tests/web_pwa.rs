@@ -1,5 +1,6 @@
 mod common;
 
+use axum::http::Method;
 use common::*;
 
 const PDF: &[u8] = include_bytes!("fixtures/text.pdf");
@@ -14,7 +15,12 @@ async fn manifest_valid_json_with_required_fields() {
         header_str(&resp, "content-type"),
         "application/manifest+json"
     );
-    assert_eq!(header_str(&resp, "cache-control"), "public, max-age=86400");
+    assert_eq!(header_str(&resp, "cache-control"), "no-cache");
+    let etag = header_str(&resp, "etag").to_owned();
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"'),
+        "strong ETag: {etag}"
+    );
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(v["name"], "Personal Media");
     assert_eq!(v["short_name"], "Media");
@@ -157,14 +163,64 @@ async fn sw_cache_name_tracks_asset_version() {
 
 #[test]
 fn sw_fetch_handler_ignores_non_get_requests() {
-    // The share target is a POST navigation; the worker must not respondWith it.
-    let fetch_start = SW.find("addEventListener(\"fetch\"").unwrap();
-    let guard = SW[fetch_start..]
-        .find("if (req.method !== \"GET\") {\n    return;\n  }")
+    // The share target is a POST navigation; the worker must not respondWith
+    // it. Matched with all whitespace removed so formatting changes are fine.
+    let squashed: String = SW.chars().filter(|c| !c.is_whitespace()).collect();
+    let fetch_start = squashed.find("addEventListener(\"fetch\"").unwrap();
+    let guard = squashed[fetch_start..]
+        .find("if(req.method!==\"GET\"){return;}")
         .expect("early return for non-GET")
         + fetch_start;
-    let first_respond = SW[fetch_start..].find("event.respondWith(").unwrap() + fetch_start;
+    let first_respond = squashed[fetch_start..].find("event.respondWith(").unwrap() + fetch_start;
     assert!(guard < first_respond);
+}
+
+#[test]
+fn sw_offline_fallback_never_resolves_undefined() {
+    let squashed: String = SW.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        squashed.contains("caches.match(OFFLINE).then("),
+        "the offline lookup must be followed by a fallback"
+    );
+    assert!(squashed.contains("r||Response.error()"));
+}
+
+async fn conditional(
+    t: &TestApp,
+    method: Method,
+    path: &str,
+    inm: &str,
+) -> axum::response::Response {
+    let req = builder(method, path, &Client::anon())
+        .header("if-none-match", inm)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    t.request(req).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conditional_requests_weak_star_and_head() {
+    let t = TestApp::new();
+    for path in ["/static/app.js", "/manifest.webmanifest"] {
+        let resp = t.get(path, &Client::anon()).await;
+        let etag = header_str(&resp, "etag").to_owned();
+        for (method, inm) in [
+            (Method::GET, format!("W/{etag}")),
+            (Method::GET, "*".to_owned()),
+            (Method::GET, format!("\"nope\", {etag}")),
+            (Method::HEAD, etag.clone()),
+            (Method::HEAD, "*".to_owned()),
+        ] {
+            let resp = conditional(&t, method.clone(), path, &inm).await;
+            assert_eq!(resp.status(), 304, "{method} {path} {inm}");
+            assert_eq!(header_str(&resp, "etag"), etag);
+            assert_eq!(header_str(&resp, "cache-control"), "no-cache");
+            assert!(body_bytes(resp).await.is_empty());
+        }
+        let resp = conditional(&t, Method::HEAD, path, "\"nope\"").await;
+        assert_eq!(resp.status(), 200, "HEAD {path}");
+        assert!(body_bytes(resp).await.is_empty());
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

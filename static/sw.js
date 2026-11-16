@@ -78,7 +78,11 @@ self.addEventListener("fetch", function (event) {
   if (req.mode === "navigate") {
     event.respondWith(
       fetch(req).catch(function () {
-        return caches.match(OFFLINE);
+        return caches.match(OFFLINE).then(function (r) {
+          // Cache evicted or half-installed: a plain network error beats
+          // respondWith(undefined).
+          return r || Response.error();
+        });
       }),
     );
   }

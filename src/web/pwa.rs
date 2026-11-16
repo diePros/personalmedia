@@ -35,12 +35,14 @@ use askama::Template;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
+use std::sync::LazyLock;
 use zeroize::Zeroizing;
 
 use super::docs::{human_size, now, parse_tags, read_text_field, web_filter};
@@ -60,7 +62,7 @@ const FILENAME_MAX_CHARS: usize = 255;
 const CHUNK: usize = 64 * 1024;
 
 /// Colors match `static/app.css`: `--accent` (light) and `--bg` (light).
-const MANIFEST: &str = r##"{
+pub const MANIFEST: &str = r##"{
   "name": "Personal Media",
   "short_name": "Media",
   "start_url": "/documents",
@@ -102,11 +104,26 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         .route("/share/{id}/discard", post(discard_share))
 }
 
-async fn manifest() -> Response {
+/// Strong `ETag` of the manifest bytes.
+static MANIFEST_ETAG: LazyLock<String> =
+    LazyLock::new(|| format!("\"{}\"", hex::encode(&Sha256::digest(MANIFEST)[..16])));
+
+/// `no-cache` + strong `ETag`, like the static files: a change to the share
+/// target or the icons reaches browsers on their next update check.
+async fn manifest(headers: HeaderMap) -> Response {
+    let etag = MANIFEST_ETAG.as_str();
+    if super::etag_matches(&headers, etag) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache")],
+        )
+            .into_response();
+    }
     (
         [
             (header::CONTENT_TYPE, "application/manifest+json"),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::ETAG, etag),
         ],
         MANIFEST,
     )

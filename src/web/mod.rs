@@ -519,18 +519,23 @@ const STATIC_FILES: &[(&str, &str, &[u8])] = &[
     ),
 ];
 
-/// Short content hash over every embedded asset and the service-worker
-/// source. It names the service-worker cache, so any deploy that changes an
+/// Short content hash over every embedded asset, the manifest and the
+/// service-worker source. It names the service-worker cache, so any deploy that changes an
 /// asset installs a fresh worker and drops the old shell cache.
-pub static ASSET_VERSION: LazyLock<String> = LazyLock::new(|| {
+pub static ASSET_VERSION: LazyLock<String> = LazyLock::new(|| asset_version(pwa::MANIFEST));
+
+/// [`ASSET_VERSION`] for a given manifest (the manifest is part of what a
+/// browser caches, so a change to it must roll the worker too).
+fn asset_version(manifest: &str) -> String {
     let mut h = Sha256::new();
     for (name, _, bytes) in STATIC_FILES {
         h.update(name.as_bytes());
         h.update(bytes);
     }
     h.update(pwa::SW_TEMPLATE.as_bytes());
+    h.update(manifest.as_bytes());
     hex::encode(&h.finalize()[..6])
-});
+}
 
 /// Strong `ETag` (quoted content hash) per [`STATIC_FILES`] entry, same order.
 static STATIC_ETAGS: LazyLock<Vec<String>> = LazyLock::new(|| {
@@ -591,6 +596,12 @@ fn serve_static(file: &str, req_headers: &HeaderMap) -> Response {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn asset_version_covers_the_manifest() {
+        assert_eq!(*ASSET_VERSION, asset_version(pwa::MANIFEST));
+        assert_ne!(asset_version("{}"), asset_version("{ }"));
+    }
 
     #[test]
     fn origin_of_drops_default_ports_only() {
