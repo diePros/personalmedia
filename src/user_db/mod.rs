@@ -52,7 +52,7 @@ CREATE VIRTUAL TABLE documents_fts USING fts5(
     doc_id UNINDEXED, title, filename, tags, content,
     tokenize='unicode61 remove_diacritics 2'
 );
-CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+CREATE TABLE tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE);
 CREATE TABLE document_tags (
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,

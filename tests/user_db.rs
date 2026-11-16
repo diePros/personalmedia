@@ -511,3 +511,18 @@ fn find_by_sha256_visible_ignores_hidden_documents() {
             .is_some()
     );
 }
+
+#[test]
+fn deleted_tag_ids_are_never_reused() {
+    let (_d, conn) = db();
+    let a = tag_ids(&conn, &["a".to_string(), "b".to_string()]).unwrap();
+    conn.execute("DELETE FROM tags WHERE id = ?1", [a[1]])
+        .unwrap();
+    let c = tag_ids(&conn, &["c".to_string()]).unwrap();
+    assert!(
+        c[0] > a[1],
+        "tag id {} reused after delete of {}",
+        c[0],
+        a[1]
+    );
+}
