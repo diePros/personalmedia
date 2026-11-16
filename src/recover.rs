@@ -117,6 +117,18 @@ fn create_private_dir(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A new file readable by the owner only (plaintext must not depend on the
+/// umask or on the directory mode alone).
+fn create_private_file(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
 /// Decrypt every document of `username` into `out/files/…` plus
 /// `out/metadata.json`, and return how many were written.
 pub fn recover(
@@ -147,11 +159,13 @@ pub fn recover(
         let (_, mut reader) = docs
             .open_plaintext(&u, id)
             .map_err(|e| anyhow::anyhow!("opening a document: {e}"))?;
-        let mut f = fs::File::create(out.join(rel)).context("creating output file")?;
+        let mut f = create_private_file(&out.join(rel)).context("creating output file")?;
         io::copy(&mut reader, &mut f).context("decrypting a document")?;
         f.flush().context("writing output file")?;
     }
-    fs::write(out.join("metadata.json"), metadata_json(&all, &plan)?)
+    let meta = metadata_json(&all, &plan)?;
+    create_private_file(&out.join("metadata.json"))
+        .and_then(|mut f| f.write_all(&meta))
         .context("writing metadata.json")?;
     Ok(all.len())
 }

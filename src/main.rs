@@ -73,11 +73,33 @@ fn create_invite(config: &Config, admin: bool) -> anyhow::Result<String> {
     accounts.create_invite(role, now)
 }
 
-/// `PM_RECOVER_SECRET` if set (tests), otherwise a prompt on the TTY.
+/// Where the recovery secret comes from. `PM_RECOVER_SECRET` exists in debug
+/// builds only (tests): in a production binary an environment variable would
+/// show up in `docker inspect` and `/proc/<pid>/environ`. Otherwise one line
+/// from stdin when stdin is not a terminal, else a prompt on the TTY.
 fn read_secret(recovery_key: bool) -> anyhow::Result<Secret> {
-    let value = match std::env::var("PM_RECOVER_SECRET") {
-        Ok(v) => Zeroizing::new(v),
-        Err(_) => {
+    use std::io::IsTerminal;
+    #[cfg(debug_assertions)]
+    let from_env = std::env::var("PM_RECOVER_SECRET").ok().map(Zeroizing::new);
+    #[cfg(not(debug_assertions))]
+    let from_env: Option<Zeroizing<String>> = {
+        if std::env::var_os("PM_RECOVER_SECRET").is_some() {
+            eprintln!(
+                "warning: PM_RECOVER_SECRET is ignored; the secret is read from stdin or a prompt"
+            );
+        }
+        None
+    };
+    let value = match from_env {
+        Some(v) => v,
+        None if !std::io::stdin().is_terminal() => {
+            let mut line = Zeroizing::new(String::new());
+            std::io::stdin().read_line(&mut line)?;
+            let trimmed = line.trim_end_matches(['\n', '\r']).to_owned();
+            anyhow::ensure!(!trimmed.is_empty(), "no secret on stdin");
+            Zeroizing::new(trimmed)
+        }
+        None => {
             let prompt = if recovery_key {
                 "Recovery key: "
             } else {

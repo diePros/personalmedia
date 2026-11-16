@@ -204,3 +204,36 @@ async fn recover_works_on_read_only_copy() {
         std::panic::resume_unwind(e);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_files_and_metadata_are_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path()).await;
+    let out = dir.path().join("out");
+    recover(dir.path(), &out, PASSWORD, &[]).success();
+    let mode = |p: std::path::PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(out.join("files")), 0o700);
+    assert_eq!(mode(out.join("metadata.json")), 0o600);
+    for name in ["a.txt", "a (2).txt", "b.bin"] {
+        assert_eq!(mode(out.join("files").join(name)), 0o600, "{name}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_is_read_from_stdin_when_not_a_tty() {
+    let dir = tempfile::tempdir().unwrap();
+    setup(dir.path()).await;
+    let out = dir.path().join("out");
+    Command::cargo_bin("personal-media")
+        .unwrap()
+        .args(["recover", "--user", "sebi", "--data"])
+        .arg(dir.path())
+        .arg("--out")
+        .arg(&out)
+        .env_remove("PM_RECOVER_SECRET")
+        .write_stdin(format!("{PASSWORD}\n"))
+        .assert()
+        .success();
+    check_output(&out);
+}
