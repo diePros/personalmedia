@@ -34,6 +34,8 @@ async fn signup(app: &TestApp, username: &str) -> (Client, String) {
     assert_eq!(header_str(&resp, "location"), "/recovery-key");
     let mut client = client_from_response(&resp);
     let html = body_string(app.get("/recovery-key", &client).await).await;
+    assert!(html.contains("it is shown again each time you log in"));
+    assert!(!html.contains("only time it is shown"));
     client.csrf = csrf_from_html(&html);
     (client, html)
 }
