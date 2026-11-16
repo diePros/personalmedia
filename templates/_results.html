@@ -1,0 +1,26 @@
+{% if results.rows.is_empty() -%}
+<p class="muted">{% if results.searching %}No documents match your search.{% else %}No documents yet.{% endif %}</p>
+{% else -%}
+<ul class="doc-list">
+{% for row in results.rows -%}
+<li class="doc-item">
+<a class="doc-title" href="/documents/{{ row.id }}">{{ row.title }}</a>
+<div class="muted doc-meta">
+{% if let Some(date) = row.date %}<span>{{ date }}</span>{% endif -%}
+{% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% endfor -%}
+{% if row.metadata_only %}<span>metadata only</span>{% endif -%}
+</div>
+{% if let Some(snippet) = row.snippet -%}
+<p class="snippet">{{ snippet|safe }}</p>
+{% endif -%}
+</li>
+{% endfor -%}
+</ul>
+{% endif -%}
+{% if results.prev_url.is_some() || results.next_url.is_some() -%}
+<nav class="pager" aria-label="Pages">
+{% if let Some(url) = results.prev_url %}<a href="{{ url }}" rel="prev">Previous</a>{% endif -%}
+<span class="muted">Page {{ results.page_no }}</span>
+{% if let Some(url) = results.next_url %}<a href="{{ url }}" rel="next">Next</a>{% endif -%}
+</nav>
+{% endif -%}

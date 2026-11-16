@@ -11,6 +11,7 @@
 //! * Redirect after a POST with [`redirect`], which also works for htmx.
 
 pub mod auth;
+pub mod docs;
 pub mod ratelimit;
 pub mod session;
 
@@ -34,7 +35,7 @@ use crate::keyring::Keyring;
 use crate::system_db::{SYSTEM_DB_FILE, SystemDb};
 use crate::tokens::TokenCache;
 use ratelimit::RateLimiter;
-use session::{CurrentUser, Session, SessionStore};
+use session::{Session, SessionStore};
 
 /// Default `Content-Security-Policy`. A route may replace it with [`CspOverride`].
 pub const CSP: &str = "default-src 'self'; img-src 'self' data:; object-src 'self'; \
@@ -115,7 +116,7 @@ fn spawn_sweeper(sessions: &Arc<SessionStore>, limiter: &Arc<RateLimiter>) {
 pub fn build_app(state: AppState) -> Router {
     Router::new()
         .merge(auth::routes())
-        .route("/documents", get(documents_stub))
+        .merge(docs::routes(&state))
         .route("/static/{file}", get(static_file))
         // Layers run bottom-up: access log, then headers, then session + CSRF.
         .layer(middleware::from_fn_with_state(
@@ -364,20 +365,4 @@ async fn static_file(Path(file): Path<String>) -> Response {
         *bytes,
     )
         .into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Placeholder routes, replaced by Task 10 (auth) and Task 11 (documents)
-// ---------------------------------------------------------------------------
-
-#[derive(Template)]
-#[template(path = "documents.html")]
-struct DocumentsStub {
-    page: Page,
-}
-
-async fn documents_stub(CurrentUser(session): CurrentUser) -> Response {
-    render(&DocumentsStub {
-        page: Page::for_session(&session),
-    })
 }

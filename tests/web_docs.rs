@@ -1,0 +1,592 @@
+mod common;
+
+use common::*;
+use personal_media::user_db::{Channel, Level, document_overrides};
+use personal_media::web::docs::content_disposition;
+
+const PDF: &[u8] = include_bytes!("fixtures/text.pdf");
+
+async fn upload(
+    t: &TestApp,
+    c: &Client,
+    name: &str,
+    mime: &str,
+    bytes: &[u8],
+    fields: &[(&str, &str)],
+) -> serde_json::Value {
+    let resp = t
+        .post_multipart("/api/upload", fields, &[("file", name, mime, bytes)], c)
+        .await;
+    assert_eq!(resp.status(), 200, "upload {name}");
+    serde_json::from_slice(&body_bytes(resp).await).unwrap()
+}
+
+async fn upload_id(t: &TestApp, c: &Client, name: &str, mime: &str, bytes: &[u8]) -> String {
+    let v = upload(t, c, name, mime, bytes, &[]).await;
+    assert_eq!(v["status"], "stored");
+    v["id"].as_str().unwrap().to_owned()
+}
+
+fn set_access(t: &TestApp, c: &Client, id: &str, level: Option<Level>) {
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    u.with_db(|conn| {
+        personal_media::user_db::set_document_access(conn, id, Channel::Web, level).unwrap()
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_list_detail_download_roundtrip() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let v = upload(
+        &t,
+        &c,
+        "Rechnung.pdf",
+        "application/pdf",
+        PDF,
+        &[
+            ("title", "Meine Rechnung"),
+            ("tags", " a , b,,"),
+            ("date", "2024-03-01"),
+        ],
+    )
+    .await;
+    let id = v["id"].as_str().unwrap().to_owned();
+
+    let list = body_string(t.get("/documents", &c).await).await;
+    assert!(list.contains("Meine Rechnung"));
+    assert!(list.contains(&format!("/documents/{id}")));
+
+    let detail = t.get(&format!("/documents/{id}"), &c).await;
+    assert_eq!(detail.status(), 200);
+    let html = body_string(detail).await;
+    assert!(html.contains(&format!(
+        "<iframe class=\"preview\" src=\"/documents/{id}/raw\""
+    )));
+    assert!(html.contains("2024-03-01"));
+
+    let raw = t.get(&format!("/documents/{id}/raw"), &c).await;
+    assert_eq!(raw.status(), 200);
+    assert_eq!(header_str(&raw, "content-type"), "application/pdf");
+    assert!(header_str(&raw, "content-disposition").starts_with("inline;"));
+    assert_eq!(header_str(&raw, "x-frame-options"), "SAMEORIGIN");
+    assert_eq!(
+        header_str(&raw, "content-security-policy"),
+        "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; object-src 'self'; frame-ancestors 'self'"
+    );
+    assert_eq!(header_str(&raw, "content-length"), PDF.len().to_string());
+    assert_eq!(body_bytes(raw).await, PDF);
+
+    let dl = t.get(&format!("/documents/{id}/download"), &c).await;
+    assert_eq!(dl.status(), 200);
+    assert_eq!(header_str(&dl, "content-type"), "application/octet-stream");
+    assert!(
+        header_str(&dl, "content-disposition").starts_with("attachment; filename=\"Rechnung.pdf\"")
+    );
+    assert_eq!(body_bytes(dl).await, PDF);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_partial_for_htmx() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    upload(
+        &t,
+        &c,
+        "n.txt",
+        "text/plain",
+        b"Vertrag mit Inhalt",
+        &[("title", "Notiz")],
+    )
+    .await;
+    wait_extracted(&t, &c, "vertrag").await;
+    let resp = t.hx_get("/documents?q=vertrag", &c).await;
+    assert_eq!(resp.status(), 200);
+    let html = body_string(resp).await;
+    assert!(!html.contains("<html"));
+    assert!(html.contains("Notiz"));
+    let full = body_string(t.get("/documents?q=vertrag", &c).await).await;
+    assert!(full.contains("<html"));
+    assert!(full.contains("hx-push-url=\"false\""));
+}
+
+async fn wait_extracted(t: &TestApp, c: &Client, q: &str) {
+    for _ in 0..100 {
+        let html = body_string(t.hx_get(&format!("/documents?q={q}"), c).await).await;
+        if html.contains("doc-item") {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("text not indexed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snippet_is_escaped() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    upload(
+        &t,
+        &c,
+        "x.txt",
+        "text/plain",
+        b"<script>alert(1)</script> Vertrag",
+        &[("title", "Plain")],
+    )
+    .await;
+    wait_extracted(&t, &c, "vertrag").await;
+    let html = body_string(t.hx_get("/documents?q=vertrag", &c).await).await;
+    assert!(html.contains("&lt;script&gt;"), "{html}");
+    assert!(html.contains("<mark>Vertrag</mark>"), "{html}");
+    assert!(!html.contains("<script>"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn html_and_svg_uploads_are_never_inline() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    for (name, mime) in [("x.html", "text/html"), ("x.svg", "image/svg+xml")] {
+        let body = format!("<svg onload=alert(1)> {name}");
+        let id = upload_id(&t, &c, name, mime, body.as_bytes()).await;
+        let raw = t.get(&format!("/documents/{id}/raw"), &c).await;
+        assert_eq!(raw.status(), 303);
+        assert_eq!(
+            header_str(&raw, "location"),
+            format!("/documents/{id}/download")
+        );
+        let dl = t.get(&format!("/documents/{id}/download"), &c).await;
+        assert_eq!(header_str(&dl, "content-type"), "application/octet-stream");
+        assert!(header_str(&dl, "content-disposition").starts_with("attachment"));
+        let detail = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+        assert!(!detail.contains("class=\"preview\""));
+    }
+}
+
+#[test]
+fn content_disposition_handles_hostile_names() {
+    let long = "x".repeat(300);
+    let long_ext = format!("{}.pdf", "y".repeat(300));
+    for name in [
+        "a\"b\r\nc.pdf",
+        "Prüfung.pdf",
+        "../../etc/passwd",
+        &long,
+        &long_ext,
+        "a\\b.txt",
+    ] {
+        let v = content_disposition("attachment", name);
+        let s = v.to_str().expect("header is visible ASCII");
+        assert!(!s.contains('\r') && !s.contains('\n'));
+        let rest = s.strip_prefix("attachment; filename=\"").unwrap();
+        let (fallback, tail) = rest.split_once('"').unwrap();
+        assert!(!fallback.contains('\\') && !fallback.contains('/'));
+        assert!(fallback.is_ascii() && fallback.len() <= 150, "{fallback}");
+        assert!(tail.starts_with("; filename*=UTF-8''"));
+    }
+    let s = content_disposition("attachment", &long_ext);
+    assert!(s.to_str().unwrap().contains(".pdf\";"));
+    let s = content_disposition("attachment", "Prüfung.pdf");
+    let s = s.to_str().unwrap();
+    assert!(s.contains("filename=\"Pr_fung.pdf\""));
+    assert!(s.contains("Pr%C3%BCfung.pdf"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_too_large_413() {
+    let t = TestApp::with_config(|cfg| cfg.max_upload_bytes = 1024);
+    let c = t.session_for("alice");
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[],
+            &[(
+                "file",
+                "big.bin",
+                "application/octet-stream",
+                &vec![7u8; 2048],
+            )],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 413);
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[("date", "2024-13-45")],
+            &[("file", "a.bin", "application/octet-stream", b"hi")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 422);
+    let resp = t
+        .post_multipart("/api/upload", &[("title", "x")], &[], &c)
+        .await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_upload_returns_duplicate_json() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"same").await;
+    let v = upload(&t, &c, "b.bin", "application/octet-stream", b"same", &[]).await;
+    assert_eq!(v["status"], "duplicate");
+    assert_eq!(v["existing_id"], id);
+    assert_eq!(v["existing_title"], "a");
+    let v = upload(
+        &t,
+        &c,
+        "b.bin",
+        "application/octet-stream",
+        b"same",
+        &[("on_duplicate", "keep")],
+    )
+    .await;
+    assert_eq!(v["status"], "stored");
+    let kept = v["id"].as_str().unwrap().to_owned();
+    // A hidden duplicate is stored as a new copy and not revealed.
+    set_access(&t, &c, &id, Some(Level::Off));
+    set_access(&t, &c, &kept, Some(Level::Off));
+    let v = upload(&t, &c, "c.bin", "application/octet-stream", b"same", &[]).await;
+    assert_eq!(v["status"], "stored");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upload_needs_csrf_header_and_session() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let mut no_csrf = c.clone();
+    no_csrf.csrf.clear();
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[],
+            &[("file", "a", "text/plain", b"x")],
+            &no_csrf,
+        )
+        .await;
+    assert_eq!(resp.status(), 403);
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[],
+            &[("file", "a", "text/plain", b"x")],
+            &Client::anon(),
+        )
+        .await;
+    assert_ne!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn edit_tags_and_title() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"data").await;
+    let resp = t
+        .post_form(
+            &format!("/documents/{id}"),
+            &[
+                ("title", "Neu"),
+                ("date", "2023-05-06"),
+                ("tags", " x, y ,,z "),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(html.contains("<h1>Neu</h1>"));
+    assert!(html.contains("2023-05-06"));
+    assert!(html.contains("value=\"x, y, z\""));
+    let resp = t
+        .post_form(
+            &format!("/documents/{id}"),
+            &[("title", "Neu"), ("date", "bad"), ("tags", "")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 422);
+    let resp = t
+        .post_form(
+            &format!("/documents/{id}"),
+            &[("title", "Neu"), ("date", ""), ("tags", "")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(!html.contains("2023-05-06"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_only_when_failed() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"data").await;
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(!html.contains("/retry"));
+    let resp = t
+        .post_form(&format!("/documents/{id}/retry"), &[], &c)
+        .await;
+    assert_eq!(resp.status(), 409);
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    u.with_db(|conn| {
+        personal_media::user_db::set_text(
+            conn,
+            &id,
+            personal_media::user_db::TextStatus::Failed,
+            None,
+            None,
+            1,
+        )
+        .unwrap()
+    });
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(html.contains("/retry"));
+    assert!(html.contains("Text extraction failed"));
+    let resp = t
+        .post_form(&format!("/documents/{id}/retry"), &[], &c)
+        .await;
+    assert_eq!(resp.status(), 303);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_requires_confirm() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"data").await;
+    let resp = t
+        .post_form(&format!("/documents/{id}/delete"), &[], &c)
+        .await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(t.get(&format!("/documents/{id}"), &c).await.status(), 200);
+    let resp = t
+        .post_form(&format!("/documents/{id}/delete"), &[("confirm", "on")], &c)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(t.get(&format!("/documents/{id}"), &c).await.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn other_users_document_is_404() {
+    let t = TestApp::new();
+    let a = t.session_for("alice");
+    let b = t.session_for("bob");
+    let id = upload_id(&t, &a, "a.bin", "application/octet-stream", b"secret").await;
+    for path in ["", "/raw", "/download"] {
+        assert_eq!(
+            t.get(&format!("/documents/{id}{path}"), &b).await.status(),
+            404
+        );
+    }
+    assert_eq!(
+        t.post_form(&format!("/documents/{id}/delete"), &[("confirm", "on")], &b)
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(
+        t.post_form(
+            &format!("/documents/{id}/access"),
+            &[("web", "full"), ("mcp", "full"), ("semantic_index", "full")],
+            &b
+        )
+        .await
+        .status(),
+        404
+    );
+    assert_eq!(t.get(&format!("/documents/{id}"), &a).await.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_off_document_hidden_from_list_search_and_detail() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload(
+        &t,
+        &c,
+        "geheim.txt",
+        "text/plain",
+        b"Vertrag",
+        &[("title", "Geheimtitel")],
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_extracted(&t, &c, "vertrag").await;
+    set_access(&t, &c, &id, Some(Level::Off));
+    assert!(
+        !body_string(t.get("/documents", &c).await)
+            .await
+            .contains("Geheimtitel")
+    );
+    assert!(
+        !body_string(t.get("/documents?q=vertrag", &c).await)
+            .await
+            .contains("Geheimtitel")
+    );
+    for path in ["", "/raw", "/download"] {
+        assert_eq!(
+            t.get(&format!("/documents/{id}{path}"), &c).await.status(),
+            404
+        );
+    }
+    for (path, fields) in [
+        ("", vec![("title", "x"), ("date", ""), ("tags", "")]),
+        ("/delete", vec![("confirm", "on")]),
+        ("/retry", vec![]),
+    ] {
+        assert_eq!(
+            t.post_form(&format!("/documents/{id}{path}"), &fields, &c)
+                .await
+                .status(),
+            404
+        );
+    }
+    // The owner can still un-hide it.
+    let resp = t
+        .post_form(
+            &format!("/documents/{id}/access"),
+            &[
+                ("web", "default"),
+                ("mcp", "default"),
+                ("semantic_index", "default"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(
+        body_string(t.get("/documents", &c).await)
+            .await
+            .contains("Geheimtitel")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_level_detail_has_no_preview_or_download() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.pdf", "application/pdf", PDF).await;
+    set_access(&t, &c, &id, Some(Level::Metadata));
+    let resp = t.get(&format!("/documents/{id}"), &c).await;
+    assert_eq!(resp.status(), 200);
+    let html = body_string(resp).await;
+    assert!(html.contains("<h1>a</h1>"));
+    assert!(!html.contains("<iframe") && !html.contains("<img"));
+    assert!(!html.contains("/download") && !html.contains("/raw"));
+    assert!(html.contains(&format!("/documents/{id}/access")));
+    assert_eq!(
+        t.get(&format!("/documents/{id}/raw"), &c).await.status(),
+        404
+    );
+    assert_eq!(
+        t.get(&format!("/documents/{id}/download"), &c)
+            .await
+            .status(),
+        404
+    );
+    assert!(
+        body_string(t.get("/documents", &c).await)
+            .await
+            .contains("/documents/")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_override_form_roundtrip() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"data").await;
+    let post = |web: &'static str, mcp: &'static str, sem: &'static str| {
+        let (t, c, id) = (&t, &c, id.clone());
+        async move {
+            t.post_form(
+                &format!("/documents/{id}/access"),
+                &[("web", web), ("mcp", mcp), ("semantic_index", sem)],
+                c,
+            )
+            .await
+        }
+    };
+    let overrides = || {
+        let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+        u.with_db(|conn| document_overrides(conn, &id).unwrap())
+    };
+    assert_eq!(post("full", "off", "metadata").await.status(), 303);
+    let o = overrides();
+    assert_eq!(o.get(&Channel::Web), Some(&Level::Full));
+    assert_eq!(o.get(&Channel::Mcp), Some(&Level::Off));
+    assert_eq!(o.get(&Channel::SemanticIndex), Some(&Level::Metadata));
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(html.contains("<option value=\"off\" selected>"));
+    assert_eq!(post("default", "default", "metadata").await.status(), 303);
+    let o = overrides();
+    assert_eq!(o.len(), 1);
+    assert_eq!(o.get(&Channel::SemanticIndex), Some(&Level::Metadata));
+    assert_eq!(post("bogus", "default", "default").await.status(), 422);
+    // Setting web to off sends the owner back to the list.
+    let resp = post("off", "default", "default").await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(header_str(&resp, "location"), "/documents");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pagination_links() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    for i in 0..51 {
+        upload_id(
+            &t,
+            &c,
+            "f.bin",
+            "application/octet-stream",
+            format!("doc {i}").as_bytes(),
+        )
+        .await;
+    }
+    let html = body_string(t.get("/documents", &c).await).await;
+    assert!(html.contains("rel=\"next\""));
+    assert!(!html.contains("rel=\"prev\""));
+    let html = body_string(t.get("/documents?page=2", &c).await).await;
+    assert!(html.contains("rel=\"prev\""));
+    assert!(!html.contains("rel=\"next\""));
+    assert_eq!(html.matches("doc-item").count(), 1);
+}
+
+fn have_tesseract() -> bool {
+    std::process::Command::new("which")
+        .arg("tesseract")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn end_to_end_ocr_search() {
+    if !have_tesseract() {
+        println!("SKIP");
+        return;
+    }
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/scanned.pdf"
+    ))
+    .unwrap();
+    upload_id(&t, &c, "scanned.pdf", "application/pdf", &bytes).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let html = body_string(t.hx_get("/documents?q=versicherungsnummer", &c).await).await;
+        if html.contains("doc-item") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "OCR text never became searchable"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
