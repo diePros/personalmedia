@@ -24,7 +24,7 @@ Existing tools fall short. Paperless-ngx stores documents unencrypted, and Every
 
 ## 3. Non-goals (v1)
 
-- Local AI (Ollama, auto-tagging, semantic/vector search). Planned for later; the design leaves room for it.
+- Local AI (Ollama, auto-tagging). Semantic search comes in v1.2 (§17a).
 - Sharing documents between users.
 - Email ingestion, watched/scanner folders, WebDAV.
 - Native mobile app, versioning, collaborative editing. (Installable PWA and share target come in v1.1, see §17.)
@@ -214,6 +214,25 @@ mcp_servers:
   - New tags may be created.
 - File downloads via MCP are not offered in v1. Agents get text, never the original binaries.
 
+## 13a. Access switchboard (v1)
+
+Each user decides, per **access channel**, how much of a document that channel may reveal. There's a per-user default, and each document can override it.
+
+- **Channels:**
+  - v1: `web` and `mcp`
+  - v1.2: `semantic_index` (whether a document's content is embedded for meaning-based search, §17a)
+  - Future channels (WebDAV, sharing, external AI) are added to the same table and default to `off` until the user enables them.
+- **Levels:** `off`, `metadata` (title, tags, date, filename, type, size) and `full` (also content: extracted text, snippets, preview/download, and later semantic matches).
+- **User defaults** live in Settings, shown as one row per channel with three options. Initial defaults *(my call)*: `web = full`, `mcp = metadata`, `semantic_index = off`. Opting in to new kinds of processing is a deliberate step.
+- **Per-document overrides** appear on the document detail page, where each channel can be `default`, `off`, `metadata` or `full`. Upload accepts the same overrides as optional fields.
+- **Effective access** for a request = `min(document level for that channel, the caller's own limit)`, where the caller's limit is the token scope for MCP and `full` for the owner's web session. Example: a `full_text` token reading a document set to `mcp = metadata` gets metadata only.
+- **Search follows the effective level per document:**
+  - Documents at `metadata` match only on title, filename and tags, with no snippet.
+  - Documents at `off` are invisible to that channel (list, search, get, tags).
+  - These are filters inside the query, not post-filters, so counts and ranks don't leak hidden content.
+- **Storage:** defaults go in `settings` and overrides in a `document_access(document_id, channel, level)` table, both inside the encrypted index DB.
+- **`web = off` semantics:** **OPEN, owner to decide**: hidden from the web UI entirely, or listed but locked behind re-entering the password, or `off` not allowed for `web`.
+
 ## 14. Security hardening (required because the app is public)
 
 - Invite-only registration, with no other signup path.
@@ -260,9 +279,30 @@ This is the first milestone after v1 and is planned as part of the same plan, ri
 
 **v1 must keep this cheap to add:** same-origin static assets, no inline scripts (already required by the CSP), responsive layouts, and an upload code path that the review page can reuse.
 
+## 17a. Near-future update (v1.2): semantic search via MCP
+
+Meaning-based search over each user's documents, exposed through MCP so that **each user brings their own agent** (Hermes, Claude, anything MCP-capable). The vault provides retrieval; the user's chosen agent does the reasoning. No chat or LLM is built into the app.
+
+- **Embeddings are computed inside the app on the ZimaBoard** *(my call)*. No document text leaves the box, so there is no new party to trust. Ollama on Proxmox would let the Proxmox admin see friends' plaintext.
+- **The model** must be:
+  - small, multilingual (German + English), CPU-only, run in-process (e.g. ONNX via `ort`/`fastembed`, or `candle`)
+  - at most ~150 MB quantized
+  - stored in `/data/models` (not user data) or baked into the image
+  - loaded lazily and unloaded after 10 minutes idle, so the idle footprint stays small; memory while embedding of a few hundred MB is acceptable
+  - Exact model choice is left to the builder, after a short benchmark on the N150.
+- **Indexing:**
+  - After text extraction, documents whose effective `semantic_index` level is `full` are split into chunks of about 300 tokens with overlap, embedded in the background worker (same keyring rules as OCR) and stored as `chunk_vectors(document_id, chunk_no, text_offset, vector BLOB)` in the encrypted index DB.
+  - Changing the switchboard to below `full` deletes that document's vectors immediately.
+  - Changing the model triggers a background re-embed.
+- **Search:** brute-force cosine similarity over the user's vectors. That's thousands of vectors per user, so it takes milliseconds and needs no vector-database server. It can be combined with FTS (hybrid ranking) for the web UI later.
+- **Privacy:**
+  - Embeddings can be partially inverted back to text, so they get exactly the same protection as text: encrypted at rest and only usable while unlocked.
+  - Semantic matching reveals content, so it is only used for documents whose effective `mcp` level is `full` **and** only for tokens with `full_text` scope. `metadata` access never touches vectors.
+- **MCP tool:** `semantic_search { query, tags?, date_from?, date_to?, limit? ≤ 20 }` → `[{id, title, document_date, tags, score, passage}]`. `passage` is the matching chunk text, subject to the switchboard and token scope as above.
+
 ## 18. Later
 
-- Ollama on Proxmox for auto-tagging and semantic search. Embeddings would be stored inside the SQLCipher DB, and per-plugin privacy settings would extend to which fields are sent to it.
+- Ollama/external AI (auto-tagging, summaries) as a new switchboard channel, off by default and opted into per user and per document.
 - Sharing between users via X25519.
 - Email/scanner inbox using the public key.
 - Outgoing email (e.g. invite links, notifications), if ever needed: use the owner's existing Resend setup for `mail.sebis.net`. Emails must never contain document content or metadata.

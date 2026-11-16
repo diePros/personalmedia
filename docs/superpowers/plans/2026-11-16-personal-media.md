@@ -262,7 +262,7 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
 ### Task 5: Per-user encrypted index DB, search
 
 **Files:**
-- Create: `src/user_db/mod.rs`, `src/user_db/documents.rs`, `src/user_db/meta.rs`, `tests/user_db.rs`
+- Create: `src/user_db/mod.rs`, `src/user_db/documents.rs`, `src/user_db/meta.rs`, `src/user_db/access.rs`, `tests/user_db.rs`
 
 **Interfaces:**
 - Consumes: `Key32` (Task 2).
@@ -273,9 +273,15 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
     - `pub struct NewDocument { pub id: String, pub wrapped_dek: Vec<u8>, pub original_filename: String, pub title: String, pub mime: String, pub size: u64, pub sha256: [u8;32], pub document_date: Option<String> /* YYYY-MM-DD */, pub tags: Vec<String>, pub created_at: i64 }`
     - `#[derive(Clone, Debug, Serialize)] pub struct Document { pub id, pub wrapped_dek: Vec<u8> /* #[serde(skip)] */, pub original_filename, pub title, pub mime, pub size: u64, pub sha256_hex: String, pub document_date: Option<String>, pub created_at: i64, pub updated_at: i64, pub text_status: TextStatus, pub page_count: Option<u32>, pub tags: Vec<String> }`
   - **Filters and search types:**
-    - `#[derive(Default, Clone)] pub struct ListFilter { pub tags_all: Vec<String>, pub tag_allow: Option<Vec<i64>> /* ANY of these tag ids */, pub date_from: Option<String>, pub date_to: Option<String>, pub limit: u32 /* 0 → 50 */, pub offset: u32 }`. Date filters apply to `document_date` (documents without one are excluded when a date filter is set).
-    - `pub enum SearchMode { FullText, MetadataOnly }`
-    - `pub struct SearchHit { pub doc: Document, pub snippet: Option<String> }`. Snippets mark matches with `\u{2}`…`\u{3}`, are always `None` in `MetadataOnly`, and are capped at 12 tokens using `…` as the ellipsis.
+    - **Access switchboard (spec §13a)**, in `src/user_db/access.rs`:
+      - `#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)] #[serde(rename_all = "snake_case")] pub enum Channel { Web, Mcp, SemanticIndex }`
+      - `#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)] #[serde(rename_all = "snake_case")] pub enum Level { Off, Metadata, Full }` (ordered `Off < Metadata < Full`)
+      - `pub struct AccessDefaults(pub HashMap<Channel, Level>)` with `Default` = `web: Full, mcp: Metadata, semantic_index: Off`, and `level(&self, Channel) -> Level`, where a missing channel → `Off`
+      - Functions: `get_access_defaults(conn) -> Result<AccessDefaults>` (settings key `access_defaults`, JSON), `set_access_defaults(conn, &AccessDefaults)`, `set_document_access(conn, doc_id, Channel, Option<Level> /* None = use default */)`, `document_overrides(conn, doc_id) -> Result<HashMap<Channel, Level>>` and `effective_level(conn, doc_id, Channel, cap: Level) -> Result<Level>` = `min(override.unwrap_or(default), cap)`
+      - Table: `document_access(document_id, channel TEXT, level TEXT, PRIMARY KEY(document_id, channel))`, cascade on document delete
+    - `#[derive(Clone, Copy)] pub struct AccessFilter { pub channel: Channel, pub cap: Level }`. The caller's cap is `Full` for the owner's web session, and the token's `content` mapped to `Metadata` or `Full` for MCP.
+    - `#[derive(Default, Clone)] pub struct ListFilter { pub tags_all: Vec<String>, pub tag_allow: Option<Vec<i64>> /* ANY of these tag ids */, pub date_from: Option<String>, pub date_to: Option<String>, pub access: Option<AccessFilter> /* None = no switchboard, only for export/recovery */, pub limit: u32 /* 0 → 50 */, pub offset: u32 }`. Date filters apply to `document_date` (documents without one are excluded when a date filter is set). With `access` set, documents whose effective level is `Off` are excluded inside the SQL, not after it.
+    - `pub struct SearchHit { pub doc: Document, pub level: Level, pub snippet: Option<String> }`. Snippets mark matches with `\u{2}`…`\u{3}`, are `None` unless `level == Full`, and are capped at 12 tokens using `…` as the ellipsis.
   - **Document functions** (in `documents.rs`, all take `conn: &Connection`):
     - `insert_document(conn, &NewDocument)`, which also indexes title/filename/tags in FTS
     - `get_document(conn, id) -> Result<Option<Document>>`
@@ -287,7 +293,7 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
     - `pending_document_ids(conn) -> Result<Vec<String>>`
     - `list_tags(conn) -> Result<Vec<(i64, String)>>`, sorted by name
     - `tag_ids(conn, names: &[String]) -> Result<Vec<i64>>`, which creates missing tags
-    - `search(conn, text: &str, mode: SearchMode, filter: &ListFilter) -> Result<Vec<SearchHit>>`, ranked by bm25
+    - `search(conn, text: &str, filter: &ListFilter) -> Result<Vec<SearchHit>>`, ranked by bm25. Run two FTS queries: documents at effective level `Full` use the full expression, and documents at `Metadata` use the column-filtered expression. Merge them by rank, then apply limit and offset.
   - **Token metadata and settings** (in `meta.rs`):
     - `#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)] pub struct TokenScope { pub access: Access, pub content: Content, pub tags: Option<Vec<i64>> }`
     - `pub enum Access { Read, ReadWrite }` and `pub enum Content { MetadataOnly, FullText }`, both serde `snake_case`
@@ -303,17 +309,20 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
 // split user text on whitespace; for each term strip every '"' char; drop empty terms;
 // quote each as "term"; the LAST term additionally gets a trailing * (prefix match);
 // join with ' ' (implicit AND). Empty after cleaning → return Ok(vec![]) without querying.
-// MetadataOnly: wrap as  {title filename tags} : (<joined>)
+// Metadata-level documents: wrap as  {title filename tags} : (<joined>)
 ```
 
 - [ ] **Step 1: Write the failing tests in `tests/user_db.rs`**
   - `insert_get_list_roundtrip`
   - `search_finds_content_with_umlaut_folding`: content `"Kündigungsfrist drei Monate"`, query `kundigungsfrist` → hit, with a snippet containing `\u{2}`
   - `prefix_search_on_last_term`: query `kundig` → hit
-  - `metadata_only_never_matches_content`: content contains `geheim` and the title doesn't; MetadataOnly query `geheim` → empty; FullText → 1 hit
+  - `metadata_only_never_matches_content`: content contains `geheim` and the title doesn't. With `AccessFilter{Mcp, cap: Metadata}`, query `geheim` → empty. With cap `Full` and the document overridden to `mcp = full` → 1 hit with a snippet. With the default (`mcp = metadata`) and cap `Full` → empty.
+  - `switchboard_off_hides_document`: override `web = off` → `list_documents` and `search` with `AccessFilter{Web, Full}` exclude it; `access: None` includes it
+  - `switchboard_defaults_and_effective_level`: default `AccessDefaults` values; `set_access_defaults` changes `effective_level` for documents without an override; an override wins; `cap` lowers the result; `set_document_access(.., None)` returns the document to the default
+  - `metadata_level_hit_has_no_snippet`: a title match on a Metadata-level doc → hit with `level == Metadata` and `snippet == None`
   - `search_input_is_literal_and_cannot_escape_columns`:
-    - For each of `geheim" OR content:geheim`, `content: geheim`, `NEAR(geheim`, `*`, `-geheim`, `"`, `""`, `(`, `title:x OR content:geheim` in MetadataOnly mode, the result is `Ok` and contains no doc whose only match is in content.
-    - The same inputs in FullText mode return `Ok`.
+    - For each of `geheim" OR content:geheim`, `content: geheim`, `NEAR(geheim`, `*`, `-geheim`, `"`, `""`, `(`, `title:x OR content:geheim` with cap `Metadata`, the result is `Ok` and contains no doc whose only match is in content.
+    - The same inputs with cap `Full` (document at `Full`) return `Ok`.
   - `tag_filters`: `tags_all = ["a","b"]` returns only docs with both tags; `tag_allow = [id_a]` returns docs with tag a
   - `date_filters_inclusive`
   - `update_meta_reindexes`: rename title → the new title is searchable and the old one isn't
@@ -701,7 +710,7 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
   - `upload_document { filename, content_base64, title?, tags?, date? }` (`read_write` only; decoded size ≤ `max_upload_bytes`)
   - `update_document { id, title?, tags?, date? }` (`read_write` only)
 - **Scope enforcement** (exactly spec §13):
-  - `content = MetadataOnly` → `SearchMode::MetadataOnly`, no snippets and no `text`.
+  - Every read uses `ListFilter.access = Some(AccessFilter { channel: Mcp, cap })` with `cap = Metadata` for `metadata_only` tokens and `Full` for `full_text` tokens. Snippets and `text` are only returned when the document's effective level is `Full`. `get_document` uses `effective_level(.., Mcp, cap)`, and `Off` means the document is reported as not found.
   - `scope.tags = Some(ids)` → `ListFilter.tag_allow = Some(ids)` on every read. `get_document` of a doc outside the allow-list → "not found".
   - `list_tags` returns only the allowed tags.
   - `upload_document` attaches the first allowed tag if none of the given tags is allowed.
