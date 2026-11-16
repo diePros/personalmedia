@@ -479,9 +479,8 @@ fn list_tags_visible_respects_tag_allow() {
         .into_iter()
         .map(|(_, n)| n)
         .collect();
-    // Only tags on documents that carry an allowed tag are listed
-    // (the document's own other tags are visible, per the spec's open question).
-    assert_eq!(names, ["miete", "steuer"]);
+    // Ruling N: only allowed tags are listed, never a visible document's other tags.
+    assert_eq!(names, ["steuer"]);
     let none = ListFilter {
         tag_allow: Some(vec![]),
         ..mcp_full()

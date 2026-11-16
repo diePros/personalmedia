@@ -37,7 +37,7 @@ use crate::keyring::Unlocked;
 use crate::tokens::{Principal, authenticate};
 use crate::user_db::{
     Document, Level, effective_level, get_document, get_document_text, list_documents,
-    list_tags_visible, search,
+    list_tags_visible, search, update_document_meta,
 };
 use crate::web::AppState;
 use crate::web::ratelimit::{client_ip, mcp_ip_key, too_many_requests};
@@ -370,7 +370,7 @@ async fn call_tool(
             if !p.can_write() {
                 return Err(READ_ONLY.into());
             }
-            update_document(state, p, parse(args)?).await
+            update_document(p, parse(args)?).await
         }
         _ => Err("unknown tool".into()),
     }
@@ -390,6 +390,26 @@ fn clean(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
+/// Drop tag names outside the token's allow-list from `docs` (no-op for an
+/// unrestricted token).
+fn restrict_tags(p: &Principal, c: &Connection, docs: &mut [Document]) -> anyhow::Result<()> {
+    if let Some(allowed) = p.allowed_tag_names(c)? {
+        for d in docs {
+            d.tags.retain(|t| allowed.contains(t));
+        }
+    }
+    Ok(())
+}
+
+/// A restricted token filtering on a tag outside its allow-list sees nothing,
+/// exactly as if the tag did not exist.
+fn tags_filter_allowed(p: &Principal, c: &Connection, tags: &[String]) -> anyhow::Result<bool> {
+    Ok(match p.allowed_tag_names(c)? {
+        Some(allowed) => tags.iter().all(|t| allowed.contains(t)),
+        None => true,
+    })
+}
+
 async fn search_documents(p: &Principal, a: SearchArgs) -> Result<Value, String> {
     if a.query.trim().is_empty() {
         return Err("query must not be empty".into());
@@ -400,7 +420,20 @@ async fn search_documents(p: &Principal, a: SearchArgs) -> Result<Value, String>
     f.date_to = clean(a.date_to);
     f.limit = a.limit.unwrap_or(20).clamp(1, 50);
     let query = a.query;
-    let hits = blocking(&p.unlocked, move |c| search(c, &query, &f)).await?;
+    let p2 = p.clone();
+    let hits = blocking(&p.unlocked, move |c| {
+        if !tags_filter_allowed(&p2, c, &f.tags_all)? {
+            return Ok(vec![]);
+        }
+        let mut hits = search(c, &query, &f)?;
+        let mut docs: Vec<Document> = hits.iter().map(|h| h.doc.clone()).collect();
+        restrict_tags(&p2, c, &mut docs)?;
+        for (h, d) in hits.iter_mut().zip(docs) {
+            h.doc = d;
+        }
+        Ok(hits)
+    })
+    .await?;
     let out: Vec<Value> = hits
         .into_iter()
         .map(|h| {
@@ -424,7 +457,16 @@ async fn list_docs(p: &Principal, a: ListArgs) -> Result<Value, String> {
     f.date_to = clean(a.date_to);
     f.limit = a.limit.unwrap_or(50).clamp(1, 100);
     f.offset = a.offset.unwrap_or(0);
-    let docs = blocking(&p.unlocked, move |c| list_documents(c, &f)).await?;
+    let p2 = p.clone();
+    let docs = blocking(&p.unlocked, move |c| {
+        if !tags_filter_allowed(&p2, c, &f.tags_all)? {
+            return Ok(vec![]);
+        }
+        let mut docs = list_documents(c, &f)?;
+        restrict_tags(&p2, c, &mut docs)?;
+        Ok(docs)
+    })
+    .await?;
     Ok(Value::Array(
         docs.iter().map(|d| Value::Object(doc_json(d))).collect(),
     ))
@@ -454,9 +496,10 @@ fn visible_doc(
 async fn get_doc(p: &Principal, a: IdArgs) -> Result<Value, String> {
     let p2 = p.clone();
     let found = blocking(&p.unlocked, move |c| {
-        let Some((doc, level)) = visible_doc(c, &p2, &a.id)? else {
+        let Some((mut doc, level)) = visible_doc(c, &p2, &a.id)? else {
             return Ok(None);
         };
+        restrict_tags(&p2, c, std::slice::from_mut(&mut doc))?;
         let text = if level == Level::Full {
             get_document_text(c, &doc.id)?
         } else {
@@ -546,38 +589,38 @@ fn doc_err(e: DocError) -> String {
     }
 }
 
-async fn update_document(state: &AppState, p: &Principal, a: UpdateArgs) -> Result<Value, String> {
-    let (p2, id) = (p.clone(), a.id.clone());
-    let new_tags = a.tags.clone();
-    // Visibility and the tag rule are checked against the same snapshot.
+async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, String> {
+    let p2 = p.clone();
+    let id = a.id.clone();
+    let date = a.date.map(|d| d.trim().to_owned());
+    // Visibility, the tag rule and the write happen on one connection lock,
+    // inside one blocking task.
     let verdict = blocking(&p.unlocked, move |c| {
-        if visible_doc(c, &p2, &id)?.is_none() {
+        let Some((doc, _)) = visible_doc(c, &p2, &id)? else {
             return Ok(Err(NOT_FOUND.to_owned()));
+        };
+        let mut tags = a.tags;
+        if let (Some(tags), Some(allowed)) = (tags.as_mut(), p2.allowed_tag_names(c)?) {
+            if !tags.iter().any(|t| allowed.iter().any(|x| x == t.trim())) {
+                return Ok(Err("tags must include an allowed tag".to_owned()));
+            }
+            // Tags the token cannot see stay on the document.
+            for hidden in doc.tags.iter().filter(|t| !allowed.contains(t)) {
+                if !tags.iter().any(|t| t.trim() == hidden) {
+                    tags.push(hidden.clone());
+                }
+            }
         }
-        if let (Some(tags), Some(allowed)) = (&new_tags, p2.allowed_tag_names(c)?)
-            && !tags.iter().any(|t| allowed.iter().any(|x| x == t.trim()))
+        let date = date.as_deref().map(|d| (!d.is_empty()).then_some(d));
+        if let Some(Some(d)) = date
+            && let Err(e) = crate::documents::validate_date(d)
         {
-            return Ok(Err("tags must include an allowed tag".to_owned()));
+            return Ok(Err(doc_err(e)));
         }
+        update_document_meta(c, &id, a.title.as_deref(), date, tags.as_deref(), now())?;
         Ok(Ok(()))
     })
     .await?;
     verdict?;
-    let date = a
-        .date
-        .as_deref()
-        .map(str::trim)
-        .map(|d| (!d.is_empty()).then_some(d));
-    state
-        .docs
-        .update(
-            &p.unlocked,
-            &a.id,
-            a.title.as_deref(),
-            date,
-            a.tags.as_deref(),
-            now(),
-        )
-        .map_err(doc_err)?;
     Ok(json!({"id": a.id, "updated": true}))
 }

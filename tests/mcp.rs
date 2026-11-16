@@ -15,7 +15,8 @@ use personal_media::documents::{OnDuplicate, UploadMeta};
 use personal_media::keyring::Unlocked;
 use personal_media::tokens::create_token;
 use personal_media::user_db::{
-    Access, Channel, Content, Level, TextStatus, TokenScope, set_document_access, set_text, tag_ids,
+    Access, Channel, Content, Level, TextStatus, TokenScope, get_document, set_document_access,
+    set_text, tag_ids,
 };
 use serde_json::{Value, json};
 
@@ -546,7 +547,10 @@ async fn restricted_upload_gets_allowed_tag() {
         .map(|t| t.as_str().unwrap())
         .collect();
     tags.sort();
-    assert_eq!(tags, ["private", "work"]);
+    // Ruling N: the token only sees the allowed tag; the owner sees both.
+    assert_eq!(tags, ["work"]);
+    let stored = f.u.with_db(|c| get_document(c, id)).unwrap().unwrap();
+    assert_eq!(stored.tags, ["private", "work"]);
     // A given allowed tag is not supplemented.
     let (_, out) = f
         .call(
@@ -769,4 +773,69 @@ async fn reinserted_revoked_token_row_rejected() {
         )
         .await;
     assert_eq!(status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_token_never_sees_other_tag_names() {
+    let f = Fx::new();
+    let id = f
+        .doc(
+            "a.txt",
+            "plain body",
+            &["work", "hiv-therapy"],
+            Some(Level::Full),
+        )
+        .await;
+    let tok = f.token(Access::Read, Content::FullText, Some(&["work"]));
+
+    let (err, tags) = f.call(&tok, "list_tags", json!({})).await;
+    assert!(!err);
+    assert_eq!(tags, json!(["work"]));
+
+    let (_, hits) = f
+        .call(&tok, "search_documents", json!({"query": "title"}))
+        .await;
+    assert_eq!(hits[0]["tags"], json!(["work"]));
+    assert!(!hits.to_string().contains("hiv"));
+
+    let (_, listed) = f.call(&tok, "list_documents", json!({})).await;
+    assert_eq!(listed[0]["tags"], json!(["work"]));
+
+    let (_, got) = f.call(&tok, "get_document", json!({"id": id})).await;
+    assert_eq!(got["tags"], json!(["work"]));
+    assert!(!got.to_string().contains("hiv"));
+
+    // Hidden tag names are not searchable or filterable either.
+    let (_, by_name) = f
+        .call(&tok, "search_documents", json!({"query": "hiv"}))
+        .await;
+    assert_eq!(by_name, json!([]));
+    let (_, by_tag) = f
+        .call(&tok, "list_documents", json!({"tags": ["hiv-therapy"]}))
+        .await;
+    assert_eq!(by_tag, json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restricted_update_preserves_hidden_tags() {
+    let f = Fx::new();
+    let id = f
+        .doc(
+            "a.txt",
+            "plain body",
+            &["work", "hiv-therapy"],
+            Some(Level::Full),
+        )
+        .await;
+    let tok = f.token(Access::ReadWrite, Content::FullText, Some(&["work"]));
+    let (err, _) = f
+        .call(
+            &tok,
+            "update_document",
+            json!({"id": id, "tags": ["work", "extra"]}),
+        )
+        .await;
+    assert!(!err);
+    let doc = f.u.with_db(|c| get_document(c, &id)).unwrap().unwrap();
+    assert_eq!(doc.tags, vec!["extra", "hiv-therapy", "work"]);
 }

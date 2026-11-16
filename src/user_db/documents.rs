@@ -192,7 +192,18 @@ pub fn list_tags_visible(conn: &Connection, f: &ListFilter) -> Result<Vec<(i64, 
     );
     access_clause(conn, f, &mut sql, &mut params)?;
     tag_allow_condition(f, &mut sql, &mut params);
-    sql.push_str(") ORDER BY t.name");
+    sql.push(')');
+    // A restricted token never learns the names of tags outside its allow-list,
+    // even when a visible document carries them.
+    if let Some(ids) = &f.tag_allow {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let marks = vec!["?"; ids.len()].join(",");
+        sql.push_str(&format!(" AND t.id IN ({marks})"));
+        params.extend(ids.iter().map(|i| Value::Integer(*i)));
+    }
+    sql.push_str(" ORDER BY t.name");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params_from_iter(params), |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -488,10 +499,17 @@ pub fn pending_document_ids(conn: &Connection) -> Result<Vec<String>> {
 
 /// Build an FTS5 expression from user text: every term is a quoted literal, the
 /// last one is a prefix match, terms are ANDed. `None` if nothing is left.
-fn build_match(text: &str, metadata_only: bool) -> Option<String> {
+///
+/// With `hide_tags` the `tags` column is excluded, so a tag-restricted token
+/// cannot probe the names of tags it is not allowed to see.
+fn build_match(text: &str, metadata_only: bool, hide_tags: bool) -> Option<String> {
     let terms: Vec<String> = text
         .split_whitespace()
-        .map(|t| t.replace('"', ""))
+        .map(|t| {
+            t.chars()
+                .filter(|c| *c != '"' && !c.is_control())
+                .collect::<String>()
+        })
         .filter(|t| !t.is_empty())
         .collect();
     let last = terms.len().checked_sub(1)?;
@@ -507,16 +525,20 @@ fn build_match(text: &str, metadata_only: bool) -> Option<String> {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    Some(if metadata_only {
-        format!("{{title filename tags}} : ({joined})")
-    } else {
-        joined
+    Some(match (metadata_only, hide_tags) {
+        (true, false) => format!("{{title filename tags}} : ({joined})"),
+        (true, true) => format!("{{title filename}} : ({joined})"),
+        (false, true) => format!("{{title filename content}} : ({joined})"),
+        (false, false) => joined,
     })
 }
 
 pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<SearchHit>> {
-    let (Some(full_expr), Some(meta_expr)) = (build_match(text, false), build_match(text, true))
-    else {
+    let hide_tags = f.tag_allow.is_some();
+    let (Some(full_expr), Some(meta_expr)) = (
+        build_match(text, false, hide_tags),
+        build_match(text, true, hide_tags),
+    ) else {
         return Ok(vec![]);
     };
     // (target level, raw levels to select, expression)
@@ -538,10 +560,12 @@ pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<Searc
     let mut hits: Vec<(f64, SearchHit)> = Vec::new();
     for (level, raw, expr) in passes {
         let mut params: Vec<Value> = Vec::new();
-        let snippet_col = if level == Level::Full {
-            "snippet(documents_fts, -1, char(2), char(3), '…', 12)"
-        } else {
-            "NULL"
+        // Column 4 is `content`; a restricted token must never get a snippet
+        // taken from the `tags` column.
+        let snippet_col = match (level == Level::Full, hide_tags) {
+            (true, false) => "snippet(documents_fts, -1, char(2), char(3), '…', 12)",
+            (true, true) => "snippet(documents_fts, 4, char(2), char(3), '…', 12)",
+            (false, _) => "NULL",
         };
         let mut sql = format!(
             "SELECT {DOC_COLS}, bm25(documents_fts), {snippet_col} FROM documents_fts \

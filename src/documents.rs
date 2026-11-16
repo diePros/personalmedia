@@ -95,7 +95,7 @@ impl Drop for FileGuard {
     }
 }
 
-fn validate_date(s: &str) -> Result<(), DocError> {
+pub(crate) fn validate_date(s: &str) -> Result<(), DocError> {
     let b = s.as_bytes();
     let shape = b.len() == 10
         && b[4] == b'-'
