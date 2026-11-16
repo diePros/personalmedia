@@ -23,6 +23,8 @@ struct Cli {
 enum Command {
     /// Run the web server (default)
     Serve,
+    /// Probe `GET /login` on `PM_BIND`; exit 0 on HTTP 200, else 1 (Docker HEALTHCHECK)
+    Healthcheck,
     /// Create an invite link
     Invite {
         #[arg(long)]
@@ -91,6 +93,34 @@ fn read_secret(recovery_key: bool) -> anyhow::Result<Secret> {
     })
 }
 
+/// True if `GET /login` on the bind address answers `200`. Std sockets only: the
+/// runtime image has no curl.
+fn healthcheck() -> bool {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let bind = std::env::var("PM_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let Ok(mut addr) = bind.parse::<SocketAddr>() else {
+        return false;
+    };
+    if addr.ip().is_unspecified() {
+        addr.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    let t = Duration::from_secs(3);
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, t) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(t));
+    let _ = s.set_write_timeout(Some(t));
+    let req = format!("GET /login HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    if s.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut head = [0u8; 12];
+    s.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.1 200")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -103,6 +133,9 @@ async fn main() -> anyhow::Result<()> {
             // Wipes OCR scratch and starts the extraction workers.
             let state = AppState::build(config)?;
             personal_media::web::serve(state).await?;
+        }
+        Command::Healthcheck => {
+            std::process::exit(if healthcheck() { 0 } else { 1 });
         }
         Command::Invite { admin } => {
             let config = Config::from_env()?;

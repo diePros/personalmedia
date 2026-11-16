@@ -2,7 +2,7 @@
 
 This guide sets up Personal Media on the ZimaBoard (ZimaOS + Docker) and makes it publicly reachable through **Tailscale Funnel**. TLS is terminated on the ZimaBoard itself, so no third party sees decrypted traffic.
 
-> **Status:** the application isn't built yet. Steps marked 🚧 describe the planned interface from the design (`docs/superpowers/specs/2026-11-16-personal-media-design.md`) and will be updated once the code exists. The Tailscale steps were checked against Tailscale's docs and source code (2026-11-16).
+> **Status:** v1 is implemented; the commands below match the code. The PWA, share target and iOS Shortcut are planned for v1.1 and aren't covered here. The Tailscale steps were checked against Tailscale's docs and source code (2026-11-16). Design: `docs/superpowers/specs/2026-11-16-personal-media-design.md`.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ ZimaBoard ─ tailscale container (network_mode: host) ─ terminates TLS
             personal-media container (network_mode: host, binds 127.0.0.1:8080)
                           │
                           ▼
-            /DATA/.../personal-media   (6 TB pool — encrypted data only)
+            /DATA/AppData/personal-media   (6 TB pool — encrypted data only)
 ```
 
 - The app listens on `127.0.0.1` only, so nothing else on the LAN (10.0.0.0/8) can reach it directly.
@@ -42,38 +42,49 @@ ZimaBoard ─ tailscale container (network_mode: host) ─ terminates TLS
 Create a directory on the redundant 6 TB pool, for example:
 
 ```bash
-mkdir -p /DATA/personal-media
+mkdir -p /DATA/AppData/personal-media
+chown -R 10001:10001 /DATA/AppData/personal-media   # the container runs as uid/gid 10001
 ```
 
 Everything the app stores there is encrypted per user. You can back it up as-is (see section 7).
 
-## 3. Deploy the app 🚧
+## 3. Deploy the app
 
-`docker-compose.yml` (will ship in the repo root):
+`docker-compose.yml` in the repo root:
 
 ```yaml
 services:
   personal-media:
     build: .
+    image: personal-media
     container_name: personal-media
     restart: unless-stopped
     network_mode: host
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     environment:
       PM_BIND: 127.0.0.1:8080
-      PM_PUBLIC_URL: https://<node-name>.<tailnet-name>.ts.net
+      PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
       PM_TRUSTED_PROXY: 127.0.0.1
       PM_MAX_UPLOAD_MB: "100"
     volumes:
-      - /DATA/personal-media:/data
+      - /DATA/AppData/personal-media:/data
     tmpfs:
-      - /data/tmp:size=512m,mode=0700   # OCR scratch: plaintext never touches disk
+      # OCR scratch: plaintext never touches disk
+      - /data/tmp:size=512m,mode=0700,uid=10001,gid=10001
 ```
+
+Edit `PM_PUBLIC_URL` to your real `https://<node>.<tailnet>.ts.net` address first; the app refuses to start without it. The root filesystem is read-only; only `/data` and the tmpfs are writable.
 
 ```bash
 git clone <this repo> && cd personalmedia
-docker compose up -d --build      # first Rust build on the N150 takes a while
-curl -sI http://127.0.0.1:8080/   # should answer locally
+docker compose up -d --build      # first Rust build on the N150 takes a while; it also runs the tests
+curl -sI http://127.0.0.1:8080/login   # should answer 200 locally
 ```
+
+The image installs German and English OCR data (`tesseract-ocr-deu`, `tesseract-ocr-eng`) and has a built-in health check (`personal-media healthcheck`).
 
 ## 4. Enable Funnel on the existing Tailscale container
 
@@ -118,7 +129,7 @@ Don't use Option A and Option B on the same node; the file in Option B overrides
 - `X-Forwarded-Proto: https` and `X-Forwarded-Host: <node>.<tailnet>.ts.net`.
 - `Tailscale-Funnel-Request: ?1` on requests that came in over the public internet. Requests from your own tailnet devices carry `Tailscale-User-Login` and related headers instead.
 
-## 4b. Test Funnel before the app exists
+## 4b. Test Funnel without the app (optional)
 
 A tiny echo server stands in for the app and shows exactly which headers arrive:
 
@@ -154,7 +165,7 @@ The first request after enabling Funnel can take a minute while the certificate 
 
 State-changing requests are checked with the `Sec-Fetch-Site` header, so use a browser that sends it: Chrome 76+, Firefox 90+ or Safari 16.4+ (and the matching mobile versions). Older browsers send `Origin: null` on form posts because the app sets `Referrer-Policy: no-referrer`, and the app rejects those posts, so forms fail with 403 there. `PM_PUBLIC_URL` may be written with or without the default port (`https://host` and `https://host:443` are the same origin).
 
-## 6. First admin and users 🚧
+## 6. First admin and users
 
 ```bash
 docker exec personal-media personal-media invite --admin
@@ -164,7 +175,7 @@ This prints a one-time invite URL. Open it, choose a username and password, and 
 
 Invite friends from the admin page. Each invite link is single-use and expires after 7 days.
 
-## 7. Connect Hermes (MCP) 🚧
+## 7. Connect Hermes (MCP)
 
 1. In the web UI: **Settings → Tokens → New token**. Choose the access (`read` / `read_write`), the content level (`metadata_only` / `full_text`) and optionally a tag allow-list. Copy the token (`pm_…`); it's shown only once.
 2. Add it to `~/.hermes/config.yaml`:
@@ -183,11 +194,21 @@ Treat the token like a key: it can unlock your documents within its scope. If it
 
 ## 8. Backups
 
-`/DATA/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle. Test a restore with the recovery CLI 🚧:
+`/DATA/AppData/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle. Test a restore with the recovery CLI. It prompts for the account password (add `--recovery-key` to be asked for the recovery key instead) and refuses a non-empty `--out` directory:
 
 ```bash
 docker exec -it personal-media personal-media recover --data /data --user <name> --out /data/tmp/restore-test
 ```
+
+`/data/tmp` is RAM-backed, so restore a small account or point `--out` at a path you can write to. Anything you decrypt there is plaintext; delete it afterwards.
+
+## Verify after deploy
+
+- [ ] The login page loads over the `ts.net` URL from a phone on mobile data (Tailscale off).
+- [ ] Signup with the admin invite works, and you saved the recovery key.
+- [ ] Uploading a scanned German PDF gets it OCR'd, and a search for a word from it finds it.
+- [ ] `docker exec personal-media sh -c 'ls /data/tmp'` prints nothing when the app is idle.
+- [ ] `docker ps` shows `personal-media` as `healthy`.
 
 ## 9. Updating
 
