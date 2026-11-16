@@ -13,6 +13,7 @@
 pub mod admin;
 pub mod auth;
 pub mod docs;
+pub mod pwa;
 pub mod ratelimit;
 pub mod session;
 pub mod settings;
@@ -149,8 +150,10 @@ pub fn build_app(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(docs::routes(&state))
         .merge(settings::routes())
+        .merge(pwa::routes())
         .merge(crate::mcp::routes(&state))
         .route("/static/{file}", get(static_file))
+        .route("/static/icons/{file}", get(icon_file))
         // Container health probe: no body, no auth, not access-logged.
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         // Layers run bottom-up: access log, then headers, then session + CSRF.
@@ -459,6 +462,7 @@ async fn access_log(req: Request, next: Next) -> Response {
 // ---------------------------------------------------------------------------
 
 const JS: &str = "text/javascript; charset=utf-8";
+const PNG: &str = "image/png";
 
 /// `(file name, content type, bytes)`. Add new assets here.
 const STATIC_FILES: &[(&str, &str, &[u8])] = &[
@@ -473,9 +477,38 @@ const STATIC_FILES: &[(&str, &str, &[u8])] = &[
         JS,
         include_bytes!("../../static/htmx.min.js"),
     ),
+    (
+        "offline.html",
+        "text/html; charset=utf-8",
+        include_bytes!("../../static/offline.html"),
+    ),
+    (
+        "icons/icon-192.png",
+        PNG,
+        include_bytes!("../../static/icons/icon-192.png"),
+    ),
+    (
+        "icons/icon-512.png",
+        PNG,
+        include_bytes!("../../static/icons/icon-512.png"),
+    ),
+    (
+        "icons/icon-maskable-512.png",
+        PNG,
+        include_bytes!("../../static/icons/icon-maskable-512.png"),
+    ),
 ];
 
 async fn static_file(Path(file): Path<String>) -> Response {
+    serve_static(&file)
+}
+
+/// `/static/icons/{file}`: the entries of [`STATIC_FILES`] named `icons/...`.
+async fn icon_file(Path(file): Path<String>) -> Response {
+    serve_static(&format!("icons/{file}"))
+}
+
+fn serve_static(file: &str) -> Response {
     let Some((_, content_type, bytes)) = STATIC_FILES.iter().find(|(name, ..)| *name == file)
     else {
         return StatusCode::NOT_FOUND.into_response();

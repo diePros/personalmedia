@@ -152,6 +152,15 @@
     });
   }
 
+  // Installable app: the worker caches only the static app shell.
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker
+        .register("/sw.js", { scope: "/" })
+        .catch(function () {});
+    });
+  }
+
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initUpload);
   } else {
