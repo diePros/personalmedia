@@ -225,6 +225,54 @@ async fn upload_too_large_413() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn oversized_text_field_before_the_file_is_413() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let big = "x".repeat(8 * 1024 + 1);
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[("title", &big)],
+            &[("file", "a.bin", "application/octet-stream", b"hi")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 413);
+    let ok = "x".repeat(8 * 1024);
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[("title", &ok)],
+            &[("file", "a.bin", "application/octet-stream", b"hi")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_aborted_upload_is_400_not_500() {
+    use axum::body::Body;
+    use axum::http::{Method, header};
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    // The body ends in the middle of the file part: no closing boundary.
+    let body =
+        "--b\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.pdf\"\r\n\r\nPARTIAL";
+    let req = builder(Method::POST, "/api/upload", &c)
+        .header("sec-fetch-site", "same-origin")
+        .header("x-csrf-token", &c.csrf)
+        .header(header::CONTENT_TYPE, "multipart/form-data; boundary=b")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = t.request(req).await;
+    assert_eq!(resp.status(), 400);
+    assert!(body_string(resp).await.contains("upload aborted"));
+    let list = body_string(t.get("/documents", &c).await).await;
+    assert!(list.contains("No documents yet."), "nothing was stored");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn duplicate_upload_returns_duplicate_json() {
     let t = TestApp::new();
     let c = t.session_for("alice");
@@ -550,6 +598,10 @@ async fn pagination_links() {
     let html = body_string(t.get("/documents", &c).await).await;
     assert!(html.contains("rel=\"next\""));
     assert!(!html.contains("rel=\"prev\""));
+    // Live pager: htmx swap without touching the address bar, plain href as fallback.
+    assert!(html.contains(
+        "href=\"/documents?page=2\" rel=\"next\" hx-get=\"/documents?page=2\" hx-target=\"#results\" hx-push-url=\"false\""
+    ));
     let html = body_string(t.get("/documents?page=2", &c).await).await;
     assert!(html.contains("rel=\"prev\""));
     assert!(!html.contains("rel=\"next\""));

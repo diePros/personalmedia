@@ -12,6 +12,7 @@
 #![allow(clippy::result_large_err)] // helpers return a ready `Response` as the error
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use askama::Template;
@@ -22,7 +23,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use serde::Deserialize;
 
 use super::session::{CsrfForm, CurrentUser, NoFields};
@@ -228,6 +229,38 @@ fn parse_tags(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Longest text field accepted before the file. Text fields are buffered in
+/// memory, so they are capped far below the upload limit.
+const TEXT_FIELD_MAX: usize = 8 * 1024;
+
+async fn read_text_field(
+    mut field: axum::extract::multipart::Field<'_>,
+) -> Result<String, Response> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match field.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > TEXT_FIELD_MAX {
+                    return Err(json_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "form field too large",
+                    ));
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                return Err(json_error(
+                    StatusCode::BAD_REQUEST,
+                    "malformed multipart body",
+                ));
+            }
+        }
+    }
+    String::from_utf8(buf)
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "malformed multipart body"))
+}
+
 async fn upload(
     State(state): State<AppState>,
     CurrentUser(session): CurrentUser,
@@ -270,12 +303,17 @@ pub async fn handle_upload(
                 document_date: date.take(),
             };
             let filter = web_filter();
+            // A body error while the file streams in means the client went away.
+            let client_gone = Arc::new(AtomicBool::new(false));
+            let flag = client_gone.clone();
+            let body =
+                field.map(move |chunk| chunk.inspect_err(|_| flag.store(true, Ordering::Relaxed)));
             return match state
                 .docs
                 .store(
                     &unlocked,
                     meta,
-                    Box::pin(field),
+                    Box::pin(body),
                     on_dup,
                     Some(&filter),
                     now(),
@@ -283,11 +321,16 @@ pub async fn handle_upload(
                 .await
             {
                 Ok(outcome) => axum::Json(outcome).into_response(),
+                Err(DocError::Internal(_)) if client_gone.load(Ordering::Relaxed) => {
+                    tracing::info!("upload aborted by the client");
+                    json_error(StatusCode::BAD_REQUEST, "upload aborted")
+                }
                 Err(e) => doc_error(e),
             };
         }
-        let Ok(value) = field.text().await else {
-            return json_error(StatusCode::BAD_REQUEST, "malformed multipart body");
+        let value = match read_text_field(field).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
         };
         match name.as_str() {
             "title" => title = Some(value).filter(|v| !v.trim().is_empty()),
@@ -537,7 +580,8 @@ struct DetailPage {
     created: String,
     status: &'static str,
     can_retry: bool,
-    /// Web level is `Full`: preview, download and edit forms are shown.
+    /// Web level is `Full`: preview and download are shown. The edit and
+    /// access forms do not depend on it.
     full: bool,
     preview_pdf: bool,
     preview_image: bool,
@@ -900,9 +944,12 @@ async fn set_access(
             if get_document(c, &doc_id)?.is_none() {
                 return Ok(None);
             }
-            set_document_access(c, &doc_id, Channel::Web, web)?;
-            set_document_access(c, &doc_id, Channel::Mcp, mcp)?;
-            set_document_access(c, &doc_id, Channel::SemanticIndex, sem)?;
+            // All three overrides change together or not at all.
+            let tx = c.unchecked_transaction()?;
+            set_document_access(&tx, &doc_id, Channel::Web, web)?;
+            set_document_access(&tx, &doc_id, Channel::Mcp, mcp)?;
+            set_document_access(&tx, &doc_id, Channel::SemanticIndex, sem)?;
+            tx.commit()?;
             Ok(Some(web_level(c, &doc_id)?))
         },
     )

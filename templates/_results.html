@@ -19,8 +19,8 @@
 {% endif -%}
 {% if results.prev_url.is_some() || results.next_url.is_some() -%}
 <nav class="pager" aria-label="Pages">
-{% if let Some(url) = results.prev_url %}<a href="{{ url }}" rel="prev">Previous</a>{% endif -%}
+{% if let Some(url) = results.prev_url %}<a href="{{ url }}" rel="prev" hx-get="{{ url }}" hx-target="#results" hx-push-url="false">Previous</a>{% endif -%}
 <span class="muted">Page {{ results.page_no }}</span>
-{% if let Some(url) = results.next_url %}<a href="{{ url }}" rel="next">Next</a>{% endif -%}
+{% if let Some(url) = results.next_url %}<a href="{{ url }}" rel="next" hx-get="{{ url }}" hx-target="#results" hx-push-url="false">Next</a>{% endif -%}
 </nav>
 {% endif -%}
