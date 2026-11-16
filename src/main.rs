@@ -6,9 +6,11 @@ use clap::{Parser, Subcommand};
 use personal_media::accounts::Accounts;
 use personal_media::config::Config;
 use personal_media::keyring::{Keyring, OnUnlock, Unlocked};
+use personal_media::recover::{RecoverError, Secret};
 use personal_media::system_db::{Role, SYSTEM_DB_FILE, SystemDb};
 use personal_media::web::AppState;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "personal-media", version)]
@@ -34,6 +36,9 @@ enum Command {
         user: String,
         #[arg(long)]
         out: PathBuf,
+        /// Unlock with the recovery key instead of the password
+        #[arg(long)]
+        recovery_key: bool,
     },
 }
 
@@ -66,6 +71,26 @@ fn create_invite(config: &Config, admin: bool) -> anyhow::Result<String> {
     accounts.create_invite(role, now)
 }
 
+/// `PM_RECOVER_SECRET` if set (tests), otherwise a prompt on the TTY.
+fn read_secret(recovery_key: bool) -> anyhow::Result<Secret> {
+    let value = match std::env::var("PM_RECOVER_SECRET") {
+        Ok(v) => Zeroizing::new(v),
+        Err(_) => {
+            let prompt = if recovery_key {
+                "Recovery key: "
+            } else {
+                "Password: "
+            };
+            Zeroizing::new(rpassword::prompt_password(prompt)?)
+        }
+    };
+    Ok(if recovery_key {
+        Secret::RecoveryKey(value)
+    } else {
+        Secret::Password(value)
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -84,7 +109,25 @@ async fn main() -> anyhow::Result<()> {
             config.require_public_url()?;
             println!("{}", create_invite(&config, admin)?);
         }
-        Command::Recover { .. } => println!("not implemented"),
+        Command::Recover {
+            data,
+            user,
+            out,
+            recovery_key,
+        } => {
+            let secret = read_secret(recovery_key)?;
+            match personal_media::recover::recover(&data, &user, &secret, &out) {
+                Ok(n) => println!("Recovered {n} documents to {}", out.display()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    let code = match e {
+                        RecoverError::OutNotEmpty(_) => 2,
+                        _ => 1,
+                    };
+                    std::process::exit(code);
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -27,6 +27,24 @@ pub struct Unlocked {
 }
 
 impl Unlocked {
+    /// Unwrap the index key with `umk` and open the user's index DB, without
+    /// registering anywhere (the offline recovery CLI has no keyring).
+    pub fn open(
+        data_dir: &Path,
+        user_id: &str,
+        umk: Key32,
+        index_key_wrapped: &[u8],
+    ) -> anyhow::Result<Unlocked> {
+        let index_key = unwrap_key(&umk, index_key_wrapped, aad::index_key(user_id).as_bytes())
+            .context("unwrapping index key")?;
+        let conn = open_user_db(&index_db_path(data_dir, user_id), &index_key)?;
+        Ok(Unlocked {
+            user_id: user_id.to_string(),
+            umk,
+            db: Mutex::new(conn),
+        })
+    }
+
     pub fn umk(&self) -> &Key32 {
         &self.umk
     }
@@ -91,14 +109,12 @@ impl Keyring {
             }
             map.retain(|_, w| w.strong_count() > 0);
 
-            let index_key = unwrap_key(&umk, index_key_wrapped, aad::index_key(user_id).as_bytes())
-                .context("unwrapping index key")?;
-            let conn = open_user_db(&index_db_path(&self.data_dir, user_id), &index_key)?;
-            let fresh = Arc::new(Unlocked {
-                user_id: user_id.to_string(),
+            let fresh = Arc::new(Unlocked::open(
+                &self.data_dir,
+                user_id,
                 umk,
-                db: Mutex::new(conn),
-            });
+                index_key_wrapped,
+            )?);
             map.insert(user_id.to_string(), Arc::downgrade(&fresh));
             fresh
         };

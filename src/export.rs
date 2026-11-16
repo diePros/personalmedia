@@ -99,6 +99,26 @@ struct MetaEntry<'a> {
     created_at: i64,
 }
 
+/// The pretty-printed `metadata.json` for `docs` and their `plan` (as made by
+/// [`plan_entries`]). Shared by the ZIP export and the recovery CLI.
+pub fn metadata_json(docs: &[Document], plan: &[(String, String)]) -> anyhow::Result<Vec<u8>> {
+    let meta: Vec<MetaEntry> = docs
+        .iter()
+        .zip(plan)
+        .map(|(d, (_, path))| MetaEntry {
+            id: &d.id,
+            title: &d.title,
+            original_filename: &d.original_filename,
+            zip_path: path,
+            mime: &d.mime,
+            document_date: d.document_date.as_deref(),
+            tags: &d.tags,
+            created_at: d.created_at,
+        })
+        .collect();
+    Ok(serde_json::to_vec_pretty(&meta)?)
+}
+
 /// Every document of the user, oldest first. Ignores the switchboard.
 pub fn all_documents(u: &Unlocked) -> anyhow::Result<Vec<Document>> {
     let mut all = Vec::new();
@@ -131,22 +151,8 @@ pub fn write_export<W: Write>(docs: &Documents, u: &Unlocked, out: W) -> anyhow:
         .large_file(true);
     let mut zip = ZipWriter::new_stream(out);
 
-    let meta: Vec<MetaEntry> = all
-        .iter()
-        .zip(&plan)
-        .map(|(d, (_, path))| MetaEntry {
-            id: &d.id,
-            title: &d.title,
-            original_filename: &d.original_filename,
-            zip_path: path,
-            mime: &d.mime,
-            document_date: d.document_date.as_deref(),
-            tags: &d.tags,
-            created_at: d.created_at,
-        })
-        .collect();
     zip.start_file("metadata.json", options)?;
-    zip.write_all(&serde_json::to_vec_pretty(&meta)?)?;
+    zip.write_all(&metadata_json(&all, &plan)?)?;
 
     for (id, path) in &plan {
         let (_, mut reader) = docs
