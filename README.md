@@ -39,7 +39,8 @@ Configuration is by environment variables (`PM_DATA_DIR`, `PM_BIND`, `PM_PUBLIC_
 ## MCP endpoint
 
 `POST /mcp` speaks MCP (protocol `2025-11-25`; `2025-06-18` and `2024-11-05` are also
-negotiated, `2025-03-26` is not because it requires JSON-RPC batches) over stateless Streamable HTTP with plain JSON responses. Authenticate with
+negotiated, `2025-03-26` is not because it requires JSON-RPC batches) over stateless Streamable
+HTTP with plain JSON responses. Authenticate with
 `Authorization: Bearer pm_...` (a token created under Settings). Tools: `search_documents`,
 `list_documents`, `get_document`, `list_tags`, `upload_document`, `update_document` (the
 two write tools are only listed for `read_write` tokens).
@@ -48,3 +49,16 @@ Deviation from the plan: this is a small hand-written JSON-RPC 2.0 handler (`src
 not the `rmcp` SDK. The endpoint is stateless and each request needs its own authenticated
 principal; a minimal handler keeps that auditable and avoids the SDK's session handling and
 host allow-list. There is no SSE stream: `GET /mcp` is 405.
+
+## Security notes
+
+- Tag-restricted MCP tokens never see tag names outside their allow-list: not in `list_tags`, not
+  on documents (the `tags` of every returned document are filtered), not through search or tag
+  filters. `update_document` keeps tags the token cannot see on the document.
+- Duplicate oracle for `metadata_only` write tokens: an upload that matches a visible
+  document's bytes is answered with that document's id and title, so a `metadata_only` write token
+  can confirm that a visible document has exactly the bytes it uploads. It needs the exact file and
+  reveals nothing about documents the token cannot see, so it is documented rather than closed.
+- Offline recovery (`personal-media recover`) opens both databases read-only and reads the secret
+  from stdin or a prompt (the `PM_RECOVER_SECRET` variable only exists in debug builds). See
+  [docs/setup.md](docs/setup.md) section 8.

@@ -11,7 +11,7 @@ fn serve_once(response: &'static str) -> String {
         if let Ok((mut s, _)) = l.accept() {
             let mut buf = [0u8; 1024];
             let n = s.read(&mut buf).unwrap_or(0);
-            assert!(buf[..n].starts_with(b"GET /login HTTP/1.1"));
+            assert!(buf[..n].starts_with(b"GET /healthz HTTP/1.1"));
             let _ = s.write_all(response.as_bytes());
         }
     });
@@ -27,8 +27,8 @@ fn run(bind: &str) -> assert_cmd::assert::Assert {
 }
 
 #[test]
-fn healthy_on_200() {
-    let addr = serve_once("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+fn healthy_on_204() {
+    let addr = serve_once("HTTP/1.1 204 No Content\r\n\r\n");
     run(&addr).success();
 }
 

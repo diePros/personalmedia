@@ -115,7 +115,7 @@ fn read_secret(recovery_key: bool) -> anyhow::Result<Secret> {
     })
 }
 
-/// True if `GET /login` on the bind address answers `200`. Std sockets only: the
+/// True if `GET /healthz` on the bind address answers `204`. Std sockets only: the
 /// runtime image has no curl.
 fn healthcheck() -> bool {
     use std::io::{Read, Write};
@@ -135,12 +135,12 @@ fn healthcheck() -> bool {
     };
     let _ = s.set_read_timeout(Some(t));
     let _ = s.set_write_timeout(Some(t));
-    let req = format!("GET /login HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     if s.write_all(req.as_bytes()).is_err() {
         return false;
     }
     let mut head = [0u8; 12];
-    s.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.1 200")
+    s.read_exact(&mut head).is_ok() && head.starts_with(b"HTTP/1.1 204")
 }
 
 #[tokio::main]

@@ -151,6 +151,8 @@ pub fn build_app(state: AppState) -> Router {
         .merge(settings::routes())
         .merge(crate::mcp::routes(&state))
         .route("/static/{file}", get(static_file))
+        // Container health probe: no body, no auth, not access-logged.
+        .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
         // Layers run bottom-up: access log, then headers, then session + CSRF.
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -438,6 +440,10 @@ async fn access_log(req: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map_or_else(|| "<unmatched>".to_owned(), |p| p.as_str().to_owned());
     let resp = next.run(req).await;
+    // The health probe fires every 30 s; it would only drown the log.
+    if path == "/healthz" {
+        return resp;
+    }
     tracing::info!(
         %method,
         path,

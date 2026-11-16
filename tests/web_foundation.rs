@@ -540,3 +540,16 @@ async fn static_assets_cached_pages_not() {
         assert_eq!(header_str(&resp, "cache-control"), "no-store");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn healthz_is_204_and_not_access_logged() {
+    let capture = install_capture();
+    let app = TestApp::new();
+    let resp = app.get("/healthz", &Client::anon()).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // A logged request right after proves the subscriber is live.
+    app.get("/login", &Client::anon()).await;
+    let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(out.contains("path=\"/login\""), "{out}");
+    assert!(!out.contains("healthz"), "{out}");
+}

@@ -65,7 +65,9 @@ fn recover(data: &Path, out: &Path, secret: &str, extra: &[&str]) -> assert_cmd:
         .arg("--out")
         .arg(out)
         .args(extra)
-        .env("PM_RECOVER_SECRET", secret)
+        // The secret goes in on stdin, as it does for a production binary
+        // (PM_RECOVER_SECRET only exists in debug builds).
+        .write_stdin(format!("{secret}\n"))
         .assert()
 }
 
@@ -128,7 +130,7 @@ async fn wrong_secret_exits_nonzero_and_writes_nothing() {
         .arg(dir.path())
         .arg("--out")
         .arg(&out)
-        .env("PM_RECOVER_SECRET", PASSWORD)
+        .write_stdin(format!("{PASSWORD}\n"))
         .assert()
         .code(1);
     assert!(stderr(&a).contains("could not unlock"));
@@ -231,7 +233,6 @@ async fn secret_is_read_from_stdin_when_not_a_tty() {
         .arg(dir.path())
         .arg("--out")
         .arg(&out)
-        .env_remove("PM_RECOVER_SECRET")
         .write_stdin(format!("{PASSWORD}\n"))
         .assert()
         .success();

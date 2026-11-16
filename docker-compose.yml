@@ -9,6 +9,13 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     environment:
       PM_BIND: 127.0.0.1:8080
       PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL

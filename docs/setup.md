@@ -64,6 +64,13 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
     environment:
       PM_BIND: 127.0.0.1:8080
       PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
@@ -76,7 +83,7 @@ services:
       - /data/tmp:size=512m,mode=0700,uid=10001,gid=10001
 ```
 
-Edit `PM_PUBLIC_URL` to your real `https://<node>.<tailnet>.ts.net` address first; the app refuses to start without it. The root filesystem is read-only; only `/data` and the tmpfs are writable.
+Edit `PM_PUBLIC_URL` to your real `https://<node>.<tailnet>.ts.net` address first; the app refuses to start (and `invite` refuses to run) unless it is an `https://host[:port]` URL. The root filesystem is read-only; only `/data` and the tmpfs are writable.
 
 Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` is unverified):
 
@@ -103,7 +110,7 @@ Then check it answers locally:
 curl -sI http://127.0.0.1:8080/login   # should answer 200
 ```
 
-The image installs German and English OCR data (`tesseract-ocr-deu`, `tesseract-ocr-eng`) and has a built-in health check (`personal-media healthcheck`).
+The image installs German and English OCR data (`tesseract-ocr-deu`, `tesseract-ocr-eng`) and has a built-in health check (`personal-media healthcheck`, which requests `/healthz` and is not written to the access log).
 
 ## 4. Enable Funnel on the existing Tailscale container
 
