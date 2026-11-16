@@ -34,6 +34,45 @@ where
         .with_context(|| format!("invalid value for {name}"))
 }
 
+/// `https://host[:port]` (a trailing `/` is fine). For local development
+/// `http://localhost[:port]` and `http://127.0.0.1[:port]` are accepted too.
+/// No path, query, user info or placeholder characters.
+pub fn validate_public_url(url: &str) -> Result<()> {
+    let bad = || {
+        anyhow::anyhow!(
+            "PM_PUBLIC_URL must be an https://host[:port] URL such as \
+             https://node.tailnet.ts.net (got {url:?})"
+        )
+    };
+    let url = url.strip_suffix('/').unwrap_or(url);
+    let (https, rest) = match url.strip_prefix("https://") {
+        Some(r) => (true, r),
+        None => (false, url.strip_prefix("http://").ok_or_else(bad)?),
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    if let Some(p) = port
+        && (p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) || p.parse::<u16>().is_err())
+    {
+        return Err(bad());
+    }
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if host.is_empty() || !host.split('.').all(label_ok) {
+        return Err(bad());
+    }
+    if !https && host != "localhost" && host != "127.0.0.1" {
+        return Err(bad());
+    }
+    Ok(())
+}
+
 impl Config {
     /// Build the configuration from `PM_*` environment variables.
     /// `PM_PUBLIC_URL` is not required here; commands that need it use
@@ -57,9 +96,11 @@ impl Config {
         })
     }
 
-    /// Fails if `PM_PUBLIC_URL` is unset (required for `serve` and `invite`).
+    /// Fails if `PM_PUBLIC_URL` is unset or not a plain `https://host[:port]`
+    /// origin (required for `serve` and `invite`).
     pub fn require_public_url(&self) -> Result<&str> {
         anyhow::ensure!(!self.public_url.is_empty(), "PM_PUBLIC_URL is required");
+        validate_public_url(&self.public_url)?;
         Ok(&self.public_url)
     }
 
