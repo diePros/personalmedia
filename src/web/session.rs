@@ -216,7 +216,7 @@ pub fn clear_session_cookie() -> HeaderValue {
     HeaderValue::from_static("pm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0")
 }
 
-fn session_id(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn session_id(headers: &HeaderMap) -> Option<&str> {
     headers
         .get_all(header::COOKIE)
         .iter()

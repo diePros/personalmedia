@@ -372,3 +372,90 @@ fn cli_invite_prints_url() {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     );
 }
+
+async fn login_with(app: &TestApp, extra: &[(&str, &str)]) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::{Method, header};
+    let mut b = common::builder(Method::POST, "/login", &Client::anon())
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    for (k, v) in extra {
+        b = b.header(*k, *v);
+    }
+    let body = format!("username=alice&password={}", PASSWORD.replace(' ', "+"));
+    app.request(b.body(Body::from(body)).unwrap()).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_site_login_post_is_403() {
+    let app = TestApp::new();
+    app.session_for("alice");
+    assert_eq!(
+        login_with(&app, &[("sec-fetch-site", "cross-site")])
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(
+        login_with(&app, &[("origin", "https://evil.example")])
+            .await
+            .status(),
+        403
+    );
+    assert_eq!(login_with(&app, &[("origin", "null")]).await.status(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_origin_login_post_ok() {
+    let app = TestApp::new();
+    app.session_for("alice");
+    let r = login_with(
+        &app,
+        &[
+            ("origin", "https://test.example"),
+            ("sec-fetch-site", "same-origin"),
+        ],
+    )
+    .await;
+    assert_eq!(r.status(), 303);
+    assert_eq!(login_with(&app, &[]).await.status(), 303);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bearer_request_without_cookie_skips_origin_check() {
+    let app = TestApp::new();
+    let hdrs = [
+        ("authorization", "Bearer pm_x"),
+        ("origin", "https://evil.example"),
+    ];
+    // Passes the guard (the login handler then answers, not a 403).
+    assert_ne!(login_with(&app, &hdrs).await.status(), 403);
+    // With a session cookie the exemption does not apply.
+    let c = app.session_for("alice");
+    use axum::body::Body;
+    use axum::http::Method;
+    let req = common::builder(Method::POST, "/logout", &c)
+        .header("authorization", "Bearer pm_x")
+        .header("origin", "https://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.request(req).await.status(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn relogin_removes_previous_session() {
+    let app = TestApp::new();
+    let old = app.signup_and_login("alice").await;
+    assert_eq!(app.get("/documents", &old).await.status(), 200);
+    let resp = app
+        .post_form(
+            "/login",
+            &[("username", "alice"), ("password", PASSWORD)],
+            &old,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    let new = client_from_response(&resp);
+    assert_ne!(new.cookie, old.cookie);
+    assert_eq!(app.get("/documents", &old).await.status(), 303);
+    assert_eq!(app.get("/documents", &new).await.status(), 200);
+}

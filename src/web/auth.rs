@@ -77,6 +77,10 @@ fn start_session(
     } else {
         "/documents"
     };
+    // A previous session on this browser must not outlive the new login.
+    if let Some(old) = super::session::session_id(headers) {
+        state.sessions.remove(old);
+    }
     let (cookie, _csrf) = state.sessions.create(user, unlocked, recovery);
     let mut resp = redirect(headers, to);
     resp.headers_mut()

@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{MatchedPath, Path, Request};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{MatchedPath, Path, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
@@ -122,6 +122,7 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             session::session_layer,
         ))
+        .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(access_log))
         .with_state(state)
@@ -233,6 +234,50 @@ pub fn render(template: &impl Template) -> Response {
 // ---------------------------------------------------------------------------
 // Layers
 // ---------------------------------------------------------------------------
+
+/// Paths that may receive cross-origin state-changing requests (for example
+/// an OS share target). Empty for now; Task 18 adds `/share`.
+const ORIGIN_EXEMPT_PATHS: &[&str] = &[];
+
+/// `scheme://host[:port]` of a URL, lowercased.
+fn origin_of(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    format!("{scheme}://{authority}").to_ascii_lowercase()
+}
+
+/// Rejects cross-origin state-changing requests (login CSRF: the cookie-less
+/// login/signup/recover posts have no token). 403 when `Sec-Fetch-Site` is
+/// `cross-site` or an `Origin` header differs from `cfg.public_url`. Requests
+/// with neither header pass (curl, old browsers). Bearer-authenticated
+/// requests without a session cookie and [`ORIGIN_EXEMPT_PATHS`] are exempt.
+async fn origin_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(req).await;
+    }
+    let headers = req.headers();
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.len() > 7 && v[..7].eq_ignore_ascii_case("bearer "));
+    if (bearer && session::session_id(headers).is_none())
+        || ORIGIN_EXEMPT_PATHS.contains(&req.uri().path())
+    {
+        return next.run(req).await;
+    }
+    let cross_site = headers
+        .get("sec-fetch-site")
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"cross-site"));
+    let bad_origin = headers.get(header::ORIGIN).is_some_and(|v| {
+        v.to_str().map_or(true, |o| {
+            o.to_ascii_lowercase() != origin_of(&state.cfg.public_url)
+        })
+    });
+    if cross_site || bad_origin {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(req).await
+}
 
 /// Sets the security headers on every response and `Cache-Control: no-store`
 /// on every response that did not choose its own caching (static assets do).
