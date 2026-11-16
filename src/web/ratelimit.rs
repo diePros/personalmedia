@@ -4,12 +4,13 @@
 //!
 //! ```ignore
 //! let keys = [ip_key(ip), user_key(&username)];
-//! if let Err(retry) = state.limiter.check(&keys) {
-//!     return too_many_requests(retry);
-//! }
-//! match attempt {
-//!     Ok(_) => state.limiter.record_success(&keys[1]),
-//!     Err(_) => state.limiter.record_failure(&keys),
+//! let attempt = match state.limiter.begin(&keys) {
+//!     Ok(a) => a,
+//!     Err(retry) => return too_many_requests(retry),
+//! };
+//! match check_credentials() {
+//!     Ok(_) => attempt.success(),
+//!     Err(_) => attempt.failure(), // also what dropping the attempt does
 //! }
 //! ```
 
@@ -77,15 +78,55 @@ pub fn too_many_requests(retry_after: Duration) -> Response {
 #[derive(Default)]
 struct Entry {
     failures: Vec<Instant>,
+    /// Attempts begun but not settled yet. They count like failures, so a
+    /// burst of parallel requests cannot all pass before the first one fails.
+    in_flight: usize,
     locked_until: Option<Instant>,
 }
 
 /// Counts failures per key: [`MAX_FAILURES`] within [`WINDOW`] lock the key
 /// for [`LOCK`]. Keys are built with [`ip_key`], [`user_key`] and [`mcp_ip_key`].
+///
+/// Attempts are reserved up front with [`RateLimiter::begin`] and settled with
+/// [`Attempt::success`] or [`Attempt::failure`] (reserve-then-settle).
 #[derive(Default)]
 pub struct RateLimiter {
     entries: Mutex<HashMap<String, Entry>>,
 }
+
+/// A reserved slot on a set of keys. Dropping it unsettled counts as a failure.
+#[must_use = "settle the attempt with success() or failure()"]
+pub struct Attempt<'a> {
+    limiter: &'a RateLimiter,
+    keys: Vec<String>,
+    settled: bool,
+}
+
+impl Attempt<'_> {
+    /// The credentials were right: release the slot and forget the `user:`
+    /// keys' failures. `ip:` failures stay.
+    pub fn success(mut self) {
+        self.settled = true;
+        self.limiter.settle(&self.keys, true);
+    }
+
+    /// The credentials were wrong: the reserved slot becomes a failure.
+    pub fn failure(mut self) {
+        self.settled = true;
+        self.limiter.settle(&self.keys, false);
+    }
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.limiter.settle(&self.keys, false);
+        }
+    }
+}
+
+/// Retry hint when the limit is reached only by attempts still in flight.
+const IN_FLIGHT_RETRY: Duration = Duration::from_secs(5);
 
 impl RateLimiter {
     pub fn new() -> RateLimiter {
@@ -97,28 +138,55 @@ impl RateLimiter {
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// `Err(retry_after)` if any of `keys` is locked (the longest remaining lock).
-    pub fn check(&self, keys: &[String]) -> Result<(), Duration> {
+    /// Reserve one attempt on every key, or `Err(retry_after)` if any key is
+    /// locked or has [`MAX_FAILURES`] failures plus attempts in flight. All
+    /// keys are checked and counted under one lock.
+    pub fn begin(&self, keys: &[String]) -> Result<Attempt<'_>, Duration> {
         let now = Instant::now();
-        let entries = self.lock();
-        let remaining = keys
-            .iter()
-            .filter_map(|k| entries.get(k)?.locked_until)
-            .filter_map(|until| until.checked_duration_since(now))
-            .filter(|d| !d.is_zero())
-            .max();
-        match remaining {
-            Some(d) => Err(d),
-            None => Ok(()),
+        let mut entries = self.lock();
+        let mut retry: Option<Duration> = None;
+        for key in keys {
+            let Some(e) = entries.get_mut(key) else {
+                continue;
+            };
+            e.failures.retain(|t| now.duration_since(*t) < WINDOW);
+            let wait = match e.locked_until.and_then(|u| u.checked_duration_since(now)) {
+                Some(d) if !d.is_zero() => Some(d),
+                _ if e.failures.len() + e.in_flight >= MAX_FAILURES => Some(IN_FLIGHT_RETRY),
+                _ => None,
+            };
+            if let Some(d) = wait {
+                retry = Some(retry.map_or(d, |r| r.max(d)));
+            }
         }
+        if let Some(d) = retry {
+            return Err(d);
+        }
+        for key in keys {
+            entries.entry(key.clone()).or_default().in_flight += 1;
+        }
+        Ok(Attempt {
+            limiter: self,
+            keys: keys.to_vec(),
+            settled: false,
+        })
     }
 
-    /// Count one failure against each of `keys`, locking those that reach the limit.
-    pub fn record_failure(&self, keys: &[String]) {
+    fn settle(&self, keys: &[String], success: bool) {
         let now = Instant::now();
         let mut entries = self.lock();
         for key in keys {
-            let e = entries.entry(key.clone()).or_default();
+            let Some(e) = entries.get_mut(key) else {
+                continue;
+            };
+            e.in_flight = e.in_flight.saturating_sub(1);
+            if success {
+                if key.starts_with("user:") {
+                    e.failures.clear();
+                    e.locked_until = None;
+                }
+                continue;
+            }
             e.failures.retain(|t| now.duration_since(*t) < WINDOW);
             e.failures.push(now);
             if e.failures.len() >= MAX_FAILURES {
@@ -128,19 +196,14 @@ impl RateLimiter {
         }
     }
 
-    /// Forget `key` (used for the `user:` key after a successful login).
-    pub fn record_success(&self, key: &str) {
-        self.lock().remove(key);
-    }
-
-    /// Drop entries with no active lock and no recent failure. Called
-    /// periodically so the map cannot grow without bound.
+    /// Drop entries with no active lock, no recent failure and nothing in
+    /// flight. Called periodically so the map cannot grow without bound.
     pub fn sweep(&self) {
         let now = Instant::now();
         self.lock().retain(|_, e| {
             e.failures.retain(|t| now.duration_since(*t) < WINDOW);
             let locked = e.locked_until.is_some_and(|until| until > now);
-            locked || !e.failures.is_empty()
+            locked || !e.failures.is_empty() || e.in_flight > 0
         });
     }
 }
@@ -160,6 +223,7 @@ mod tests {
                 Entry {
                     failures: vec![now],
                     locked_until: None,
+                    ..Entry::default()
                 },
             );
             entries.insert(
@@ -167,6 +231,7 @@ mod tests {
                 Entry {
                     failures: vec![],
                     locked_until: Some(now + LOCK),
+                    ..Entry::default()
                 },
             );
             entries.insert("ip:idle".into(), Entry::default());
@@ -176,6 +241,7 @@ mod tests {
                     Entry {
                         failures: vec![],
                         locked_until: Some(past),
+                        ..Entry::default()
                     },
                 );
             }
@@ -199,8 +265,9 @@ mod tests {
             Entry {
                 failures: vec![],
                 locked_until: Some(past),
+                ..Entry::default()
             },
         );
-        assert!(limiter.check(&["user:a".to_string()]).is_ok());
+        assert!(limiter.begin(&["user:a".to_string()]).is_ok());
     }
 }

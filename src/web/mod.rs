@@ -38,10 +38,16 @@ use crate::system_db::{SYSTEM_DB_FILE, SystemDb};
 use crate::tokens::TokenCache;
 use ratelimit::RateLimiter;
 use session::{Session, SessionStore};
+use tokio::sync::Semaphore;
 
 /// Default `Content-Security-Policy`. A route may replace it with [`CspOverride`].
 pub const CSP: &str = "default-src 'self'; img-src 'self' data:; object-src 'self'; \
                        frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
+
+/// Argon2 runs allowed at the same time.
+pub const KDF_PERMITS: usize = 2;
+/// How long a request waits for a KDF permit before getting a 503.
+pub const KDF_WAIT: Duration = Duration::from_secs(10);
 
 /// How often expired sessions and stale rate-limit entries are dropped.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -56,6 +62,8 @@ pub struct AppState {
     pub sessions: Arc<SessionStore>,
     pub limiter: Arc<RateLimiter>,
     pub tokens: Arc<TokenCache>,
+    /// Bounds concurrent password KDF work (Argon2 uses 64 MiB per run).
+    pub kdf_permits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -92,6 +100,7 @@ impl AppState {
             sessions,
             limiter,
             tokens: Arc::new(TokenCache::default()),
+            kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
         })
     }
 }
@@ -223,6 +232,61 @@ impl Page {
             is_admin: confirmed && session.is_admin(),
         }
     }
+}
+
+/// Why [`run_kdf`] did not return the closure's value.
+pub enum KdfError {
+    /// No permit became free in time.
+    Busy,
+    /// The blocking task panicked or was cancelled.
+    Failed(tokio::task::JoinError),
+}
+
+/// Runs password-KDF work on the blocking pool while holding one of `permits`.
+/// The permit is released when the work ends, even if the caller goes away.
+pub async fn run_kdf<T: Send + 'static>(
+    permits: &Arc<Semaphore>,
+    wait: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, KdfError> {
+    let permit = match tokio::time::timeout(wait, permits.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        // The semaphore is never closed; treat it like exhaustion.
+        Ok(Err(_)) | Err(_) => return Err(KdfError::Busy),
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(KdfError::Failed)
+}
+
+/// `503 Service Unavailable` with `Retry-After: 5`.
+pub fn service_busy() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, HeaderValue::from_static("5"))],
+        "The server is busy. Try again in a moment.",
+    )
+        .into_response()
+}
+
+/// [`run_kdf`] on the app's permits, with the failure turned into a response.
+#[allow(clippy::result_large_err)] // the error is a ready `Response`, as in the route modules
+pub async fn kdf_blocking<T: Send + 'static>(
+    state: &AppState,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    run_kdf(&state.kdf_permits, KDF_WAIT, f)
+        .await
+        .map_err(|e| match e {
+            KdfError::Busy => service_busy(),
+            KdfError::Failed(e) => {
+                tracing::error!(error = %e, "account task failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        })
 }
 
 /// Render a template as an HTML response.
@@ -376,4 +440,47 @@ async fn static_file(Path(file): Path<String>) -> Response {
         *bytes,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kdf_semaphore_limits_concurrency() {
+        let permits = Arc::new(Semaphore::new(KDF_PERMITS));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let (permits, running, peak) = (permits.clone(), running.clone(), peak.clone());
+            tasks.push(tokio::spawn(async move {
+                run_kdf(&permits, Duration::from_secs(30), move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(40));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await
+                .ok()
+                .expect("permit within the wait");
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), KDF_PERMITS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kdf_wait_times_out_with_503_and_retry_after() {
+        let permits = Arc::new(Semaphore::new(1));
+        let _held = permits.clone().acquire_owned().await.unwrap();
+        let r = run_kdf(&permits, Duration::from_millis(50), || ()).await;
+        assert!(matches!(r, Err(KdfError::Busy)));
+        let resp = service_busy();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()["retry-after"], "5");
+    }
 }

@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
 use super::session::{CsrfForm, NoFields, PendingUser, clear_session_cookie, session_cookie};
-use super::{AppState, Page, redirect, render};
+use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::AccountError;
 use crate::system_db::InviteError;
 
@@ -47,16 +47,6 @@ fn now() -> i64 {
 
 async fn index() -> Redirect {
     Redirect::to("/documents")
-}
-
-/// Runs CPU-heavy account work (Argon2) off the async threads.
-async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, Box<Response>> {
-    tokio::task::spawn_blocking(f).await.map_err(|e| {
-        tracing::error!(error = %e, "account task failed");
-        Box::new(StatusCode::INTERNAL_SERVER_ERROR.into_response())
-    })
 }
 
 fn internal(e: &AccountError) -> Response {
@@ -161,9 +151,9 @@ async fn signup(
     }
     let accounts = state.accounts.clone();
     let (t, u, p) = (token.clone(), form.username.clone(), form.password);
-    let result = match blocking(move || accounts.signup(&t, &u, &p, now())).await {
+    let result = match kdf_blocking(&state, move || accounts.signup(&t, &u, &p, now())).await {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(resp) => return resp,
     };
     match result {
         Ok((unlocked, user, recovery)) => {
@@ -309,36 +299,37 @@ async fn login(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let keys = limiter_keys(&state, peer, &headers, &form.username);
-    if let Err(retry) = state.limiter.check(&keys) {
-        return too_many_requests(retry);
-    }
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
     let accounts = state.accounts.clone();
     let (u, p, c) = (
         form.username.clone(),
         form.password,
         form.code.trim().to_owned(),
     );
-    let result = match blocking(move || {
+    let result = match kdf_blocking(&state, move || {
         let code = (!c.is_empty()).then_some(c.as_str());
         accounts.login(&u, &p, code)
     })
     .await
     {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(resp) => return resp,
     };
     match result {
         Ok((unlocked, user)) => {
-            state.limiter.record_success(&keys[1]);
+            attempt.success();
             start_session(&state, &headers, &user, unlocked, None)
         }
         Err(AccountError::Disabled) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             login_error(StatusCode::FORBIDDEN, form.username, DISABLED)
         }
         Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
         Err(_) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             login_error(StatusCode::UNAUTHORIZED, form.username, INVALID_LOGIN)
         }
     }
@@ -403,10 +394,6 @@ async fn recover(
     headers: HeaderMap,
     Form(form): Form<RecoverForm>,
 ) -> Response {
-    let keys = limiter_keys(&state, peer, &headers, &form.username);
-    if let Err(retry) = state.limiter.check(&keys) {
-        return too_many_requests(retry);
-    }
     if form.new_password != form.new_password_confirm {
         return recover_error(
             StatusCode::BAD_REQUEST,
@@ -414,30 +401,38 @@ async fn recover(
             "The passwords do not match",
         );
     }
+    let keys = limiter_keys(&state, peer, &headers, &form.username);
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
     let accounts = state.accounts.clone();
     let (u, k, p) = (form.username.clone(), form.recovery_key, form.new_password);
-    let result = match blocking(move || accounts.recover(&u, &k, &p)).await {
+    let result = match kdf_blocking(&state, move || accounts.recover(&u, &k, &p)).await {
         Ok(r) => r,
-        Err(resp) => return *resp,
+        Err(resp) => return resp,
     };
     match result {
         Ok((unlocked, user, new_key)) => {
-            state.limiter.record_success(&keys[1]);
+            attempt.success();
             start_session(&state, &headers, &user, unlocked, Some(new_key))
         }
-        // The recovery key was right, so this is not a guess: no failure recorded.
-        Err(AccountError::WeakPassword) => recover_error(
-            StatusCode::BAD_REQUEST,
-            form.username,
-            "The password must be at least 10 characters",
-        ),
+        // The recovery key was right, so this is not a guess: settle as success.
+        Err(AccountError::WeakPassword) => {
+            attempt.success();
+            recover_error(
+                StatusCode::BAD_REQUEST,
+                form.username,
+                "The password must be at least 10 characters",
+            )
+        }
         Err(AccountError::Disabled) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             recover_error(StatusCode::FORBIDDEN, form.username, DISABLED)
         }
         Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
         Err(_) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             recover_error(
                 StatusCode::UNAUTHORIZED,
                 form.username,

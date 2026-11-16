@@ -342,6 +342,34 @@ async fn login_rate_limited_returns_429() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn parallel_logins_cannot_exceed_limit() {
+    let app = std::sync::Arc::new(TestApp::new());
+    let mut tasks = Vec::new();
+    for _ in 0..30 {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            app.post_form(
+                "/login",
+                &[("username", "ghost"), ("password", "nope nope nope")],
+                &Client::anon(),
+            )
+            .await
+            .status()
+            .as_u16()
+        }));
+    }
+    let mut codes = Vec::new();
+    for t in tasks {
+        codes.push(t.await.unwrap());
+    }
+    let reached_kdf = codes.iter().filter(|c| **c == 401).count();
+    let limited = codes.iter().filter(|c| **c == 429).count();
+    assert_eq!(reached_kdf + limited, 30, "unexpected statuses: {codes:?}");
+    assert!(reached_kdf <= 10, "{reached_kdf} reached the KDF");
+    assert!(limited >= 20, "only {limited} were limited");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn root_redirects_to_documents() {
     let app = TestApp::new();
     let r = app.get("/", &Client::anon()).await;

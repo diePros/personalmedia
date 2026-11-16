@@ -343,33 +343,60 @@ fn rate_limit_locks_after_10_failures_and_reports_retry_after() {
     let keys = [ip.clone(), user.clone()];
 
     for _ in 0..9 {
-        assert!(limiter.check(&keys).is_ok());
-        limiter.record_failure(&keys);
+        limiter.begin(&keys).unwrap().failure();
     }
-    assert!(limiter.check(&keys).is_ok(), "9 failures do not lock");
-    limiter.record_failure(&keys);
+    let ninth = limiter.begin(&keys).expect("9 failures do not lock");
+    ninth.failure();
 
-    let retry = limiter.check(&keys).unwrap_err();
+    let retry = limiter.begin(&keys).err().unwrap();
     assert!(retry <= Duration::from_secs(15 * 60));
     assert!(retry > Duration::from_secs(14 * 60));
     // Each key is locked on its own.
-    assert!(limiter.check(std::slice::from_ref(&ip)).is_err());
-    assert!(limiter.check(std::slice::from_ref(&user)).is_err());
-    assert!(limiter.check(&["user:bob".to_string()]).is_ok());
+    assert!(limiter.begin(std::slice::from_ref(&ip)).is_err());
+    assert!(limiter.begin(std::slice::from_ref(&user)).is_err());
+    assert!(limiter.begin(&["user:bob".to_string()]).is_ok());
 
-    // A success clears that key only.
-    limiter.record_success(&user);
-    assert!(limiter.check(std::slice::from_ref(&user)).is_ok());
-    assert!(limiter.check(&keys).is_err(), "the ip key is still locked");
+    // Ten failures on an ip key lock it.
+    let carol_ip = ["ip:198.51.100.1".to_string()];
+    for _ in 0..10 {
+        limiter.begin(&carol_ip).unwrap().failure();
+    }
+    assert!(limiter.begin(&carol_ip).is_err());
 
     // A success in between resets the count.
     let carol = [user_key("carol")];
     for _ in 0..9 {
-        limiter.record_failure(&carol);
+        limiter.begin(&carol).unwrap().failure();
     }
-    limiter.record_success(&carol[0]);
-    limiter.record_failure(&carol);
-    assert!(limiter.check(&carol).is_ok());
+    limiter.begin(&carol).unwrap().success();
+    limiter.begin(&carol).unwrap().failure();
+    assert!(limiter.begin(&carol).is_ok());
+}
+
+#[test]
+fn in_flight_attempts_count_toward_the_limit() {
+    let limiter = RateLimiter::new();
+    let keys = [user_key("dave")];
+    let held: Vec<_> = (0..10).map(|_| limiter.begin(&keys).unwrap()).collect();
+    assert!(
+        limiter.begin(&keys).is_err(),
+        "10 in flight reserve all slots"
+    );
+    // Settling as success frees the slots without recording failures.
+    for a in held {
+        a.success();
+    }
+    assert!(limiter.begin(&keys).is_ok());
+}
+
+#[test]
+fn dropping_an_unsettled_attempt_counts_as_failure() {
+    let limiter = RateLimiter::new();
+    let keys = [user_key("erin")];
+    for _ in 0..10 {
+        drop(limiter.begin(&keys).unwrap());
+    }
+    assert!(limiter.begin(&keys).is_err(), "ten drops lock the key");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -26,7 +26,7 @@ use serde::Deserialize;
 use super::docs::{channel_body, format_date};
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
 use super::session::{CsrfForm, CurrentUser, NoFields, Session};
-use super::{AppState, Page, redirect, render};
+use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::{AccountError, TotpSetup};
 use crate::export;
 use crate::tokens::{create_token, revoke_token};
@@ -426,9 +426,10 @@ async fn change_password(
     CsrfForm(form): CsrfForm<PasswordForm>,
 ) -> Response {
     let keys = limiter_keys(&state, peer, &headers, &session);
-    if let Err(retry) = state.limiter.check(&keys) {
-        return too_many_requests(retry);
-    }
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
     if form.new != form.new_confirm {
         return failure(
             &state,
@@ -440,7 +441,7 @@ async fn change_password(
     }
     let accounts = state.accounts.clone();
     let user_id = session.user_id.clone();
-    let result = match blocking(move || {
+    let result = match kdf_blocking(&state, move || {
         accounts.change_password(&user_id, &form.current, &form.new)
     })
     .await
@@ -450,7 +451,7 @@ async fn change_password(
     };
     match result {
         Ok(()) => {
-            state.limiter.record_success(&keys[1]);
+            attempt.success();
             // The password is the credential of the other browsers, so they go.
             state
                 .sessions
@@ -459,7 +460,7 @@ async fn change_password(
             redirect(&headers, "/settings?notice=password")
         }
         Err(AccountError::InvalidCredentials) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             failure(
                 &state,
                 &session,
@@ -469,6 +470,8 @@ async fn change_password(
             .await
         }
         Err(AccountError::WeakPassword) => {
+            // The current password was right: not a guess.
+            attempt.success();
             failure(
                 &state,
                 &session,
@@ -500,12 +503,13 @@ async fn regenerate_recovery(
     CsrfForm(form): CsrfForm<RecoveryForm>,
 ) -> Response {
     let keys = limiter_keys(&state, peer, &headers, &session);
-    if let Err(retry) = state.limiter.check(&keys) {
-        return too_many_requests(retry);
-    }
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
     let accounts = state.accounts.clone();
     let (u, user_id) = (session.unlocked.clone(), session.user_id.clone());
-    let result = match blocking(move || {
+    let result = match kdf_blocking(&state, move || {
         accounts.verify_password(&user_id, &form.password)?;
         accounts.regenerate_recovery(&u)
     })
@@ -516,14 +520,14 @@ async fn regenerate_recovery(
     };
     match result {
         Ok(key) => {
-            state.limiter.record_success(&keys[1]);
+            attempt.success();
             state
                 .sessions
                 .set_must_confirm_recovery(&session.id, Some(key));
             redirect(&headers, "/recovery-key")
         }
         Err(AccountError::InvalidCredentials) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             failure(
                 &state,
                 &session,
@@ -597,9 +601,10 @@ async fn totp_enable(
     CsrfForm(form): CsrfForm<CodeForm>,
 ) -> Response {
     let keys = limiter_keys(&state, peer, &headers, &session);
-    if let Err(retry) = state.limiter.check(&keys) {
-        return too_many_requests(retry);
-    }
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
     let Some(secret) = session.pending_totp_secret.clone() else {
         return failure(
             &state,
@@ -617,12 +622,12 @@ async fn totp_enable(
     };
     match result {
         Ok(()) => {
-            state.limiter.record_success(&keys[1]);
+            attempt.success();
             state.sessions.set_pending_totp(&session.id, None);
             redirect(&headers, "/settings?notice=totp_on")
         }
         Err(AccountError::InvalidCredentials) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             // Keep the same secret on screen so the authenticator stays valid.
             let accounts = state.accounts.clone();
             let username = session.username.clone();
@@ -643,6 +648,7 @@ async fn totp_enable(
             .await
         }
         Err(AccountError::TotpAlreadyEnabled) => {
+            attempt.success();
             state.sessions.set_pending_totp(&session.id, None);
             failure(
                 &state,
@@ -664,9 +670,10 @@ async fn totp_disable(
     CsrfForm(form): CsrfForm<CodeForm>,
 ) -> Response {
     let keys = limiter_keys(&state, peer, &headers, &session);
-    if let Err(retry) = state.limiter.check(&keys) {
-        return too_many_requests(retry);
-    }
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
     let accounts = state.accounts.clone();
     let (u, code) = (session.unlocked.clone(), form.code);
     let result = match blocking(move || accounts.totp_disable(&u, &code)).await {
@@ -675,11 +682,11 @@ async fn totp_disable(
     };
     match result {
         Ok(()) => {
-            state.limiter.record_success(&keys[1]);
+            attempt.success();
             redirect(&headers, "/settings?notice=totp_off")
         }
         Err(AccountError::InvalidCredentials) => {
-            state.limiter.record_failure(&keys);
+            attempt.failure();
             failure(
                 &state,
                 &session,
