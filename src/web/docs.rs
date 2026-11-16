@@ -77,7 +77,7 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         )
 }
 
-fn now() -> i64 {
+pub(super) fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -226,7 +226,7 @@ pub fn content_disposition(kind: &str, filename: &str) -> HeaderValue {
 // Upload
 // ---------------------------------------------------------------------------
 
-fn parse_tags(s: &str) -> Vec<String> {
+pub(super) fn parse_tags(s: &str) -> Vec<String> {
     s.split(',')
         .map(str::trim)
         .filter(|t| !t.is_empty())
@@ -236,9 +236,9 @@ fn parse_tags(s: &str) -> Vec<String> {
 
 /// Longest text field accepted before the file. Text fields are buffered in
 /// memory, so they are capped far below the upload limit.
-const TEXT_FIELD_MAX: usize = 8 * 1024;
+pub(super) const TEXT_FIELD_MAX: usize = 8 * 1024;
 
-async fn read_text_field(
+pub(super) async fn read_text_field(
     mut field: axum::extract::multipart::Field<'_>,
 ) -> Result<String, Response> {
     let mut buf: Vec<u8> = Vec::new();
@@ -456,7 +456,7 @@ pub(super) fn format_date(ts: i64) -> String {
         .unwrap_or_default()
 }
 
-fn human_size(n: u64) -> String {
+pub(super) fn human_size(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut v = n as f64;
     let mut i = 0;

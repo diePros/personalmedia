@@ -38,7 +38,7 @@ use crate::keyring::Keyring;
 use crate::system_db::{SYSTEM_DB_FILE, SystemDb};
 use crate::tokens::TokenCache;
 use ratelimit::RateLimiter;
-use session::{Session, SessionStore};
+use session::{Session, SessionStore, SharedStaging};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
@@ -62,6 +62,8 @@ pub struct AppState {
     pub accounts: Arc<Accounts>,
     pub docs: Arc<Documents>,
     pub sessions: Arc<SessionStore>,
+    /// Shared files waiting for review (`/share`); memory only.
+    pub shared: Arc<SharedStaging>,
     pub limiter: Arc<RateLimiter>,
     pub tokens: Arc<TokenCache>,
     /// Bounds concurrent password KDF work (Argon2 uses 64 MiB per run).
@@ -96,9 +98,13 @@ impl AppState {
         start_workers(cfg.ocr_workers, ExtractConfig::new(tmp), docs.clone(), rx);
 
         let sessions = Arc::new(SessionStore::new(cfg.session_idle, cfg.session_max));
+        let shared = Arc::new(SharedStaging::new(
+            cfg.share_ttl,
+            cfg.max_upload_bytes as usize,
+        ));
         let limiter = Arc::new(RateLimiter::new());
         let tokens = Arc::new(TokenCache::default());
-        spawn_sweeper(&sessions, &limiter, &tokens);
+        spawn_sweeper(&sessions, &shared, &limiter, &tokens);
 
         Ok(AppState {
             cfg: Arc::new(cfg),
@@ -107,6 +113,7 @@ impl AppState {
             accounts,
             docs,
             sessions,
+            shared,
             limiter,
             tokens,
             kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
@@ -118,11 +125,13 @@ impl AppState {
 /// Background task that ends when the state it sweeps is dropped.
 fn spawn_sweeper(
     sessions: &Arc<SessionStore>,
+    shared: &Arc<SharedStaging>,
     limiter: &Arc<RateLimiter>,
     tokens: &Arc<TokenCache>,
 ) {
-    let (sessions, limiter, tokens) = (
+    let (sessions, shared, limiter, tokens) = (
         Arc::downgrade(sessions),
+        Arc::downgrade(shared),
         Arc::downgrade(limiter),
         Arc::downgrade(tokens),
     );
@@ -130,12 +139,16 @@ fn spawn_sweeper(
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             tick.tick().await;
-            let (Some(sessions), Some(limiter), Some(tokens)) =
-                (sessions.upgrade(), limiter.upgrade(), tokens.upgrade())
-            else {
+            let (Some(sessions), Some(shared), Some(limiter), Some(tokens)) = (
+                sessions.upgrade(),
+                shared.upgrade(),
+                limiter.upgrade(),
+                tokens.upgrade(),
+            ) else {
                 break;
             };
             sessions.sweep();
+            shared.sweep();
             limiter.sweep();
             tokens.sweep();
         }
@@ -151,7 +164,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(docs::routes(&state))
         .merge(settings::routes())
-        .merge(pwa::routes())
+        .merge(pwa::routes(&state))
         .merge(crate::mcp::routes(&state))
         .route("/static/{file}", get(static_file))
         .route("/static/icons/{file}", get(icon_file))
@@ -215,8 +228,8 @@ pub fn is_htmx(headers: &HeaderMap) -> bool {
 /// Send the browser to `to` after a successful action: `303 See Other`, or
 /// for htmx `200` with `HX-Redirect` (htmx would otherwise swap the target
 /// page into the current one).
-pub fn redirect(headers: &HeaderMap, to: &'static str) -> Response {
-    let to = HeaderValue::from_static(to);
+pub fn redirect(headers: &HeaderMap, to: &str) -> Response {
+    let to = HeaderValue::from_str(to).expect("redirect targets are plain ASCII");
     if is_htmx(headers) {
         (StatusCode::OK, [("hx-redirect", to)]).into_response()
     } else {
@@ -330,9 +343,10 @@ pub fn render(template: &impl Template) -> Response {
 // Layers
 // ---------------------------------------------------------------------------
 
-/// Paths that may receive cross-origin state-changing requests (for example
-/// an OS share target). Empty for now; Task 18 adds `/share`.
-const ORIGIN_EXEMPT_PATHS: &[&str] = &[];
+/// Paths that may receive cross-origin state-changing requests: the OS share
+/// target. Only `POST /share` (exact path), which merely stages files in
+/// memory; saving them (`POST /share/{id}`) stays guarded and needs CSRF.
+const ORIGIN_EXEMPT_PATHS: &[&str] = &[pwa::SHARE_PATH];
 
 /// The only paths that accept bearer-token authentication. A bearer header on
 /// any other path gets no origin-guard exemption.

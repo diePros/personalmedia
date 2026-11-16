@@ -54,9 +54,15 @@ self.addEventListener("fetch", function (event) {
   const req = event.request;
   const url = new URL(req.url);
 
+  // Only GETs are ever answered here. In particular the share target is a
+  // top-level POST navigation (`mode === "navigate"`); it must go straight to
+  // the network untouched, or the files would be lost.
+  if (req.method !== "GET") {
+    return;
+  }
+
   // Shell assets: cache-first, same origin, GET only.
   if (
-    req.method === "GET" &&
     url.origin === self.location.origin &&
     PRECACHE.indexOf(url.pathname) !== -1
   ) {

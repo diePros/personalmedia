@@ -237,7 +237,7 @@ pub fn clear_session_cookie() -> HeaderValue {
     )
 }
 
-pub(crate) fn session_id(headers: &HeaderMap) -> Option<&str> {
+fn cookie_value<'a>(headers: &'a HeaderMap, cookie: &str) -> Option<&'a str> {
     headers
         .get_all(header::COOKIE)
         .iter()
@@ -245,8 +245,40 @@ pub(crate) fn session_id(headers: &HeaderMap) -> Option<&str> {
         .flat_map(|v| v.split(';'))
         .find_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
-            (name == SESSION_COOKIE).then_some(value)
+            (name == cookie).then_some(value)
         })
+}
+
+pub(crate) fn session_id(headers: &HeaderMap) -> Option<&str> {
+    cookie_value(headers, SESSION_COOKIE)
+}
+
+/// Remembers a staged share (see [`SharedStaging`]) across the login detour:
+/// `POST /share` without a session sets it, login consumes it.
+///
+/// `SameSite=Lax` on purpose: it is set by the response to the OS-originated
+/// cross-site POST, and the browser must send it back on the following
+/// same-site requests. It holds only the unguessable staging id, which is
+/// worthless without a session of the user the share gets bound to.
+pub const CONTINUE_COOKIE: &str = "__Host-pm_continue";
+
+pub fn continue_cookie(staging_id: &str, ttl: Duration) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{CONTINUE_COOKIE}={staging_id}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+        ttl.as_secs()
+    ))
+    .expect("staging ids are base64url")
+}
+
+pub fn clear_continue_cookie() -> HeaderValue {
+    HeaderValue::from_static(
+        "__Host-pm_continue=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
+    )
+}
+
+/// The staging id in the continue cookie, if it has the shape of one.
+pub fn continue_id(headers: &HeaderMap) -> Option<&str> {
+    cookie_value(headers, CONTINUE_COOKIE).filter(|id| is_staging_id(id))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -292,7 +324,12 @@ pub async fn session_layer(
 ) -> Response {
     let session = session_id(req.headers()).and_then(|id| state.sessions.get(id));
     if let Some(session) = session {
-        if !matches!(*req.method(), Method::GET | Method::HEAD) {
+        // The OS share target posts multipart without our token. That one
+        // route only stages the files in server memory; saving them needs the
+        // CSRF-protected form on the review page. Exact path, POST only.
+        let share_target =
+            *req.method() == Method::POST && req.uri().path() == super::pwa::SHARE_PATH;
+        if !matches!(*req.method(), Method::GET | Method::HEAD) && !share_target {
             let headers = req.headers();
             let allowed = if headers.contains_key(CSRF_HEADER) {
                 check_csrf(&session, headers, None).is_ok()
@@ -453,5 +490,211 @@ where
         serde_urlencoded::from_bytes::<T>(&body)
             .map(CsrfForm)
             .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY.into_response())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared files waiting for review
+// ---------------------------------------------------------------------------
+
+/// Most files one share may carry.
+pub const MAX_SHARED_FILES: usize = 20;
+
+/// A staging id is 32 random bytes as unpadded base64url.
+pub fn is_staging_id(s: &str) -> bool {
+    s.len() == 43
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// One file handed over by the OS share sheet. The bytes are wiped on drop.
+pub struct StagedFile {
+    pub filename: String,
+    pub mime: Option<String>,
+    pub bytes: Zeroizing<Vec<u8>>,
+}
+
+/// A staged share as it is taken out of the store for saving.
+pub struct Staged {
+    pub files: Vec<StagedFile>,
+    pub title: Option<String>,
+}
+
+/// What the review page may show: names and sizes, never the bytes.
+pub struct StagedView {
+    pub files: Vec<(String, usize)>,
+    pub title: Option<String>,
+}
+
+/// The staged share does not fit the size caps.
+#[derive(Debug)]
+pub struct StagingFull;
+
+struct Entry {
+    /// `None` until a logged-in user first opens the share.
+    user_id: Option<String>,
+    files: Vec<StagedFile>,
+    title: Option<String>,
+    created: Instant,
+    total: usize,
+}
+
+/// Files shared to the app (Web Share Target) that wait for the user's
+/// review. They live **only in memory** (wiped on drop), bounded per entry by
+/// `max_upload_bytes` and overall by four times that, and expire after the
+/// configured TTL. An entry belongs to one user: the one it was staged by, or
+/// else the first logged-in user who opens it; everyone else gets "not found".
+pub struct SharedStaging {
+    entries: Mutex<HashMap<String, Entry>>,
+    ttl: Duration,
+    entry_max: usize,
+    total_max: usize,
+}
+
+impl SharedStaging {
+    pub fn new(ttl: Duration, entry_max: usize) -> SharedStaging {
+        SharedStaging {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+            entry_max,
+            total_max: entry_max.saturating_mul(4),
+        }
+    }
+
+    /// Per-entry size cap (the largest share accepted).
+    pub fn entry_max(&self) -> usize {
+        self.entry_max
+    }
+
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn live(&self, e: &Entry, now: Instant) -> bool {
+        now.duration_since(e.created) < self.ttl
+    }
+
+    /// Stages `files` for `user_id` (`None`: nobody logged in yet) and returns
+    /// the staging id. Fails when the share exceeds the per-entry cap or the
+    /// global cap over all live entries.
+    pub fn stage(
+        &self,
+        user_id: Option<String>,
+        files: Vec<StagedFile>,
+        title: Option<String>,
+    ) -> Result<String, StagingFull> {
+        let total: usize = files.iter().map(|f| f.bytes.len()).sum();
+        if total > self.entry_max {
+            return Err(StagingFull);
+        }
+        let now = Instant::now();
+        let mut map = self.lock();
+        let (expired, live): (Vec<String>, usize) = {
+            let mut sum = 0;
+            let mut dead = Vec::new();
+            for (id, e) in map.iter() {
+                if self.live(e, now) {
+                    sum += e.total;
+                } else {
+                    dead.push(id.clone());
+                }
+            }
+            (dead, sum)
+        };
+        let dead: Vec<Entry> = expired.iter().filter_map(|id| map.remove(id)).collect();
+        if live.saturating_add(total) > self.total_max {
+            drop(map);
+            drop(dead);
+            return Err(StagingFull);
+        }
+        let id = random_token();
+        map.insert(
+            id.clone(),
+            Entry {
+                user_id,
+                files,
+                title,
+                created: now,
+                total,
+            },
+        );
+        drop(map);
+        drop(dead);
+        Ok(id)
+    }
+
+    /// Whether a live entry exists (to decide where login sends the user).
+    pub fn exists(&self, id: &str) -> bool {
+        self.lock()
+            .get(id)
+            .is_some_and(|e| self.live(e, Instant::now()))
+    }
+
+    /// Looks `id` up for `user_id`, binding an unbound entry to that user.
+    /// `None` for a missing, expired or foreign entry.
+    fn claim<'a>(
+        &self,
+        map: &'a mut HashMap<String, Entry>,
+        id: &str,
+        user_id: &str,
+    ) -> Option<&'a mut Entry> {
+        let now = Instant::now();
+        let entry = map.get_mut(id)?;
+        if !self.live(entry, now) {
+            return None;
+        }
+        match &entry.user_id {
+            Some(owner) if owner != user_id => None,
+            Some(_) => Some(entry),
+            None => {
+                entry.user_id = Some(user_id.to_owned());
+                Some(entry)
+            }
+        }
+    }
+
+    /// Names and sizes of a share, for its review page.
+    pub fn view(&self, id: &str, user_id: &str) -> Option<StagedView> {
+        let mut map = self.lock();
+        let e = self.claim(&mut map, id, user_id)?;
+        Some(StagedView {
+            files: e
+                .files
+                .iter()
+                .map(|f| (f.filename.clone(), f.bytes.len()))
+                .collect(),
+            title: e.title.clone(),
+        })
+    }
+
+    /// Removes a share (to save or discard it). One caller wins; a second
+    /// gets `None`.
+    pub fn take(&self, id: &str, user_id: &str) -> Option<Staged> {
+        let mut map = self.lock();
+        self.claim(&mut map, id, user_id)?;
+        let e = map.remove(id)?;
+        Some(Staged {
+            files: e.files,
+            title: e.title,
+        })
+    }
+
+    /// Drops expired shares (every minute, so bytes do not linger unread).
+    pub fn sweep(&self) {
+        let now = Instant::now();
+        let dead: Vec<Entry> = {
+            let mut map = self.lock();
+            let ids: Vec<String> = map
+                .iter()
+                .filter(|(_, e)| !self.live(e, now))
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| map.remove(id)).collect()
+        };
+        drop(dead);
     }
 }

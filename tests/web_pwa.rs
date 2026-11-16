@@ -154,3 +154,35 @@ async fn sw_cache_name_tracks_asset_version() {
     assert!(!body.contains("__ASSET_VERSION__"));
     assert!(body.contains("cache: \"reload\""));
 }
+
+#[test]
+fn sw_fetch_handler_ignores_non_get_requests() {
+    // The share target is a POST navigation; the worker must not respondWith it.
+    let fetch_start = SW.find("addEventListener(\"fetch\"").unwrap();
+    let guard = SW[fetch_start..]
+        .find("if (req.method !== \"GET\") {\n    return;\n  }")
+        .expect("early return for non-GET")
+        + fetch_start;
+    let first_respond = SW[fetch_start..].find("event.respondWith(").unwrap() + fetch_start;
+    assert!(guard < first_respond);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manifest_declares_share_target() {
+    let t = TestApp::new();
+    let resp = t.get("/manifest.webmanifest", &Client::anon()).await;
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(
+        v["share_target"],
+        serde_json::json!({
+            "action": "/share",
+            "method": "POST",
+            "enctype": "multipart/form-data",
+            "params": {
+                "title": "title",
+                "text": "text",
+                "files": [{"name": "files", "accept": ["application/pdf", "image/*", "text/plain"]}]
+            }
+        })
+    );
+}

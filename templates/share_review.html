@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Review shared files · Personal Media{% endblock %}
+{% block content %}
+<h1>Review shared files</h1>
+<p class="muted">These files are held in memory only and nothing is saved yet. They are dropped after a few minutes.</p>
+{% if let Some(error) = error -%}
+<p class="error" role="alert">{{ error }}</p>
+{% endif -%}
+<ul class="doc-list">
+{% for file in files -%}
+<li class="doc-item"><span class="doc-title">{{ file.name }}</span> <span class="doc-meta">{{ file.size }}</span></li>
+{% endfor -%}
+</ul>
+<form method="post" action="/share/{{ id }}" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="title">Title (optional, applied to every file)</label>
+<input type="text" id="title" name="title" value="{{ title }}" maxlength="300">
+</div>
+<div>
+<label for="tags">Tags (optional, comma separated)</label>
+<input type="text" id="tags" name="tags" value="{{ tags }}">
+</div>
+<button type="submit">Save</button>
+</form>
+<form method="post" action="/share/{{ id }}/discard">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit" class="danger">Discard</button>
+</form>
+{% endblock %}

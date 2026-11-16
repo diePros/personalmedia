@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Shared files · Personal Media{% endblock %}
+{% block content %}
+<h1>Shared files</h1>
+<ul class="doc-list">
+{% for row in rows -%}
+<li class="doc-item">
+{% if let Some(link) = row.link %}<a class="doc-title" href="{{ link }}">{{ row.name }}</a>{% else %}<span class="doc-title">{{ row.name }}</span>{% endif %}
+<span class="doc-meta">{{ row.note }}</span>
+</li>
+{% endfor -%}
+</ul>
+<p><a href="/documents">Back to documents</a></p>
+{% endblock %}

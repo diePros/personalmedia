@@ -218,6 +218,13 @@ Invite friends from the admin page. Each invite link is single-use and expires a
 
 Treat the token like a key: it can unlock your documents within its scope. If it leaks, revoke it in the web UI.
 
+## 7b. Share to Personal Media from a phone
+
+- **Android (Chrome):** install the app (menu → *Install app*). Personal Media then appears in the share sheet for PDFs, images and text files. Shared files go to a review page where you can set a title and tags and press **Save**; nothing is stored before that. They wait in the server's memory only (never on disk), for 15 minutes at most, and a share is limited to `PM_MAX_UPLOAD_MB`. If your session has expired you log in first and land on the review page with the files still waiting.
+- **iPhone/iPad:** iOS has no share target for web apps. Use the Shortcut in [`docs/ios-shortcut.md`](ios-shortcut.md), which uploads through `/api/upload` with a restricted token.
+
+**SameSite note.** The Android share is a cross-site `POST` navigation into the app. Whether Chrome sends the `SameSite=Strict` session cookie with it is not guaranteed, so the flow does not depend on it: without a session the server sets a short-lived `__Host-pm_continue` cookie (`SameSite=Lax`) holding only the staging id, and after login you are sent on to the review page. The session cookie `__Host-pm_session` is still `Strict`. *Result of the real-phone test: not recorded yet. If the continue cookie turns out not to survive the login detour on Android, relax the session cookie to `Lax`; CSRF tokens stay mandatory either way.*
+
 ## 8. Backups
 
 `/DATA/AppData/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle.

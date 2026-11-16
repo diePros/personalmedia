@@ -18,7 +18,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
-use super::session::{CsrfForm, NoFields, PendingUser, clear_session_cookie, session_cookie};
+use super::session::{
+    CsrfForm, NoFields, PendingUser, clear_continue_cookie, clear_session_cookie, continue_id,
+    session_cookie,
+};
 use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::AccountError;
 use crate::system_db::InviteError;
@@ -71,10 +74,25 @@ fn start_session(
     if let Some(old) = super::session::session_id(headers) {
         state.sessions.remove(old);
     }
+    // A share staged before login (`POST /share` without a session) continues
+    // on its review page, once. Not after signup/recovery, which first have to
+    // show the recovery key.
+    let share = recovery
+        .is_none()
+        .then(|| continue_id(headers))
+        .flatten()
+        .filter(|id| state.shared.exists(id));
     let (cookie, _csrf) = state.sessions.create(user, unlocked, recovery);
-    let mut resp = redirect(headers, to);
+    let mut resp = match share {
+        Some(id) => redirect(headers, &format!("/share/{id}")),
+        None => redirect(headers, to),
+    };
     resp.headers_mut()
         .insert(header::SET_COOKIE, session_cookie(&cookie));
+    if continue_id(headers).is_some() {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, clear_continue_cookie());
+    }
     resp
 }
 

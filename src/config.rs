@@ -7,6 +7,9 @@ use anyhow::{Context, Result};
 
 use crate::crypto::kdf::Argon2Params;
 
+/// Default lifetime of a staged share (spec: 15 minutes).
+pub const DEFAULT_SHARE_TTL: Duration = Duration::from_secs(15 * 60);
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
@@ -15,6 +18,8 @@ pub struct Config {
     pub max_upload_bytes: u64,
     pub session_idle: Duration,
     pub session_max: Duration,
+    /// How long shared files wait for review in memory (`/share`).
+    pub share_ttl: Duration,
     pub trusted_proxy: IpAddr,
     pub ocr_workers: usize,
     pub argon2: Argon2Params,
@@ -90,6 +95,7 @@ impl Config {
             max_upload_bytes: max_upload_mb * 1024 * 1024,
             session_idle: Duration::from_secs(idle_min * 60),
             session_max: Duration::from_secs(max_hours * 3600),
+            share_ttl: DEFAULT_SHARE_TTL,
             trusted_proxy: parse_var("PM_TRUSTED_PROXY", "127.0.0.1")?,
             ocr_workers: parse_var("PM_OCR_WORKERS", "1")?,
             argon2: Argon2Params::default(),
@@ -112,6 +118,7 @@ impl Config {
             max_upload_bytes: 100 * 1024 * 1024,
             session_idle: Duration::from_secs(30 * 60),
             session_max: Duration::from_secs(12 * 3600),
+            share_ttl: DEFAULT_SHARE_TTL,
             trusted_proxy: "127.0.0.1".parse().unwrap(),
             ocr_workers: 1,
             argon2: Argon2Params {
