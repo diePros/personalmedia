@@ -1,7 +1,9 @@
 services:
   personal-media:
+    # Prebuilt image from GitHub (see docs/setup.md "Updating"). `docker compose pull`
+    # fetches it; `docker compose up -d --build` builds locally from this checkout instead.
+    image: ghcr.io/diepros/personalmedia:latest
     build: .
-    image: personal-media
     container_name: personal-media
     restart: unless-stopped
     network_mode: host

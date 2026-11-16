@@ -261,11 +261,38 @@ It prompts for the account password (add `--recovery-key` to be asked for the re
 
 ## 9. Updating
 
+Every release tag (`vX.Y.Z`) is built by GitHub Actions (`.github/workflows/image.yml`). The build also runs the full test suite, including German OCR. The image is published privately as `ghcr.io/diepros/personalmedia` with the tags `X.Y.Z`, `X.Y` and `latest`.
+
+**One-time: let the ZimaBoard pull from the private registry.**
+
+1. On GitHub, go to *Settings → Developer settings → Personal access tokens → Tokens (classic)* and create a token with only the **`read:packages`** scope. Classic tokens are the ones GHCR accepts for `docker login`.
+2. On the ZimaBoard (see the ZimaOS notes in §3 about `sudo`/`DOCKER_CONFIG`):
+
+   ```bash
+   sudo DOCKER_CONFIG=/DATA/.docker docker login ghcr.io -u <your-github-username>
+   # paste the token as the password
+   ```
+
+**Each update** (seconds instead of a local Rust build):
+
 ```bash
-git pull && docker compose up -d --build
+cd <source checkout>            # where docker-compose.yml lives
+git pull                        # picks up compose/doc changes
+sudo DOCKER_CONFIG=/DATA/.docker docker compose pull
+sudo DOCKER_CONFIG=/DATA/.docker docker compose up -d
 ```
 
+To pin a version instead of `latest`, set `image: ghcr.io/diepros/personalmedia:1.1` in `docker-compose.yml`. A local build still works without the registry: `docker compose up -d --build`.
+
+What an update does:
+- Documents, accounts, MCP tokens and the Funnel setup stay as they are.
+- Everyone is logged out once, because keys only live in memory.
+- Pending OCR jobs resume at each user's next login.
+- Database changes ship as automatic migrations (schema frozen since v1.0.0).
+
 Funnel needs no changes when the app updates.
+
+**Registry storage:** GitHub's free plan includes 500 MB of private package storage. The image is about 320 MB, and versions share their base layers. Each new version adds roughly the size of the app layer. If you get close to the limit, delete old versions under the repository's *Packages* page.
 
 ## 10. Custom domain options (later)
 
