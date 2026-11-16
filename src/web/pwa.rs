@@ -6,7 +6,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
-use super::AppState;
+use super::{ASSET_VERSION, AppState};
 
 /// Colors match `static/app.css`: `--accent` (light) and `--bg` (light).
 const MANIFEST: &str = r##"{
@@ -25,7 +25,8 @@ const MANIFEST: &str = r##"{
 }
 "##;
 
-const SW: &str = include_str!("../../static/sw.js");
+/// `static/sw.js` with the `__ASSET_VERSION__` placeholder in its cache name.
+pub const SW_TEMPLATE: &str = include_str!("../../static/sw.js");
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -56,7 +57,7 @@ async fn service_worker() -> Response {
                 "/",
             ),
         ],
-        SW,
+        SW_TEMPLATE.replace("__ASSET_VERSION__", &ASSET_VERSION),
     )
         .into_response()
 }

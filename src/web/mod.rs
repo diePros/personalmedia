@@ -19,7 +19,7 @@ pub mod session;
 pub mod settings;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use askama::Template;
@@ -39,6 +39,7 @@ use crate::system_db::{SYSTEM_DB_FILE, SystemDb};
 use crate::tokens::TokenCache;
 use ratelimit::RateLimiter;
 use session::{Session, SessionStore};
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 /// Default `Content-Security-Policy`. A route may replace it with [`CspOverride`].
@@ -499,26 +500,70 @@ const STATIC_FILES: &[(&str, &str, &[u8])] = &[
     ),
 ];
 
-async fn static_file(Path(file): Path<String>) -> Response {
-    serve_static(&file)
+/// Short content hash over every embedded asset and the service-worker
+/// source. It names the service-worker cache, so any deploy that changes an
+/// asset installs a fresh worker and drops the old shell cache.
+pub static ASSET_VERSION: LazyLock<String> = LazyLock::new(|| {
+    let mut h = Sha256::new();
+    for (name, _, bytes) in STATIC_FILES {
+        h.update(name.as_bytes());
+        h.update(bytes);
+    }
+    h.update(pwa::SW_TEMPLATE.as_bytes());
+    hex::encode(&h.finalize()[..6])
+});
+
+/// Strong `ETag` (quoted content hash) per [`STATIC_FILES`] entry, same order.
+static STATIC_ETAGS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    STATIC_FILES
+        .iter()
+        .map(|(_, _, bytes)| format!("\"{}\"", hex::encode(&Sha256::digest(bytes)[..16])))
+        .collect()
+});
+
+async fn static_file(Path(file): Path<String>, headers: HeaderMap) -> Response {
+    serve_static(&file, &headers)
 }
 
 /// `/static/icons/{file}`: the entries of [`STATIC_FILES`] named `icons/...`.
-async fn icon_file(Path(file): Path<String>) -> Response {
-    serve_static(&format!("icons/{file}"))
+async fn icon_file(Path(file): Path<String>, headers: HeaderMap) -> Response {
+    serve_static(&format!("icons/{file}"), &headers)
 }
 
-fn serve_static(file: &str) -> Response {
-    let Some((_, content_type, bytes)) = STATIC_FILES.iter().find(|(name, ..)| *name == file)
-    else {
+/// Whether `If-None-Match` lists `etag` (or `*`); weak validators compare equal.
+fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(',')
+                .map(|t| t.trim().trim_start_matches("W/"))
+                .any(|t| t == "*" || t == etag)
+        })
+}
+
+/// Assets are revalidated on every use (`no-cache` + `ETag`), so a deploy is
+/// never hidden behind a day-old browser cache.
+fn serve_static(file: &str, req_headers: &HeaderMap) -> Response {
+    let Some(i) = STATIC_FILES.iter().position(|(name, ..)| *name == file) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let (_, content_type, bytes) = STATIC_FILES[i];
+    let etag = STATIC_ETAGS[i].as_str();
+    if etag_matches(req_headers, etag) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache")],
+        )
+            .into_response();
+    }
     (
         [
-            (header::CONTENT_TYPE, *content_type),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::ETAG, etag),
         ],
-        *bytes,
+        bytes,
     )
         .into_response()
 }

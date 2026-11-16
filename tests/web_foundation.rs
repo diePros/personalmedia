@@ -516,11 +516,7 @@ async fn static_assets_cached_pages_not() {
     ] {
         let resp = app.get(&format!("/static/{file}"), &Client::anon()).await;
         assert_eq!(resp.status(), StatusCode::OK, "{file}");
-        assert_eq!(
-            header_str(&resp, "cache-control"),
-            "public, max-age=86400",
-            "{file}"
-        );
+        assert_eq!(header_str(&resp, "cache-control"), "no-cache", "{file}");
         assert_eq!(header_str(&resp, "content-type"), content_type, "{file}");
         assert!(!common::body_bytes(resp).await.is_empty(), "{file}");
     }

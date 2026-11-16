@@ -43,7 +43,10 @@ async fn sw_served_with_scope_header() {
     assert!(header_str(&resp, "content-type").starts_with("text/javascript"));
     assert_eq!(header_str(&resp, "cache-control"), "no-cache");
     assert_eq!(header_str(&resp, "service-worker-allowed"), "/");
-    assert_eq!(body_string(resp).await, SW);
+    assert_eq!(
+        body_string(resp).await,
+        SW.replace("__ASSET_VERSION__", &personal_media::web::ASSET_VERSION)
+    );
 }
 
 fn precache_entries() -> Vec<String> {
@@ -112,4 +115,42 @@ async fn authenticated_pages_are_no_store() {
         assert_eq!(resp.status(), 200, "{path}");
         assert_eq!(header_str(&resp, "cache-control"), "no-store", "{path}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn static_assets_revalidate_with_etag() {
+    let t = TestApp::new();
+    for path in ["/static/app.js", "/static/icons/icon-192.png"] {
+        let resp = t.get(path, &Client::anon()).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        assert_eq!(header_str(&resp, "cache-control"), "no-cache", "{path}");
+        let etag = header_str(&resp, "etag").to_owned();
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+
+        let req = builder(axum::http::Method::GET, path, &Client::anon())
+            .header("if-none-match", &etag)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = t.request(req).await;
+        assert_eq!(resp.status(), 304, "{path}");
+        assert_eq!(header_str(&resp, "etag"), etag);
+        assert!(body_bytes(resp).await.is_empty());
+
+        let req = builder(axum::http::Method::GET, path, &Client::anon())
+            .header("if-none-match", "\"other\"")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(t.request(req).await.status(), 200);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sw_cache_name_tracks_asset_version() {
+    let t = TestApp::new();
+    let body = body_string(t.get("/sw.js", &Client::anon()).await).await;
+    let version = &*personal_media::web::ASSET_VERSION;
+    assert!(!version.is_empty());
+    assert!(body.contains(&format!("\"pm-shell-{version}\"")), "{body}");
+    assert!(!body.contains("__ASSET_VERSION__"));
+    assert!(body.contains("cache: \"reload\""));
 }

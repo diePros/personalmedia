@@ -3,7 +3,7 @@
 // authenticated response always go to the network (and are `no-store`).
 "use strict";
 
-const CACHE = "pm-shell-v1";
+const CACHE = "pm-shell-__ASSET_VERSION__";
 const OFFLINE = "/static/offline.html";
 const PRECACHE = [
   "/static/app.css",
@@ -18,7 +18,12 @@ const PRECACHE = [
 self.addEventListener("install", function (event) {
   event.waitUntil(
     caches.open(CACHE).then(function (cache) {
-      return cache.addAll(PRECACHE);
+      // `reload` bypasses the HTTP cache so the shell is never stale.
+      return cache.addAll(
+        PRECACHE.map(function (url) {
+          return new Request(url, { cache: "reload" });
+        }),
+      );
     }),
   );
   self.skipWaiting();
