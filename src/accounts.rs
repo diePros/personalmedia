@@ -183,17 +183,20 @@ impl Accounts {
         password: &str,
         now: i64,
     ) -> Result<(Arc<Unlocked>, UserRow, RecoveryKey), AccountError> {
-        let username = normalize_username(username)?;
-        check_password_strength(password)?;
-        if self.sys.user_by_name(&username)?.is_some() {
-            return Err(AccountError::UsernameTaken);
-        }
-
+        // Validate the invite first (read-only) so that an unauthenticated
+        // caller can never learn whether a username exists.
         let mut raw = Zeroizing::new([0u8; 32]);
         if invite_token.len() != 64 || hex::decode_to_slice(invite_token, raw.as_mut()).is_err() {
             return Err(InviteError::NotFound.into());
         }
         let hash: [u8; 32] = Sha256::digest(raw.as_slice()).into();
+        self.sys.invite_status(hash, now)?;
+
+        let username = normalize_username(username)?;
+        check_password_strength(password)?;
+        if self.sys.user_by_name(&username)?.is_some() {
+            return Err(AccountError::UsernameTaken);
+        }
         let role = self.sys.consume_invite(hash, now)?;
 
         let id = uuid::Uuid::new_v4().to_string();

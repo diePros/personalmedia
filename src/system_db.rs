@@ -278,6 +278,28 @@ impl SystemDb {
         Ok(())
     }
 
+    /// Read-only invite check: same errors as [`SystemDb::consume_invite`],
+    /// but nothing is marked used.
+    pub fn invite_status(&self, token_hash: [u8; 32], now: i64) -> Result<Role, InviteError> {
+        let conn = self.lock();
+        let row: Option<(String, i64, Option<i64>)> = conn
+            .query_row(
+                "SELECT role, expires_at, used_at FROM invites WHERE token_hash=?1",
+                [token_hash.as_slice()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| InviteError::Internal)?;
+        let (role, expires_at, used_at) = row.ok_or(InviteError::NotFound)?;
+        if used_at.is_some() {
+            return Err(InviteError::Used);
+        }
+        if now > expires_at {
+            return Err(InviteError::Expired);
+        }
+        Role::parse(&role).ok_or(InviteError::Internal)
+    }
+
     /// Atomically validate an invite and mark it used.
     pub fn consume_invite(&self, token_hash: [u8; 32], now: i64) -> Result<Role, InviteError> {
         let mut conn = self.lock();
@@ -468,6 +490,22 @@ mod tests {
             db.consume_invite([2; 32], 10).unwrap_err(),
             InviteError::NotFound
         );
+    }
+
+    #[test]
+    fn invite_status_is_read_only() {
+        let (_d, db) = db();
+        let h = [3; 32];
+        db.create_invite(h, Role::User, 0, 100).unwrap();
+        assert_eq!(db.invite_status(h, 10).unwrap(), Role::User);
+        assert_eq!(db.invite_status(h, 10).unwrap(), Role::User);
+        assert_eq!(db.invite_status(h, 101).unwrap_err(), InviteError::Expired);
+        assert_eq!(
+            db.invite_status([4; 32], 10).unwrap_err(),
+            InviteError::NotFound
+        );
+        db.consume_invite(h, 10).unwrap();
+        assert_eq!(db.invite_status(h, 11).unwrap_err(), InviteError::Used);
     }
 
     #[test]

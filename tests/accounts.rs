@@ -209,6 +209,19 @@ fn duplicate_username_rejected_without_burning_invite() {
 }
 
 #[test]
+fn signup_without_valid_invite_never_reveals_username_taken() {
+    let env = Env::new();
+    env.accounts
+        .signup(&env.invite(Role::User), "sebi", PW, NOW)
+        .unwrap();
+    let bogus = "ab".repeat(32);
+    let taken = env.accounts.signup(&bogus, "sebi", PW, NOW).unwrap_err();
+    let free = env.accounts.signup(&bogus, "nobody", PW, NOW).unwrap_err();
+    assert!(matches!(taken, AccountError::Invite(InviteError::NotFound)));
+    assert!(matches!(free, AccountError::Invite(InviteError::NotFound)));
+}
+
+#[test]
 fn weak_password_rejected() {
     let env = Env::new();
     let token = env.invite(Role::User);
