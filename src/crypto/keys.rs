@@ -100,6 +100,10 @@ pub mod aad {
     pub fn totp(user_id: &str) -> String {
         format!("pm/v1/totp/{user_id}")
     }
+    /// Seals the recovery key shown to the user until they confirm saving it.
+    pub fn pending_recovery(user_id: &str) -> String {
+        format!("pm/v1/pending-recovery/{user_id}")
+    }
     pub fn dek(user_id: &str, doc_id: &str) -> String {
         format!("pm/v1/dek/{user_id}/{doc_id}")
     }
@@ -184,5 +188,6 @@ mod tests {
         assert_eq!(aad::index_key("u"), "pm/v1/indexkey/u");
         assert_eq!(aad::totp("u"), "pm/v1/totp/u");
         assert_eq!(aad::umk_recovery("u"), "pm/v1/umk/recovery/u");
+        assert_eq!(aad::pending_recovery("u"), "pm/v1/pending-recovery/u");
     }
 }

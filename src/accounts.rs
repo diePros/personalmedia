@@ -173,11 +173,14 @@ impl Accounts {
         Ok((salt, wrapped))
     }
 
-    fn new_recovery_wrap(user_id: &str, umk: &Key32) -> (RecoveryKey, Vec<u8>) {
+    /// A new recovery key with its wrap and its pending copy (the key sealed
+    /// under the UMK, kept until the user confirms having saved it).
+    fn new_recovery_wrap(user_id: &str, umk: &Key32) -> (RecoveryKey, Vec<u8>, Vec<u8>) {
         let rk = RecoveryKey::generate();
         let kek = secret_kek(rk.secret(), INFO_RECOVERY);
         let wrapped = wrap_key(&kek, umk, aad::umk_recovery(user_id).as_bytes());
-        (rk, wrapped)
+        let pending = seal(umk, rk.secret(), aad::pending_recovery(user_id).as_bytes());
+        (rk, wrapped, pending)
     }
 
     fn unwrap_with_password(&self, row: &UserRow, password: &str) -> Result<Key32, AccountError> {
@@ -240,7 +243,7 @@ impl Accounts {
         now: i64,
     ) -> Result<(UserRow, RecoveryKey), AccountError> {
         let (salt, umk_by_password) = self.new_password_wrap(id, password, umk)?;
-        let (recovery, umk_by_recovery) = Self::new_recovery_wrap(id, umk);
+        let (recovery, umk_by_recovery, pending) = Self::new_recovery_wrap(id, umk);
         let index_key = Key32::random();
         let index_key_wrapped = wrap_key(umk, &index_key, aad::index_key(id).as_bytes());
 
@@ -264,6 +267,7 @@ impl Accounts {
             umk_by_recovery,
             index_key_wrapped,
             totp_sealed: None,
+            pending_recovery_sealed: Some(pending),
         };
         match self.sys.insert_user(&row) {
             Ok(()) => Ok((row, recovery)),
@@ -327,10 +331,10 @@ impl Accounts {
         check_password_strength(new_password)?;
 
         let (salt, by_password) = self.new_password_wrap(&row.id, new_password, &umk)?;
-        let (new_recovery, by_recovery) = Self::new_recovery_wrap(&row.id, &umk);
+        let (new_recovery, by_recovery, pending) = Self::new_recovery_wrap(&row.id, &umk);
         self.sys
             .set_password_wrap(&row.id, salt, self.argon2, &by_password)?;
-        self.sys.set_recovery_wrap(&row.id, &by_recovery)?;
+        self.sys.replace_recovery(&row.id, &by_recovery, &pending)?;
         // The authenticator may be lost; the user re-enables TOTP afterwards.
         self.sys.set_totp(&row.id, None)?;
 
@@ -340,6 +344,7 @@ impl Accounts {
             umk_by_password: by_password,
             umk_by_recovery: by_recovery,
             totp_sealed: None,
+            pending_recovery_sealed: Some(pending),
             ..row
         };
         let unlocked = self.keyring.unlock(&row.id, umk, &row.index_key_wrapped)?;
@@ -368,9 +373,35 @@ impl Accounts {
 
     /// Replace the recovery wrap with one for a newly generated recovery key.
     pub fn regenerate_recovery(&self, u: &Unlocked) -> Result<RecoveryKey, AccountError> {
-        let (recovery, wrapped) = Self::new_recovery_wrap(&u.user_id, u.umk());
-        self.sys.set_recovery_wrap(&u.user_id, &wrapped)?;
+        let (recovery, wrapped, pending) = Self::new_recovery_wrap(&u.user_id, u.umk());
+        self.sys.replace_recovery(&u.user_id, &wrapped, &pending)?;
         Ok(recovery)
+    }
+
+    /// The recovery key the user has not confirmed saving yet, if any.
+    pub fn pending_recovery(&self, u: &Unlocked) -> Result<Option<RecoveryKey>, AccountError> {
+        let Some(row) = self.sys.user_by_id(&u.user_id)? else {
+            return Err(AccountError::InvalidCredentials);
+        };
+        let Some(sealed) = row.pending_recovery_sealed else {
+            return Ok(None);
+        };
+        let bytes = open(
+            u.umk(),
+            &sealed,
+            aad::pending_recovery(&u.user_id).as_bytes(),
+        )
+        .map_err(|e| anyhow!("stored pending recovery key unusable: {e}"))?;
+        let key: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("stored pending recovery key has the wrong length"))?;
+        Ok(Some(RecoveryKey::from_secret(key)))
+    }
+
+    /// The user confirmed saving the recovery key: forget the pending copy.
+    pub fn confirm_recovery(&self, user_id: &str) -> anyhow::Result<()> {
+        self.sys.clear_pending_recovery(user_id)
     }
 
     /// Check `password` against the stored password wrap without changing anything.

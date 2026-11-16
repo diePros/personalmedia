@@ -66,6 +66,9 @@ pub struct UserRow {
     pub umk_by_recovery: Vec<u8>,
     pub index_key_wrapped: Vec<u8>,
     pub totp_sealed: Option<Vec<u8>>,
+    /// The newest recovery key, sealed under the UMK, until the user confirms
+    /// having saved it.
+    pub pending_recovery_sealed: Option<Vec<u8>>,
 }
 
 pub struct SystemDb {
@@ -86,7 +89,8 @@ CREATE TABLE users (
     umk_by_password BLOB NOT NULL,
     umk_by_recovery BLOB NOT NULL,
     index_key_wrapped BLOB NOT NULL,
-    totp_sealed BLOB
+    totp_sealed BLOB,
+    pending_recovery_sealed BLOB
 );
 CREATE TABLE invites (
     token_hash BLOB PRIMARY KEY,
@@ -104,7 +108,8 @@ CREATE INDEX tokens_user ON tokens(user_id);
 ";
 
 const USER_COLS: &str = "id, username, role, disabled, created_at, salt, argon2_m, argon2_t, \
-     argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed";
+     argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed, \
+     pending_recovery_sealed";
 
 fn bad_col(i: usize, what: &str) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
@@ -135,6 +140,7 @@ fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         umk_by_recovery: r.get(10)?,
         index_key_wrapped: r.get(11)?,
         totp_sealed: r.get(12)?,
+        pending_recovery_sealed: r.get(13)?,
     })
 }
 
@@ -163,7 +169,7 @@ impl SystemDb {
 
     pub fn insert_user(&self, u: &UserRow) -> Result<(), SysError> {
         let res = self.lock().execute(
-            &format!("INSERT INTO users ({USER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"),
+            &format!("INSERT INTO users ({USER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
             params![
                 u.id,
                 u.username,
@@ -178,6 +184,7 @@ impl SystemDb {
                 u.umk_by_recovery,
                 u.index_key_wrapped,
                 u.totp_sealed,
+                u.pending_recovery_sealed,
             ],
         );
         match res {
@@ -238,6 +245,29 @@ impl SystemDb {
         self.lock().execute(
             "UPDATE users SET umk_by_recovery=?2 WHERE id=?1",
             params![id, wrapped],
+        )?;
+        Ok(())
+    }
+
+    /// Replace the recovery wrap and the sealed copy of the new key in one statement.
+    pub fn replace_recovery(
+        &self,
+        id: &str,
+        wrapped: &[u8],
+        pending_sealed: &[u8],
+    ) -> anyhow::Result<()> {
+        self.lock().execute(
+            "UPDATE users SET umk_by_recovery=?2, pending_recovery_sealed=?3 WHERE id=?1",
+            params![id, wrapped, pending_sealed],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the pending recovery key once the user confirmed saving it.
+    pub fn clear_pending_recovery(&self, id: &str) -> anyhow::Result<()> {
+        self.lock().execute(
+            "UPDATE users SET pending_recovery_sealed=NULL WHERE id=?1",
+            params![id],
         )?;
         Ok(())
     }
@@ -437,6 +467,7 @@ mod tests {
             umk_by_recovery: vec![4, 5],
             index_key_wrapped: vec![6],
             totp_sealed: None,
+            pending_recovery_sealed: None,
         }
     }
 
@@ -461,6 +492,19 @@ mod tests {
             p: 1,
         };
         db.set_password_wrap("u1", [9; 16], a2, &[8, 8]).unwrap();
+        db.set_recovery_wrap("u1", &[5, 5]).unwrap();
+        db.replace_recovery("u1", &[6, 6], &[7]).unwrap();
+        let got = db.user_by_id("u1").unwrap().unwrap();
+        assert_eq!(got.umk_by_recovery, vec![6, 6]);
+        assert_eq!(got.pending_recovery_sealed, Some(vec![7]));
+        db.clear_pending_recovery("u1").unwrap();
+        assert_eq!(
+            db.user_by_id("u1")
+                .unwrap()
+                .unwrap()
+                .pending_recovery_sealed,
+            None
+        );
         db.set_recovery_wrap("u1", &[5, 5]).unwrap();
         db.set_totp("u1", Some(&[1])).unwrap();
         db.set_disabled("u1", true).unwrap();

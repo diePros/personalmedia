@@ -13,6 +13,11 @@ impl RecoveryKey {
         Self(b)
     }
 
+    /// Rebuilds a key from its 32 secret bytes (for example after unsealing it).
+    pub fn from_secret(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub fn to_display(&self) -> String {
         let enc = BASE32_NOPAD.encode(&self.0);
         enc.as_bytes()

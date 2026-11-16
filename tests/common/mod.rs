@@ -89,6 +89,8 @@ impl TestApp {
 
     fn session_with_role(&self, username: &str, role: Role) -> Client {
         let client = self.pending_session_with_role(username, role);
+        let user_id = self.state.sessions.get(&client.cookie).unwrap().user_id;
+        self.state.accounts.confirm_recovery(&user_id).unwrap();
         self.state.sessions.confirm_recovery(&client.cookie);
         client
     }

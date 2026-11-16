@@ -540,3 +540,102 @@ async fn login_in_flight_does_not_survive_disable() {
         Err(personal_media::accounts::AccountError::InvalidCredentials)
     ));
 }
+
+async fn login_as(app: &TestApp, username: &str, password: &str) -> axum::response::Response {
+    app.post_form(
+        "/login",
+        &[("username", username), ("password", password)],
+        &Client::anon(),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unconfirmed_recovery_key_is_shown_again_after_relogin() {
+    let app = TestApp::new();
+    let (_dropped_session, html) = signup(&app, "alice").await;
+    let key = extract_key(&html);
+
+    // The tab was closed without confirming; a fresh login must show it again.
+    let resp = login_as(&app, "alice", PASSWORD).await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(header_str(&resp, "location"), "/recovery-key");
+    let c2 = client_from_response(&resp);
+    let page = body_string(app.get("/recovery-key", &c2).await).await;
+    assert_eq!(extract_key(&page), key);
+    // And nothing else is reachable until it is confirmed.
+    assert_eq!(app.get("/documents", &c2).await.status(), 303);
+
+    // The sealed copy never exposes the key in system.db.
+    let raw = std::fs::read(
+        app.dir
+            .path()
+            .join(personal_media::system_db::SYSTEM_DB_FILE),
+    )
+    .unwrap();
+    let secret = *personal_media::crypto::RecoveryKey::parse(&key)
+        .unwrap()
+        .secret();
+    assert!(!raw.windows(32).any(|w| w == secret));
+    assert!(!String::from_utf8_lossy(&raw).contains(&key.replace('-', "")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn confirming_clears_pending_recovery() {
+    let app = TestApp::new();
+    let (client, _) = signup(&app, "alice").await;
+    assert!(
+        app.state
+            .sys
+            .user_by_name("alice")
+            .unwrap()
+            .unwrap()
+            .pending_recovery_sealed
+            .is_some()
+    );
+    let r = app
+        .post_form("/recovery-key", &[("saved", "on")], &client)
+        .await;
+    assert_eq!(r.status(), 303);
+    assert!(
+        app.state
+            .sys
+            .user_by_name("alice")
+            .unwrap()
+            .unwrap()
+            .pending_recovery_sealed
+            .is_none()
+    );
+    let resp = login_as(&app, "alice", PASSWORD).await;
+    assert_eq!(header_str(&resp, "location"), "/documents");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unconfirmed_new_key_after_recover_is_shown_again() {
+    let app = TestApp::new();
+    let (client, html) = signup(&app, "alice").await;
+    let old_key = extract_key(&html);
+    app.post_form("/recovery-key", &[("saved", "on")], &client)
+        .await;
+    let pw = "a brand new passphrase";
+    let resp = app
+        .post_form(
+            "/recover",
+            &[
+                ("username", "alice"),
+                ("recovery_key", &old_key),
+                ("new_password", pw),
+                ("new_password_confirm", pw),
+            ],
+            &Client::anon(),
+        )
+        .await;
+    let c2 = client_from_response(&resp);
+    let new_key = extract_key(&body_string(app.get("/recovery-key", &c2).await).await);
+
+    let resp = login_as(&app, "alice", pw).await;
+    assert_eq!(header_str(&resp, "location"), "/recovery-key");
+    let c3 = client_from_response(&resp);
+    let again = extract_key(&body_string(app.get("/recovery-key", &c3).await).await);
+    assert_eq!(again, new_key);
+}

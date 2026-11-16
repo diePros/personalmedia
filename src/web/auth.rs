@@ -98,6 +98,11 @@ pub fn finish_login(
     if row.disabled {
         return Err(AccountError::Disabled);
     }
+    // A recovery key the user never confirmed is shown again, whatever the login.
+    let recovery = match recovery {
+        Some(key) => Some(key),
+        None => state.accounts.pending_recovery(&unlocked)?,
+    };
     Ok(start_session(state, headers, &row, unlocked, recovery))
 }
 
@@ -267,6 +272,9 @@ async fn recovery_key_confirm(
             &session,
             Some("Confirm that you have saved your recovery key"),
         );
+    }
+    if let Err(e) = state.accounts.confirm_recovery(&session.user_id) {
+        return internal(&AccountError::Internal(e));
     }
     state.sessions.confirm_recovery(&session.id);
     redirect(&headers, "/documents")
