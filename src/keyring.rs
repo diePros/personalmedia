@@ -65,6 +65,15 @@ impl std::fmt::Debug for Unlocked {
     }
 }
 
+/// The presented UMK differs from the live one: forged or swapped wrap.
+#[derive(Debug, thiserror::Error)]
+#[error("presented key does not match the unlocked user")]
+pub struct UmkMismatch;
+
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    std::hint::black_box(a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y))) == 0
+}
+
 pub struct Keyring {
     data_dir: PathBuf,
     on_unlock: Arc<dyn OnUnlock>,
@@ -105,6 +114,11 @@ impl Keyring {
             // unlocks of one user can never produce two `Unlocked`.
             let mut map = self.lock();
             if let Some(live) = map.get(user_id).and_then(Weak::upgrade) {
+                // The wraps in system.db are attacker-writable; the live UMK is
+                // the only trustworthy reference, so the presented one must match.
+                if !ct_eq(live.umk.as_bytes(), umk.as_bytes()) {
+                    return Err(UmkMismatch.into());
+                }
                 return Ok(live);
             }
             map.retain(|_, w| w.strong_count() > 0);

@@ -596,3 +596,82 @@ fn totp_resume_rebuilds_the_same_setup() {
     assert!(again.qr_png_base64.starts_with("iVBORw0KGgo"));
     assert!(env.accounts.totp_resume("sebi", "not base32 !").is_err());
 }
+
+fn forge_password_wrap(env: &Env, user_id: &str, attacker_pw: &str) {
+    use personal_media::crypto::{Key32, aad, password_kek, wrap_key};
+    let row = env.sys.user_by_id(user_id).unwrap().unwrap();
+    let salt = [5u8; 16];
+    let kek = password_kek(attacker_pw, &salt, &row.argon2).unwrap();
+    let forged = wrap_key(
+        &kek,
+        &Key32::from_bytes([9u8; 32]),
+        aad::umk_password(user_id).as_bytes(),
+    );
+    rusqlite::Connection::open(env.dir.path().join(SYSTEM_DB_FILE))
+        .unwrap()
+        .execute(
+            "UPDATE users SET salt=?1, umk_by_password=?2 WHERE id=?3",
+            rusqlite::params![salt.to_vec(), forged, user_id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn forged_password_wrap_rejected_while_user_unlocked() {
+    let env = Env::new();
+    let (u, row, _rk) = env
+        .accounts
+        .signup(&env.invite(Role::User), "victim", PW, NOW)
+        .unwrap();
+    // `u` keeps the keyring entry live.
+    forge_password_wrap(&env, &row.id, "attacker chosen pw");
+    let r = env.accounts.login("victim", "attacker chosen pw", None);
+    assert!(matches!(r, Err(AccountError::InvalidCredentials)));
+    drop(u);
+}
+
+#[test]
+fn forged_password_wrap_rejected_while_user_locked() {
+    let env = Env::new();
+    let (u, row, _rk) = env
+        .accounts
+        .signup(&env.invite(Role::User), "victim", PW, NOW)
+        .unwrap();
+    drop(u);
+    forge_password_wrap(&env, &row.id, "attacker chosen pw");
+    assert!(
+        env.accounts
+            .login("victim", "attacker chosen pw", None)
+            .is_err()
+    );
+}
+
+#[test]
+fn swapped_index_key_wraps_rejected() {
+    let env = Env::new();
+    let (ua, a, _) = env
+        .accounts
+        .signup(&env.invite(Role::User), "alice", PW, NOW)
+        .unwrap();
+    let (ub, b, _) = env
+        .accounts
+        .signup(&env.invite(Role::User), "bobby", PW, NOW)
+        .unwrap();
+    let ra = env.sys.user_by_id(&a.id).unwrap().unwrap();
+    let rb = env.sys.user_by_id(&b.id).unwrap().unwrap();
+    let conn = rusqlite::Connection::open(env.dir.path().join(SYSTEM_DB_FILE)).unwrap();
+    for (id, w) in [
+        (&a.id, &rb.index_key_wrapped),
+        (&b.id, &ra.index_key_wrapped),
+    ] {
+        conn.execute(
+            "UPDATE users SET index_key_wrapped=?1 WHERE id=?2",
+            rusqlite::params![w, id],
+        )
+        .unwrap();
+    }
+    drop((ua, ub));
+    // Locked: the swapped index key cannot be unwrapped.
+    assert!(env.accounts.login("alice", PW, None).is_err());
+    assert!(env.accounts.login("bobby", PW, None).is_err());
+}

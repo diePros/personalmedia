@@ -48,6 +48,14 @@ pub enum AccountError {
     Internal(#[from] anyhow::Error),
 }
 
+fn unlock_error(e: anyhow::Error) -> AccountError {
+    if e.is::<crate::keyring::UmkMismatch>() {
+        AccountError::InvalidCredentials
+    } else {
+        AccountError::Internal(e)
+    }
+}
+
 pub struct TotpSetup {
     pub secret_b32: String,
     pub otpauth_url: String,
@@ -228,7 +236,10 @@ impl Accounts {
                 return Err(e);
             }
         };
-        let unlocked = self.keyring.unlock(&id, umk, &row.index_key_wrapped)?;
+        let unlocked = self
+            .keyring
+            .unlock(&id, umk, &row.index_key_wrapped)
+            .map_err(unlock_error)?;
         Ok((unlocked, row, recovery))
     }
 
@@ -301,7 +312,10 @@ impl Accounts {
                 return Err(AccountError::InvalidCredentials);
             }
         }
-        let unlocked = self.keyring.unlock(&row.id, umk, &row.index_key_wrapped)?;
+        let unlocked = self
+            .keyring
+            .unlock(&row.id, umk, &row.index_key_wrapped)
+            .map_err(unlock_error)?;
         Ok((unlocked, row))
     }
 
@@ -347,7 +361,10 @@ impl Accounts {
             pending_recovery_sealed: Some(pending),
             ..row
         };
-        let unlocked = self.keyring.unlock(&row.id, umk, &row.index_key_wrapped)?;
+        let unlocked = self
+            .keyring
+            .unlock(&row.id, umk, &row.index_key_wrapped)
+            .map_err(unlock_error)?;
         Ok((unlocked, row, new_recovery))
     }
 

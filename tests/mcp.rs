@@ -692,3 +692,81 @@ async fn bearer_upload_via_api_upload() {
     assert_eq!(status, 200);
     assert_eq!(out["status"], "stored");
 }
+
+fn sys_conn(f: &Fx) -> rusqlite::Connection {
+    rusqlite::Connection::open(f.t.dir.path().join("system.db")).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forged_token_wrap_rejected_while_user_unlocked() {
+    use personal_media::crypto::{INFO_TOKEN, Key32, aad, secret_kek, wrap_key};
+    let f = Fx::new();
+    let real = f.token(Access::Read, Content::FullText, None);
+    let token_id = &real[3..35];
+    let secret = [7u8; 32];
+    let forged = wrap_key(
+        &secret_kek(&secret, INFO_TOKEN),
+        &Key32::from_bytes([9u8; 32]),
+        aad::umk_token(token_id).as_bytes(),
+    );
+    sys_conn(&f)
+        .execute(
+            "UPDATE tokens SET umk_wrapped=?1 WHERE token_id=?2",
+            rusqlite::params![forged, token_id],
+        )
+        .unwrap();
+    let (status, _) = f
+        .post(
+            Some(&format!("pm_{token_id}_{}", hex::encode(secret))),
+            &json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+        )
+        .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn swapped_token_rows_between_users_rejected() {
+    let f = Fx::new();
+    let real = f.token(Access::Read, Content::FullText, None);
+    let token_id = real[3..35].to_string();
+    let bob = f.t.session_for("bobby");
+    let bob_id =
+        f.t.state
+            .sessions
+            .get(&bob.cookie)
+            .unwrap()
+            .unlocked
+            .user_id
+            .clone();
+    sys_conn(&f)
+        .execute(
+            "UPDATE tokens SET user_id=?1 WHERE token_id=?2",
+            rusqlite::params![bob_id, token_id],
+        )
+        .unwrap();
+    let (status, _) = f
+        .post(
+            Some(&real),
+            &json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+        )
+        .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reinserted_revoked_token_row_rejected() {
+    use personal_media::tokens::revoke_token;
+    let f = Fx::new();
+    let real = f.token(Access::Read, Content::FullText, None);
+    let token_id = real[3..35].to_string();
+    let (uid, wrap) = f.t.state.sys.token(&token_id).unwrap().unwrap();
+    revoke_token(&f.t.state.sys, &f.u, &token_id, &f.t.state.tokens).unwrap();
+    f.t.state.sys.insert_token(&token_id, &uid, &wrap).unwrap();
+    let (status, _) = f
+        .post(
+            Some(&real),
+            &json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+        )
+        .await;
+    assert_eq!(status, 401);
+}
