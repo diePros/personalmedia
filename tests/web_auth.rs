@@ -639,3 +639,38 @@ async fn unconfirmed_new_key_after_recover_is_shown_again() {
     let again = extract_key(&body_string(app.get("/recovery-key", &c3).await).await);
     assert_eq!(again, new_key);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recover_ends_other_sessions() {
+    let app = TestApp::new();
+    let (client, html) = signup(&app, "alice").await;
+    let key = extract_key(&html);
+    app.post_form("/recovery-key", &[("saved", "on")], &client)
+        .await;
+    // A second browser logged in with the old password.
+    let other = client_from_response(&login_as(&app, "alice", PASSWORD).await);
+    assert_eq!(app.get("/documents", &other).await.status(), 200);
+    assert_eq!(app.get("/documents", &client).await.status(), 200);
+
+    let pw = "a brand new passphrase";
+    let resp = app
+        .post_form(
+            "/recover",
+            &[
+                ("username", "alice"),
+                ("recovery_key", &key),
+                ("new_password", pw),
+                ("new_password_confirm", pw),
+            ],
+            &Client::anon(),
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    for old in [&client, &other] {
+        let r = app.get("/documents", old).await;
+        assert_eq!(r.status(), 303);
+        assert_eq!(header_str(&r, "location"), "/login");
+    }
+    let fresh = client_from_response(&resp);
+    assert_eq!(app.get("/recovery-key", &fresh).await.status(), 200);
+}

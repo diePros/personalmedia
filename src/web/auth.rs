@@ -463,6 +463,10 @@ async fn recover(
     };
     match result {
         Ok((unlocked, user, new_key)) => {
+            // The old password may be compromised: no other session or cached
+            // token unlock survives the recovery.
+            state.sessions.remove_user(&user.id);
+            state.tokens.evict_user(&user.id);
             match finish_login(&state, &headers, &user.id, unlocked, Some(new_key)) {
                 Ok(resp) => {
                     attempt.success();
