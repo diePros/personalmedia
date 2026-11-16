@@ -565,3 +565,34 @@ fn unlocked_debug_does_not_leak_key() {
     assert!(!dbg.contains(&hex::encode(u.umk().as_bytes())));
     assert!(!dbg.contains(&format!("{:?}", u.umk().as_bytes())));
 }
+
+#[test]
+fn verify_password_checks_without_changing_anything() {
+    let env = Env::new();
+    let (_u, row, _rk) = env
+        .accounts
+        .signup(&env.invite(Role::User), "sebi", PW, NOW)
+        .unwrap();
+    env.accounts.verify_password(&row.id, PW).unwrap();
+    assert!(matches!(
+        env.accounts.verify_password(&row.id, PW2).unwrap_err(),
+        AccountError::InvalidCredentials
+    ));
+    assert!(matches!(
+        env.accounts.verify_password("nobody", PW).unwrap_err(),
+        AccountError::InvalidCredentials
+    ));
+    // Still logs in with the original password.
+    env.accounts.login("sebi", PW, None).unwrap();
+}
+
+#[test]
+fn totp_resume_rebuilds_the_same_setup() {
+    let env = Env::new();
+    let setup = env.accounts.totp_begin("sebi");
+    let again = env.accounts.totp_resume("sebi", &setup.secret_b32).unwrap();
+    assert_eq!(again.secret_b32, setup.secret_b32);
+    assert_eq!(again.otpauth_url, setup.otpauth_url);
+    assert!(again.qr_png_base64.starts_with("iVBORw0KGgo"));
+    assert!(env.accounts.totp_resume("sebi", "not base32 !").is_err());
+}

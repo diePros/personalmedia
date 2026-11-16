@@ -165,6 +165,16 @@ impl SessionStore {
         drop(key);
     }
 
+    /// Require the user to confirm a freshly generated recovery key before
+    /// using the session for anything else.
+    pub fn set_must_confirm_recovery(&self, id: &str, key: Option<RecoveryKey>) {
+        let old = self
+            .lock()
+            .get_mut(id)
+            .map(|s| std::mem::replace(&mut s.must_confirm_recovery, key));
+        drop(old);
+    }
+
     pub fn set_pending_totp(&self, id: &str, secret: Option<String>) {
         if let Some(s) = self.lock().get_mut(id) {
             s.pending_totp_secret = secret;
@@ -180,6 +190,11 @@ impl SessionStore {
     /// End every session of a user (disable, delete, password change).
     pub fn remove_user(&self, user_id: &str) {
         self.remove_where(|s| s.user_id == user_id);
+    }
+
+    /// End every session of a user except `keep` (password change).
+    pub fn remove_user_except(&self, user_id: &str, keep: &str) {
+        self.remove_where(|s| s.user_id == user_id && s.id != keep);
     }
 
     /// Drop expired sessions. Run every minute by a background task, so keys

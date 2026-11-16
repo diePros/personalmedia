@@ -348,7 +348,7 @@ fn snippet_html(s: &str) -> String {
         .replace('\u{3}', "</mark>")
 }
 
-fn format_date(ts: i64) -> String {
+pub(super) fn format_date(ts: i64) -> String {
     time::OffsetDateTime::from_unix_timestamp(ts)
         .map(|d| d.date().to_string())
         .unwrap_or_default()
@@ -660,6 +660,11 @@ fn stream_body(mut reader: impl std::io::Read + Send + 'static) -> Body {
             }
         }
     });
+    channel_body(rx)
+}
+
+/// A response body fed by a bounded channel (the other end is a blocking task).
+pub(super) fn channel_body(rx: tokio::sync::mpsc::Receiver<std::io::Result<Bytes>>) -> Body {
     Body::from_stream(stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     }))

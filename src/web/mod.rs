@@ -14,6 +14,7 @@ pub mod auth;
 pub mod docs;
 pub mod ratelimit;
 pub mod session;
+pub mod settings;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -117,6 +118,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .merge(auth::routes())
         .merge(docs::routes(&state))
+        .merge(settings::routes())
         .route("/static/{file}", get(static_file))
         // Layers run bottom-up: access log, then headers, then session + CSRF.
         .layer(middleware::from_fn_with_state(

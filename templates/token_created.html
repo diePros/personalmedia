@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}New token · Personal Media{% endblock %}
+{% block content %}
+<h1>Token created</h1>
+<p class="notice" role="status">This is the only time the token is shown. Copy it now.</p>
+<p>Token for <strong>{{ name }}</strong>:</p>
+<p><code class="recovery-key">{{ token }}</code></p>
+<h2>Hermes</h2>
+<p>Add this to <code>~/.hermes/config.yaml</code>, then run <code>/reload-mcp</code> in Hermes.</p>
+<pre><code>mcp_servers:
+  personal_media:
+    url: "{{ public_url }}/mcp"
+    headers:
+      Authorization: "Bearer {{ token }}"</code></pre>
+<p><a href="/settings#tokens">Back to settings</a></p>
+{% endblock %}

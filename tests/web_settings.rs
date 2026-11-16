@@ -1,0 +1,725 @@
+mod common;
+
+use std::io::Read;
+
+use common::*;
+use personal_media::system_db::SYSTEM_DB_FILE;
+use personal_media::user_db::{
+    Access, Channel, Content, Level, TokenScope, get_access_defaults, list_token_meta,
+    set_document_access,
+};
+
+const PDF: &[u8] = include_bytes!("fixtures/text.pdf");
+
+fn totp_code(secret_b32: &str) -> String {
+    totp_rs::Builder::new()
+        .with_algorithm(totp_rs::Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(1)
+        .with_step_duration(30)
+        .with_secret(totp_rs::Secret::try_from_base32(secret_b32).unwrap())
+        .build()
+        .unwrap()
+        .generate_current()
+        .to_string()
+}
+
+async fn upload_named(t: &TestApp, c: &Client, name: &str, bytes: &[u8], title: &str) -> String {
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[("title", title)],
+            &[("file", name, "application/pdf", bytes)],
+            c,
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    v["id"].as_str().unwrap().to_owned()
+}
+
+fn unlocked(t: &TestApp, c: &Client) -> std::sync::Arc<personal_media::keyring::Unlocked> {
+    t.state.sessions.get(&c.cookie).unwrap().unlocked
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_page_needs_login_and_lists_sections() {
+    let t = TestApp::new();
+    let anon = t.get("/settings", &Client::anon()).await;
+    assert_eq!(anon.status(), 303);
+    let c = t.session_for("alice");
+    let resp = t.get("/settings", &c).await;
+    assert_eq!(resp.status(), 200);
+    let html = body_string(resp).await;
+    let positions: Vec<usize> = [
+        "Access defaults",
+        "Hidden from web",
+        "Tokens",
+        "Two-factor",
+        "Password",
+        "Recovery key",
+        "Export",
+    ]
+    .iter()
+    .map(|h| {
+        html.find(&format!("<h2>{h}"))
+            .unwrap_or_else(|| panic!("{h}"))
+    })
+    .collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    assert!(html.contains(
+        "Changing your password does not protect against someone who already copied a backup of the server."
+    ));
+    assert!(html.contains("Per-document settings on a document's page override these defaults."));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_password_flow() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let other = {
+        let row = t.state.sys.user_by_name("alice").unwrap().unwrap();
+        let (cookie, csrf) = t.state.sessions.create(&row, unlocked(&t, &c), None);
+        Client { cookie, csrf }
+    };
+    let new = "a brand new password";
+
+    let wrong = t
+        .post_form(
+            "/settings/password",
+            &[
+                ("current", "nope nope nope"),
+                ("new", new),
+                ("new_confirm", new),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(wrong.status(), 401);
+    assert!(
+        body_string(wrong)
+            .await
+            .contains("The current password is wrong")
+    );
+
+    let mismatch = t
+        .post_form(
+            "/settings/password",
+            &[
+                ("current", PASSWORD),
+                ("new", new),
+                ("new_confirm", "different one"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(mismatch.status(), 400);
+
+    let weak = t
+        .post_form(
+            "/settings/password",
+            &[
+                ("current", PASSWORD),
+                ("new", "short"),
+                ("new_confirm", "short"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(weak.status(), 400);
+
+    let ok = t
+        .post_form(
+            "/settings/password",
+            &[("current", PASSWORD), ("new", new), ("new_confirm", new)],
+            &c,
+        )
+        .await;
+    assert_eq!(ok.status(), 303);
+    assert_eq!(header_str(&ok, "location"), "/settings?notice=password");
+
+    assert!(t.state.accounts.login("alice", new, None).is_ok());
+    assert!(t.state.accounts.login("alice", PASSWORD, None).is_err());
+    // This browser stays logged in, the other one does not.
+    assert_eq!(t.get("/settings", &c).await.status(), 200);
+    assert_eq!(t.get("/settings", &other).await.status(), 303);
+    let page = body_string(t.get("/settings?notice=password", &c).await).await;
+    assert!(page.contains("Password changed."));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn password_forms_need_csrf() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let resp = t
+        .post_form_raw(
+            "/settings/password",
+            &[
+                ("current", PASSWORD),
+                ("new", "another password"),
+                ("new_confirm", "another password"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 403);
+    assert!(t.state.accounts.login("alice", PASSWORD, None).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn regenerate_recovery_requires_password_and_confirmation() {
+    let t = TestApp::new();
+    let c = t.pending_session_for("alice");
+    let old_key = t
+        .state
+        .sessions
+        .get(&c.cookie)
+        .unwrap()
+        .must_confirm_recovery
+        .unwrap()
+        .to_display();
+    t.state.sessions.confirm_recovery(&c.cookie);
+
+    let wrong = t
+        .post_form(
+            "/settings/recovery",
+            &[("password", "wrong wrong wrong")],
+            &c,
+        )
+        .await;
+    assert_eq!(wrong.status(), 401);
+    assert!(
+        t.state
+            .sessions
+            .get(&c.cookie)
+            .unwrap()
+            .must_confirm_recovery
+            .is_none()
+    );
+
+    let ok = t
+        .post_form("/settings/recovery", &[("password", PASSWORD)], &c)
+        .await;
+    assert_eq!(ok.status(), 303);
+    assert_eq!(header_str(&ok, "location"), "/recovery-key");
+
+    // Until it is confirmed the session only reaches the recovery key page.
+    assert_eq!(t.get("/settings", &c).await.status(), 303);
+    let page = body_string(t.get("/recovery-key", &c).await).await;
+    let new_key = t
+        .state
+        .sessions
+        .get(&c.cookie)
+        .unwrap()
+        .must_confirm_recovery
+        .unwrap()
+        .to_display();
+    assert_ne!(new_key, old_key);
+    assert!(page.contains(&new_key));
+    let confirm = t.post_form("/recovery-key", &[("saved", "on")], &c).await;
+    assert_eq!(confirm.status(), 303);
+    assert_eq!(t.get("/settings", &c).await.status(), 200);
+
+    // The old key is dead, the new one works.
+    assert!(
+        t.state
+            .accounts
+            .recover("alice", &old_key, "some other password")
+            .is_err()
+    );
+    assert!(
+        t.state
+            .accounts
+            .recover("alice", &new_key, "some other password")
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn totp_enable_disable() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let uid = t.state.sessions.get(&c.cookie).unwrap().user_id;
+
+    // Enabling without starting the setup fails.
+    let early = t
+        .post_form("/settings/totp/enable", &[("code", "123456")], &c)
+        .await;
+    assert_eq!(early.status(), 400);
+
+    let begin = t.post_form("/settings/totp/begin", &[], &c).await;
+    assert_eq!(begin.status(), 200);
+    let html = body_string(begin).await;
+    assert!(html.contains("<img src=\"data:image/png;base64,iVBORw0KGgo"));
+    let secret = t
+        .state
+        .sessions
+        .get(&c.cookie)
+        .unwrap()
+        .pending_totp_secret
+        .unwrap();
+    assert!(html.contains(&secret));
+
+    let bad = t
+        .post_form("/settings/totp/enable", &[("code", "000000")], &c)
+        .await;
+    assert_eq!(bad.status(), 401);
+    let bad_html = body_string(bad).await;
+    assert!(bad_html.contains(&secret), "same secret stays on screen");
+    assert!(bad_html.contains("data:image/png;base64,"));
+    assert!(!t.state.accounts.totp_enabled(&uid));
+
+    let ok = t
+        .post_form(
+            "/settings/totp/enable",
+            &[("code", &totp_code(&secret))],
+            &c,
+        )
+        .await;
+    assert_eq!(ok.status(), 303);
+    assert!(t.state.accounts.totp_enabled(&uid));
+    assert!(
+        t.state
+            .sessions
+            .get(&c.cookie)
+            .unwrap()
+            .pending_totp_secret
+            .is_none()
+    );
+    // Login now needs a code.
+    assert!(t.state.accounts.login("alice", PASSWORD, None).is_err());
+
+    let again = t.post_form("/settings/totp/begin", &[], &c).await;
+    assert_eq!(again.status(), 409);
+
+    let bad_off = t
+        .post_form("/settings/totp/disable", &[("code", "000000")], &c)
+        .await;
+    assert_eq!(bad_off.status(), 401);
+    assert!(t.state.accounts.totp_enabled(&uid));
+    let off = t
+        .post_form(
+            "/settings/totp/disable",
+            &[("code", &totp_code(&secret))],
+            &c,
+        )
+        .await;
+    assert_eq!(off.status(), 303);
+    assert!(!t.state.accounts.totp_enabled(&uid));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_token_shows_once_and_lists_without_secret() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    upload_named(&t, &c, "a.pdf", PDF, "Doc").await;
+    let tag_resp = t
+        .post_multipart(
+            "/api/upload",
+            &[("tags", "medical")],
+            &[("file", "b.pdf", "application/pdf", b"%PDF-1.4 other")],
+            &c,
+        )
+        .await;
+    assert_eq!(tag_resp.status(), 200);
+    let tag_id = u.with_db(|conn| personal_media::user_db::list_tags(conn).unwrap())[0].0;
+
+    let resp = t
+        .post_form(
+            "/settings/tokens",
+            &[
+                ("name", "Hermes"),
+                ("access", "read_write"),
+                ("content", "full_text"),
+                ("tags[]", &tag_id.to_string()),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header_str(&resp, "cache-control"), "no-store");
+    let html = body_string(resp).await;
+    let token = html
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .find(|w| w.starts_with("pm_"))
+        .expect("token shown")
+        .to_owned();
+    let parts: Vec<&str> = token.split('_').collect();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts[1].len(), 32);
+    assert_eq!(parts[2].len(), 64);
+    assert!(
+        token[3..]
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    );
+    assert!(html.contains("mcp_servers:"));
+    assert!(html.contains("https://test.example/mcp"));
+    assert!(html.contains(&format!("Bearer {token}")));
+
+    let metas = u.with_db(|conn| list_token_meta(conn).unwrap());
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].name, "Hermes");
+    assert_eq!(
+        metas[0].scope,
+        TokenScope {
+            access: Access::ReadWrite,
+            content: Content::FullText,
+            tags: Some(vec![tag_id]),
+        }
+    );
+    assert_eq!(
+        t.state.sys.token_ids_for_user(&u.user_id).unwrap(),
+        vec![parts[1].to_owned()]
+    );
+
+    let settings = body_string(t.get("/settings", &c).await).await;
+    assert!(settings.contains("Hermes"));
+    assert!(settings.contains("tags: medical"));
+    assert!(!settings.contains(parts[2]), "secret is never shown again");
+    assert!(!settings.contains(&token));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_token_validates_input_and_defaults_to_least_access() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    for fields in [
+        vec![("name", "")],
+        vec![("name", "   ")],
+        vec![("name", "x"), ("access", "root")],
+        vec![("name", "x"), ("content", "everything")],
+        vec![("name", "x"), ("tags[]", "999")],
+        vec![("name", "x"), ("tags[]", "abc")],
+    ] {
+        let resp = t.post_form("/settings/tokens", &fields, &c).await;
+        assert_eq!(resp.status(), 400, "{fields:?}");
+    }
+    let long = "n".repeat(101);
+    let resp = t
+        .post_form("/settings/tokens", &[("name", &long)], &c)
+        .await;
+    assert_eq!(resp.status(), 400);
+    assert!(u.with_db(|conn| list_token_meta(conn).unwrap()).is_empty());
+    assert!(
+        t.state
+            .sys
+            .token_ids_for_user(&u.user_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let ok = t
+        .post_form("/settings/tokens", &[("name", "plain")], &c)
+        .await;
+    assert_eq!(ok.status(), 200);
+    let metas = u.with_db(|conn| list_token_meta(conn).unwrap());
+    assert_eq!(
+        metas[0].scope,
+        TokenScope {
+            access: Access::Read,
+            content: Content::MetadataOnly,
+            tags: None
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_token_removes_rows() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let bob = t.session_for("bob");
+    let u = unlocked(&t, &c);
+    t.post_form("/settings/tokens", &[("name", "one")], &c)
+        .await;
+    let id = u.with_db(|conn| list_token_meta(conn).unwrap())[0]
+        .id
+        .clone();
+
+    // Another user cannot revoke it.
+    let denied = t
+        .post_form(&format!("/settings/tokens/{id}/revoke"), &[], &bob)
+        .await;
+    assert_eq!(denied.status(), 404);
+    assert_eq!(t.state.sys.token_ids_for_user(&u.user_id).unwrap().len(), 1);
+
+    let resp = t
+        .post_form(&format!("/settings/tokens/{id}/revoke"), &[], &c)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(
+        t.state
+            .sys
+            .token_ids_for_user(&u.user_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(u.with_db(|conn| list_token_meta(conn).unwrap()).is_empty());
+    let again = t
+        .post_form(&format!("/settings/tokens/{id}/revoke"), &[], &c)
+        .await;
+    assert_eq!(again.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_rows_have_no_plaintext_name_in_system_db() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let resp = t
+        .post_form("/settings/tokens", &[("name", "HermesMedical")], &c)
+        .await;
+    assert_eq!(resp.status(), 200);
+    let uid = t.state.sessions.get(&c.cookie).unwrap().user_id;
+    assert_eq!(t.state.sys.token_ids_for_user(&uid).unwrap().len(), 1);
+    // Include the WAL, where recent writes may still live.
+    for suffix in ["", "-wal"] {
+        let path = t.dir.path().join(format!("{SYSTEM_DB_FILE}{suffix}"));
+        if let Ok(bytes) = std::fs::read(path) {
+            assert!(!bytes.windows(13).any(|w| w == b"HermesMedical"));
+        }
+    }
+}
+
+fn entry_names(zip: &zip::ZipArchive<std::io::Cursor<Vec<u8>>>) -> Vec<String> {
+    let mut names: Vec<String> = zip
+        .file_names()
+        .map(|n| n.expect("valid entry name").into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn read_zip(bytes: Vec<u8>) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+    zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_zip_contains_all_files_and_metadata() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let other = t.session_for("bob");
+    let a = upload_named(&t, &c, "Rechnung März.pdf", PDF, "Rechnung").await;
+    let resp = t
+        .post_multipart(
+            "/api/upload",
+            &[("title", "Notiz"), ("tags", "x, y"), ("date", "2024-05-06")],
+            &[("file", "notiz.txt", "text/plain", "Grüße".as_bytes())],
+            &c,
+        )
+        .await;
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let b = v["id"].as_str().unwrap().to_owned();
+    upload_named(&t, &other, "bobs.pdf", PDF, "Bobs").await;
+    // A document hidden from the web is part of the export.
+    unlocked(&t, &c)
+        .with_db(|conn| set_document_access(conn, &b, Channel::Web, Some(Level::Off)).unwrap());
+
+    let resp = t.get("/settings/export.zip", &c).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header_str(&resp, "content-type"), "application/zip");
+    assert_eq!(
+        header_str(&resp, "content-disposition"),
+        "attachment; filename=\"personal-media-export.zip\""
+    );
+    let mut zip = read_zip(body_bytes(resp).await);
+    let names = entry_names(&zip);
+    assert_eq!(
+        names,
+        [
+            "files/Rechnung März.pdf",
+            "files/notiz.txt",
+            "metadata.json"
+        ]
+    );
+    for i in 0..zip.len() {
+        assert_eq!(
+            zip.by_index(i).unwrap().compression(),
+            zip::CompressionMethod::Stored
+        );
+    }
+    let mut pdf = Vec::new();
+    zip.by_name("files/Rechnung März.pdf")
+        .unwrap()
+        .read_to_end(&mut pdf)
+        .unwrap();
+    assert_eq!(pdf, PDF);
+    let mut txt = String::new();
+    zip.by_name("files/notiz.txt")
+        .unwrap()
+        .read_to_string(&mut txt)
+        .unwrap();
+    assert_eq!(txt, "Grüße");
+
+    let mut meta = String::new();
+    zip.by_name("metadata.json")
+        .unwrap()
+        .read_to_string(&mut meta)
+        .unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+    let meta = meta.as_array().unwrap();
+    assert_eq!(meta.len(), 2);
+    let find = |id: &str| meta.iter().find(|m| m["id"] == id).unwrap();
+    let ma = find(&a);
+    assert_eq!(ma["title"], "Rechnung");
+    assert_eq!(ma["original_filename"], "Rechnung März.pdf");
+    assert_eq!(ma["zip_path"], "files/Rechnung März.pdf");
+    assert_eq!(ma["mime"], "application/pdf");
+    assert!(ma["document_date"].is_null());
+    assert!(ma["created_at"].is_i64());
+    let mb = find(&b);
+    assert_eq!(mb["document_date"], "2024-05-06");
+    assert_eq!(mb["tags"], serde_json::json!(["x", "y"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_zip_entry_names_are_safe_and_unique() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    upload_named(&t, &c, "../a.pdf", PDF, "first").await;
+    upload_named(&t, &c, "a.pdf", b"%PDF-1.4 second", "second").await;
+    let resp = t.get("/settings/export.zip", &c).await;
+    let zip = read_zip(body_bytes(resp).await);
+    let names = entry_names(&zip);
+    assert_eq!(names, ["files/a (2).pdf", "files/a.pdf", "metadata.json"]);
+    assert!(
+        names
+            .iter()
+            .all(|n| !n.contains("..") && !n.starts_with('/'))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn export_of_empty_vault_is_a_valid_zip() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let zip = read_zip(body_bytes(t.get("/settings/export.zip", &c).await).await);
+    assert_eq!(entry_names(&zip), ["metadata.json"]);
+    assert_eq!(
+        t.get("/settings/export.zip", &Client::anon())
+            .await
+            .status(),
+        303
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn access_defaults_form_roundtrip() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let resp = t
+        .post_form(
+            "/settings/access",
+            &[
+                ("web", "metadata"),
+                ("mcp", "full"),
+                ("semantic_index", "off"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    let d = u.with_db(|conn| get_access_defaults(conn).unwrap());
+    assert_eq!(d.level(Channel::Web), Level::Metadata);
+    assert_eq!(d.level(Channel::Mcp), Level::Full);
+    assert_eq!(d.level(Channel::SemanticIndex), Level::Off);
+
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(html.contains("<option value=\"metadata\" selected>"));
+    assert!(html.contains("<option value=\"full\" selected>"));
+
+    let bad = t
+        .post_form(
+            "/settings/access",
+            &[
+                ("web", "everything"),
+                ("mcp", "full"),
+                ("semantic_index", "off"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(bad.status(), 422);
+    assert_eq!(
+        u.with_db(|conn| get_access_defaults(conn).unwrap())
+            .level(Channel::Web),
+        Level::Metadata
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hidden_documents_listed_and_can_be_unhidden() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let shown = upload_named(&t, &c, "s.pdf", PDF, "Visible one").await;
+    let hidden = upload_named(&t, &c, "h.pdf", b"%PDF-1.4 h", "Secret one").await;
+    u.with_db(|conn| {
+        set_document_access(conn, &hidden, Channel::Web, Some(Level::Off)).unwrap();
+        set_document_access(conn, &hidden, Channel::Mcp, Some(Level::Full)).unwrap();
+    });
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(html.contains("Secret one"));
+    assert!(!html.contains("Visible one"));
+    assert!(html.contains(&format!("action=\"/documents/{hidden}/access\"")));
+    assert!(!html.contains(&format!("/documents/{shown}/access")));
+    assert_eq!(
+        t.get(&format!("/documents/{hidden}"), &c).await.status(),
+        404
+    );
+
+    // The button's form posts web=default and keeps the other overrides.
+    let resp = t
+        .post_form(
+            &format!("/documents/{hidden}/access"),
+            &[
+                ("web", "default"),
+                ("mcp", "full"),
+                ("semantic_index", "default"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(
+        t.get(&format!("/documents/{hidden}"), &c).await.status(),
+        200
+    );
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(!html.contains("Secret one"));
+    assert!(html.contains("No documents are hidden"));
+    let over =
+        u.with_db(|conn| personal_media::user_db::document_overrides(conn, &hidden).unwrap());
+    assert_eq!(over.get(&Channel::Mcp), Some(&Level::Full));
+    assert_eq!(over.get(&Channel::Web), None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hidden_by_default_posts_full_and_preserves_other_overrides() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let id = upload_named(&t, &c, "h.pdf", PDF, "Hidden by default").await;
+    u.with_db(|conn| {
+        personal_media::user_db::set_access_defaults(
+            conn,
+            &personal_media::user_db::AccessDefaults(
+                [
+                    (Channel::Web, Level::Off),
+                    (Channel::Mcp, Level::Metadata),
+                    (Channel::SemanticIndex, Level::Off),
+                ]
+                .into(),
+            ),
+        )
+        .unwrap();
+        set_document_access(conn, &id, Channel::Mcp, Some(Level::Off)).unwrap();
+    });
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(html.contains("Hidden by default"));
+    assert!(html.contains("<input type=\"hidden\" name=\"web\" value=\"full\">"));
+    assert!(html.contains("<input type=\"hidden\" name=\"mcp\" value=\"off\">"));
+    assert!(html.contains("<input type=\"hidden\" name=\"semantic_index\" value=\"default\">"));
+}

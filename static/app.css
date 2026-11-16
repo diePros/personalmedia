@@ -321,3 +321,21 @@ iframe.preview {
     grid-template-columns: repeat(3, 1fr);
   }
 }
+
+fieldset {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.5rem var(--gap);
+}
+
+pre {
+  overflow-x: auto;
+  padding: 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+section + section {
+  margin-top: 2rem;
+}

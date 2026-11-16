@@ -114,6 +114,17 @@ fn build_totp(secret: Secret, account_name: &str) -> Result<Totp, TotpError> {
         .build()
 }
 
+fn totp_setup(secret: Secret, username: &str) -> Result<TotpSetup, TotpError> {
+    // ':' separates issuer and account in the otpauth label and is rejected there.
+    let account = username.replace(':', "_");
+    let totp = build_totp(secret, &account)?;
+    Ok(TotpSetup {
+        secret_b32: totp.secret().to_base32(),
+        otpauth_url: totp.to_url().unwrap_or_default(),
+        qr_png_base64: totp.to_qr_base64().unwrap_or_default(),
+    })
+}
+
 /// Check a user-typed code (whitespace is ignored) against the current time.
 fn totp_code_valid(secret: Secret, code: &str) -> bool {
     let code: String = code.chars().filter(|c| !c.is_whitespace()).collect();
@@ -362,20 +373,30 @@ impl Accounts {
         Ok(recovery)
     }
 
+    /// Check `password` against the stored password wrap without changing anything.
+    pub fn verify_password(&self, user_id: &str, password: &str) -> Result<(), AccountError> {
+        let row = self
+            .sys
+            .user_by_id(user_id)?
+            .ok_or(AccountError::InvalidCredentials)?;
+        self.unwrap_with_password(&row, password).map(|_| ())
+    }
+
     /// Generate a new TOTP secret for the user to scan. Nothing is stored until
     /// [`Accounts::totp_enable`] confirms a code.
     pub fn totp_begin(&self, username: &str) -> TotpSetup {
         let mut bytes = Zeroizing::new([0u8; TOTP_SECRET_LEN]);
         fill_random(bytes.as_mut());
-        // ':' separates issuer and account in the otpauth label and is rejected there.
-        let account = username.replace(':', "_");
-        let totp = build_totp(Secret::from(*bytes), &account)
-            .expect("fixed TOTP parameters and a 20-byte secret are valid");
-        TotpSetup {
-            secret_b32: totp.secret().to_base32(),
-            otpauth_url: totp.to_url().unwrap_or_default(),
-            qr_png_base64: totp.to_qr_base64().unwrap_or_default(),
-        }
+        totp_setup(Secret::from(*bytes), username)
+            .expect("fixed TOTP parameters and a 20-byte secret are valid")
+    }
+
+    /// Rebuild the setup data (QR code, URL) for a secret from
+    /// [`Accounts::totp_begin`], for example after a wrong confirmation code.
+    pub fn totp_resume(&self, username: &str, secret_b32: &str) -> Result<TotpSetup, AccountError> {
+        let secret =
+            Secret::try_from_base32(secret_b32).map_err(|_| AccountError::InvalidCredentials)?;
+        totp_setup(secret, username).map_err(|_| AccountError::InvalidCredentials)
     }
 
     /// Confirm `code` against the secret from [`Accounts::totp_begin`] and store

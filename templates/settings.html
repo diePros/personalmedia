@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}Settings · Personal Media{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+{% if let Some(notice) = notice -%}
+<p class="notice" role="status">{{ notice }}</p>
+{% endif -%}
+{% if let Some(error) = error -%}
+<p class="error" role="alert">{{ error }}</p>
+{% endif -%}
+
+<section id="access">
+<h2>Access defaults</h2>
+<p class="muted">Choose how much each channel may see of your documents. Per-document settings on a document's page override these defaults.</p>
+<form method="post" action="/settings/access" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+{% for row in channels -%}
+<div>
+<label for="default-{{ row.name }}">{{ row.label }}</label>
+<select id="default-{{ row.name }}" name="{{ row.name }}">
+{% for opt in row.options -%}
+<option value="{{ opt.value }}"{% if opt.selected %} selected{% endif %}>{{ opt.label }}</option>
+{% endfor -%}
+</select>
+</div>
+{% endfor -%}
+<button type="submit">Save defaults</button>
+</form>
+</section>
+
+<section id="hidden">
+<h2>Hidden from web</h2>
+{% if hidden.is_empty() -%}
+<p class="muted">No documents are hidden from the web interface.</p>
+{% else -%}
+<p class="muted">These documents are not shown in the web interface.</p>
+<ul class="doc-list">
+{% for doc in hidden -%}
+<li class="doc-item">
+<span class="doc-title">{{ doc.title }}</span>
+{% if !doc.date.is_empty() %}<span class="muted doc-meta">{{ doc.date }}</span>{% endif %}
+<form method="post" action="/documents/{{ doc.id }}/access">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="web" value="{{ doc.web }}">
+<input type="hidden" name="mcp" value="{{ doc.mcp }}">
+<input type="hidden" name="semantic_index" value="{{ doc.semantic_index }}">
+<button type="submit">Show in web</button>
+</form>
+</li>
+{% endfor -%}
+</ul>
+{% endif -%}
+</section>
+
+<section id="tokens">
+<h2>Tokens</h2>
+<p class="muted">Tokens let AI assistants such as Hermes read your documents over MCP, within the scope you choose. Treat a token like a key.</p>
+{% if tokens.is_empty() -%}
+<p class="muted">No tokens yet.</p>
+{% else -%}
+<ul class="doc-list">
+{% for t in tokens -%}
+<li class="doc-item">
+<span class="doc-title">{{ t.name }}</span>
+<span class="muted doc-meta">{{ t.summary }}</span>
+<span class="muted doc-meta">Created {{ t.created }} · {{ t.last_used }}</span>
+<form method="post" action="/settings/tokens/{{ t.id }}/revoke">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit" class="danger">Revoke</button>
+</form>
+</li>
+{% endfor -%}
+</ul>
+{% endif -%}
+<h3>New token</h3>
+<form method="post" action="/settings/tokens" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="token-name">Name</label>
+<input type="text" id="token-name" name="name" maxlength="100" required>
+</div>
+<div>
+<label for="token-access">Access</label>
+<select id="token-access" name="access">
+<option value="read" selected>Read only</option>
+<option value="read_write">Read and write</option>
+</select>
+</div>
+<div>
+<label for="token-content">Content</label>
+<select id="token-content" name="content">
+<option value="metadata_only" selected>Metadata only</option>
+<option value="full_text">Full text</option>
+</select>
+</div>
+{% if !tags.is_empty() -%}
+<fieldset>
+<legend>Only these tags (none selected means all documents)</legend>
+{% for tag in tags -%}
+<div class="check">
+<input type="checkbox" id="token-tag-{{ tag.id }}" name="tags[]" value="{{ tag.id }}">
+<label for="token-tag-{{ tag.id }}">{{ tag.name }}</label>
+</div>
+{% endfor -%}
+</fieldset>
+{% endif -%}
+<button type="submit">Create token</button>
+</form>
+</section>
+
+<section id="two-factor">
+<h2>Two-factor authentication</h2>
+{% if totp_enabled -%}
+<p>Two-factor authentication is on. Enter a current code to turn it off.</p>
+<form method="post" action="/settings/totp/disable" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="totp-disable-code">Code</label>
+<input type="text" id="totp-disable-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+</div>
+<button type="submit" class="danger">Turn off</button>
+</form>
+{% else if let Some(setup) = totp_setup -%}
+<p>Scan this QR code with your authenticator app, or type the secret in by hand. Then enter the code the app shows.</p>
+<p><img src="data:image/png;base64,{{ setup.qr }}" alt="QR code for your authenticator app" width="200" height="200"></p>
+<p><code class="recovery-key">{{ setup.secret }}</code></p>
+<form method="post" action="/settings/totp/enable" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="totp-enable-code">Code</label>
+<input type="text" id="totp-enable-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+</div>
+<button type="submit">Turn on</button>
+</form>
+{% else -%}
+<p class="muted">Two-factor authentication is off. When it is on, logging in also needs a code from your authenticator app.</p>
+<form method="post" action="/settings/totp/begin">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit">Set up</button>
+</form>
+{% endif -%}
+</section>
+
+<section id="password">
+<h2>Password</h2>
+<form method="post" action="/settings/password" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="current">Current password</label>
+<input type="password" id="current" name="current" autocomplete="current-password" required>
+</div>
+<div>
+<label for="new">New password (at least 10 characters)</label>
+<input type="password" id="new" name="new" autocomplete="new-password" minlength="10" required>
+</div>
+<div>
+<label for="new_confirm">Repeat new password</label>
+<input type="password" id="new_confirm" name="new_confirm" autocomplete="new-password" minlength="10" required>
+</div>
+<button type="submit">Change password</button>
+</form>
+<p class="muted">Changing your password does not protect against someone who already copied a backup of the server.</p>
+</section>
+
+<section id="recovery">
+<h2>Recovery key</h2>
+<p class="muted">Generate a new recovery key if you lost yours or suspect it leaked. The old key stops working immediately. You will see the new key once and must confirm that you saved it.</p>
+<form method="post" action="/settings/recovery" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="recovery-password">Your password</label>
+<input type="password" id="recovery-password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit">Generate new recovery key</button>
+</form>
+</section>
+
+<section id="export">
+<h2>Export</h2>
+<p class="muted">Download all your documents, including those hidden from the web, as one ZIP file with a metadata.json.</p>
+<p><a class="button" href="/settings/export.zip">Download ZIP</a></p>
+</section>
+{% endblock %}

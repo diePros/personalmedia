@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod config;
 pub mod crypto;
 pub mod documents;
+pub mod export;
 pub mod extract;
 pub mod harden;
 pub mod keyring;
