@@ -1,6 +1,6 @@
 use super::{CryptoError, fill_random};
 use data_encoding::BASE32_NOPAD;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// 32 random bytes shown to the user as 13 dash-separated groups of 4 base32 chars.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -23,11 +23,12 @@ impl RecoveryKey {
     }
 
     pub fn parse(s: &str) -> Result<Self, CryptoError> {
-        let cleaned: String = s
-            .chars()
-            .filter(|c| !c.is_whitespace() && *c != '-')
-            .map(|c| c.to_ascii_uppercase())
-            .collect();
+        let cleaned: Zeroizing<String> = Zeroizing::new(
+            s.chars()
+                .filter(|c| !c.is_whitespace() && *c != '-')
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+        );
         if cleaned.len() != 52 {
             return Err(CryptoError::Format);
         }

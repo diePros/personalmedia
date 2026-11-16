@@ -29,7 +29,7 @@ fn nonce(prefix: &[u8; PREFIX_LEN], counter: u32, last: bool) -> XNonce {
 }
 
 fn cipher(key: &Key32) -> XChaCha20Poly1305 {
-    XChaCha20Poly1305::new(&(*key.as_bytes()).into())
+    XChaCha20Poly1305::new_from_slice(key.as_bytes()).expect("32-byte key")
 }
 
 pub struct EncryptWriter<W: Write> {
@@ -115,6 +115,7 @@ pub struct DecryptReader<R: Read> {
     plain: Zeroizing<Vec<u8>>,
     pos: usize,
     done: bool,
+    failed: bool,
 }
 
 /// Read until `buf` is full or EOF; returns bytes read.
@@ -149,6 +150,7 @@ impl<R: Read> DecryptReader<R> {
             plain: Zeroizing::new(Vec::new()),
             pos: 0,
             done: false,
+            failed: false,
         })
     }
 
@@ -204,11 +206,19 @@ impl<R: Read> Read for DecryptReader<R> {
         if out.is_empty() {
             return Ok(0);
         }
+        if self.failed {
+            return Err(invalid("blob authentication failed"));
+        }
         while self.pos >= self.plain.len() {
             if self.done {
                 return Ok(0);
             }
-            self.next_chunk()?;
+            if let Err(e) = self.next_chunk() {
+                if e.kind() == io::ErrorKind::InvalidData {
+                    self.failed = true;
+                }
+                return Err(e);
+            }
         }
         let n = out.len().min(self.plain.len() - self.pos);
         out[..n].copy_from_slice(&self.plain[self.pos..self.pos + n]);
@@ -334,6 +344,18 @@ mod tests {
         let mut r = DecryptReader::new(&blob[..], &k, b"a").unwrap();
         let mut buf = [0u8; 10];
         assert_eq!(r.read(&mut buf).unwrap_err().kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn reader_stays_failed_after_auth_error() {
+        let k = Key32::random();
+        let mut blob = enc(&data(3 * CHUNK), &k, b"a");
+        blob[HDR + 5] ^= 1;
+        let mut r = DecryptReader::new(&blob[..], &k, b"a").unwrap();
+        let mut buf = [0u8; 10];
+        for _ in 0..3 {
+            assert_eq!(r.read(&mut buf).unwrap_err().kind(), ErrorKind::InvalidData);
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ impl std::fmt::Debug for Key32 {
 }
 
 fn cipher(key: &Key32) -> XChaCha20Poly1305 {
-    XChaCha20Poly1305::new(&(*key.as_bytes()).into())
+    XChaCha20Poly1305::new_from_slice(key.as_bytes()).expect("32-byte key")
 }
 
 /// Format: `[version u8 = 1][nonce 24][ciphertext + tag]`.
