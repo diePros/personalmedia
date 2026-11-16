@@ -38,10 +38,11 @@ Configuration is by environment variables (`PM_DATA_DIR`, `PM_BIND`, `PM_PUBLIC_
 
 ## MCP endpoint
 
-`POST /mcp` speaks MCP (protocol `2025-06-18`, older `2025-03-26` and `2024-11-05` are
-negotiated) over stateless Streamable HTTP with plain JSON responses. Authenticate with
+`POST /mcp` speaks MCP (protocol `2025-11-25`; `2025-06-18` and `2024-11-05` are also
+negotiated, `2025-03-26` is not because it requires JSON-RPC batches) over stateless Streamable HTTP with plain JSON responses. Authenticate with
 `Authorization: Bearer pm_...` (a token created under Settings). Tools: `search_documents`,
-`list_documents`, `get_document`, `list_tags`, `upload_document`, `update_document`.
+`list_documents`, `get_document`, `list_tags`, `upload_document`, `update_document` (the
+two write tools are only listed for `read_write` tokens).
 
 Deviation from the plan: this is a small hand-written JSON-RPC 2.0 handler (`src/mcp.rs`),
 not the `rmcp` SDK. The endpoint is stateless and each request needs its own authenticated

@@ -44,8 +44,10 @@ use crate::web::AppState;
 use crate::web::ratelimit::{client_ip, mcp_ip_key, too_many_requests};
 
 const SERVER_NAME: &str = "personal-media";
-const LATEST_PROTOCOL: &str = "2025-06-18";
-const SUPPORTED_PROTOCOLS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+const LATEST_PROTOCOL: &str = "2025-11-25";
+/// Newest first. `2025-03-26` is left out on purpose: it requires servers to
+/// accept JSON-RPC batches, which this endpoint does not.
+const SUPPORTED_PROTOCOLS: &[&str] = &["2025-11-25", "2025-06-18", "2024-11-05"];
 /// Longest document text returned by `get_document`, in characters.
 const TEXT_MAX_CHARS: usize = 100_000;
 /// Room for the JSON envelope and the other fields around the base64 payload.
@@ -187,7 +189,7 @@ async fn rpc(
             return match serde_json::from_slice::<Value>(&body) {
                 // An object that is not a usable envelope: ignore it.
                 Ok(Value::Object(_)) => StatusCode::ACCEPTED.into_response(),
-                // Batches are not part of protocol 2025-06-18.
+                // Batches are not supported (see SUPPORTED_PROTOCOLS).
                 Ok(_) => json_response(
                     StatusCode::BAD_REQUEST,
                     &rpc_error(Value::Null, -32600, "invalid request"),
@@ -227,7 +229,10 @@ async fn rpc(
             )
         }
         "ping" => rpc_result(id, json!({})),
-        "tools/list" => rpc_result(id, json!({"tools": tool_definitions()})),
+        "tools/list" => rpc_result(
+            id,
+            json!({"tools": tool_definitions(principal.can_write())}),
+        ),
         "tools/call" => {
             let params = env
                 .params
@@ -299,10 +304,11 @@ const TOOL_NAMES: &[&str] = &[
     "update_document",
 ];
 
-fn tool_definitions() -> Value {
+/// The tool list; write tools only for tokens that may write.
+fn tool_definitions(can_write: bool) -> Value {
     let tags = json!({"type": "array", "items": {"type": "string"}});
     let date = json!({"type": "string", "description": "YYYY-MM-DD"});
-    json!([
+    let all = json!([
         {
             "name": "search_documents",
             "description": "Full-text search over the documents this token may see.",
@@ -351,7 +357,14 @@ fn tool_definitions() -> Value {
                 "date": {"type": "string", "description": "YYYY-MM-DD; empty string clears the date"}
             }, "required": ["id"]}
         }
-    ])
+    ]);
+    let Value::Array(mut all) = all else {
+        unreachable!("tool list is an array")
+    };
+    if !can_write {
+        all.retain(|t| !t["name"].as_str().is_some_and(|n| WRITE_TOOLS.contains(&n)));
+    }
+    Value::Array(all)
 }
 
 #[derive(Deserialize)]

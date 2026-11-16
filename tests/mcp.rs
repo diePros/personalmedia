@@ -276,7 +276,8 @@ async fn client_handshake_with_mcp_headers() {
         .await;
     assert_eq!(resp.status(), 200);
     let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 6);
+    // A read-only token is not offered the two write tools.
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 4);
 
     // An unsupported version is answered with ours.
     let resp = f
@@ -287,7 +288,7 @@ async fn client_handshake_with_mcp_headers() {
         ))
         .await;
     let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(v["result"]["protocolVersion"], "2025-11-25");
     // Unknown methods are JSON-RPC errors.
     let resp =
         f.t.request(send(json!({"jsonrpc":"2.0","id":3,"method":"nope"}), None))
@@ -299,7 +300,7 @@ async fn client_handshake_with_mcp_headers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tools_list_has_six_tools() {
     let f = Fx::new();
-    let tok = f.token(Access::Read, Content::MetadataOnly, None);
+    let tok = f.token(Access::ReadWrite, Content::MetadataOnly, None);
     let (status, v) = f
         .post(
             Some(&tok),
@@ -988,4 +989,73 @@ async fn only_wellformed_failures_count_and_success_clears() {
         f.post(Some(&bad), &body).await;
     }
     assert_eq!(f.post(Some(&bad), &body).await.0, 429);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tools_list_hides_write_tools_from_read_only_tokens() {
+    let f = Fx::new();
+    let tok = f.token(Access::Read, Content::FullText, None);
+    let (_, v) = f
+        .post(
+            Some(&tok),
+            &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+    let mut names: Vec<&str> = v["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "get_document",
+            "list_documents",
+            "list_tags",
+            "search_documents"
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_negotiates_supported_versions() {
+    let f = Fx::new();
+    let tok = f.token(Access::Read, Content::FullText, None);
+    let version = |wanted: &'static str| {
+        let (f, tok) = (&f, &tok);
+        async move {
+            let (_, v) = f
+                .post(
+                    Some(tok),
+                    &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                            "params":{"protocolVersion":wanted}}),
+                )
+                .await;
+            v["result"]["protocolVersion"].as_str().unwrap().to_owned()
+        }
+    };
+    assert_eq!(version("2025-11-25").await, "2025-11-25");
+    assert_eq!(version("2025-06-18").await, "2025-06-18");
+    assert_eq!(version("2024-11-05").await, "2024-11-05");
+    // 2025-03-26 would require accepting batches, which are not supported.
+    assert_eq!(version("2025-03-26").await, "2025-11-25");
+    assert_eq!(version("1999-01-01").await, "2025-11-25");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_with_control_characters_is_not_an_error() {
+    let f = Fx::new();
+    f.doc("a.dat", "plain body", &[], Some(Level::Full)).await;
+    let tok = f.token(Access::Read, Content::FullText, None);
+    for q in ["pla\u{0}in", "\u{1}\u{2}\u{7f}", "body\u{0}"] {
+        let (err, out) = f.call(&tok, "search_documents", json!({"query": q})).await;
+        assert!(!err || out == "query must not be empty", "{q:?}: {out}");
+    }
+    let (err, hits) = f
+        .call(&tok, "search_documents", json!({"query": "pla\u{0}in"}))
+        .await;
+    assert!(!err);
+    assert_eq!(hits.as_array().unwrap().len(), 1);
 }
