@@ -78,11 +78,11 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 /// Open (creating if needed) the user's SQLCipher index with a raw key, and migrate.
 pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
     let conn = Connection::open(path).context("opening user db")?;
-    let pragma = Zeroizing::new(format!(
-        "PRAGMA key = \"x'{}'\";",
-        hex::encode(key.as_bytes())
-    ));
+    let key_hex = Zeroizing::new(hex::encode(key.as_bytes()));
+    let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", key_hex.as_str()));
     conn.execute_batch(&pragma)?;
+    // Keep temp structures in memory so sorts/merges never spill plaintext to disk.
+    conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA secure_delete = ON;")?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     // Reading the schema fails here if the key is wrong.
     let version: i64 = conn

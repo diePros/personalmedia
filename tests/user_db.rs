@@ -25,7 +25,7 @@ fn nd(id: &str, title: &str, filename: &str, tags: &[&str], created_at: i64) -> 
 
 fn add(conn: &Connection, id: &str, title: &str, tags: &[&str], content: &str) {
     insert_document(conn, &nd(id, title, &format!("{id}.pdf"), tags, 100)).unwrap();
-    set_text(conn, id, TextStatus::Done, Some(content), Some(1)).unwrap();
+    set_text(conn, id, TextStatus::Done, Some(content), Some(1), 7).unwrap();
 }
 
 fn web() -> ListFilter {
@@ -78,7 +78,7 @@ fn insert_get_list_roundtrip() {
         ["b1", "a1"]
     );
     assert_eq!(pending_document_ids(&conn).unwrap().len(), 2);
-    set_text(&conn, "a1", TextStatus::Done, Some("x"), Some(3)).unwrap();
+    set_text(&conn, "a1", TextStatus::Done, Some("x"), Some(3), 7).unwrap();
     assert_eq!(pending_document_ids(&conn).unwrap(), vec!["b1"]);
     assert_eq!(
         get_document(&conn, "a1").unwrap().unwrap().page_count,
@@ -397,6 +397,7 @@ fn db_file_has_no_plaintext() {
             TextStatus::Done,
             Some("Einkommensteuer"),
             Some(1),
+            7,
         )
         .unwrap();
     }
@@ -414,4 +415,16 @@ fn db_file_has_no_plaintext() {
             );
         }
     }
+}
+
+#[test]
+fn temp_store_is_memory_and_set_text_bumps_updated_at() {
+    let (_d, conn) = db();
+    let ts: i64 = conn
+        .query_row("PRAGMA temp_store", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ts, 2);
+    insert_document(&conn, &nd("a1", "t", "f.pdf", &[], 1)).unwrap();
+    set_text(&conn, "a1", TextStatus::Done, Some("x"), None, 777).unwrap();
+    assert_eq!(get_document(&conn, "a1").unwrap().unwrap().updated_at, 777);
 }

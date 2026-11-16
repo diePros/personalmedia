@@ -367,11 +367,12 @@ pub fn set_text(
     status: TextStatus,
     text: Option<&str>,
     page_count: Option<u32>,
+    now: i64,
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     let n = tx.execute(
-        "UPDATE documents SET text_status = ?2, page_count = ?3 WHERE id = ?1",
-        params![id, status.as_str(), page_count.map(|p| p as i64)],
+        "UPDATE documents SET text_status = ?2, page_count = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, status.as_str(), page_count.map(|p| p as i64), now],
     )?;
     if n == 0 {
         return Err(anyhow!("document not found"));
