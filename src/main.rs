@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use personal_media::config::Config;
+use personal_media::web::AppState;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "personal-media", version)]
@@ -30,14 +32,27 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+/// Log to stderr; `RUST_LOG` overrides the default level `info`.
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => {
             personal_media::harden::harden_process();
+            init_tracing();
             let config = Config::from_env()?;
             config.require_public_url()?;
-            println!("not implemented");
+            // Wipes OCR scratch and starts the extraction workers.
+            let state = AppState::build(config)?;
+            personal_media::web::serve(state).await?;
         }
         Command::Invite { admin: _ } => {
             let config = Config::from_env()?;

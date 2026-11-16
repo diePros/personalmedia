@@ -1,0 +1,255 @@
+//! Shared harness for the web integration tests.
+//!
+//! Each test file does `mod common;` and uses only part of this module, so
+//! everything here is `#[allow(dead_code)]`.
+#![allow(dead_code)]
+
+use std::net::SocketAddr;
+
+use axum::Router;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::{Method, Request, header};
+use axum::response::Response;
+use http_body_util::BodyExt;
+use personal_media::config::Config;
+use personal_media::system_db::Role;
+use personal_media::web::{AppState, build_app};
+use tower::ServiceExt;
+
+pub const PASSWORD: &str = "correct horse battery";
+/// The TCP peer every test request appears to come from. It differs from
+/// `Config::for_tests`' trusted proxy (127.0.0.1), so `X-Forwarded-For` is
+/// ignored unless a test sets the peer itself.
+pub const PEER: &str = "203.0.113.7:40000";
+
+/// A browser stand-in: the session cookie value and the session's CSRF token.
+/// `Client::anon()` has neither.
+#[derive(Clone, Debug, Default)]
+pub struct Client {
+    pub cookie: String,
+    pub csrf: String,
+}
+
+impl Client {
+    pub fn anon() -> Client {
+        Client::default()
+    }
+}
+
+pub struct TestApp {
+    pub dir: tempfile::TempDir,
+    pub state: AppState,
+    pub app: Router,
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+impl TestApp {
+    /// A fresh app on a tempdir with `Config::for_tests`. Needs a running
+    /// multi-thread runtime: `#[tokio::test(flavor = "multi_thread")]`.
+    pub fn new() -> TestApp {
+        TestApp::with_config(|_| {})
+    }
+
+    /// Like [`TestApp::new`], with a chance to adjust the config first.
+    pub fn with_config(adjust: impl FnOnce(&mut Config)) -> TestApp {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::for_tests(dir.path().to_path_buf());
+        adjust(&mut cfg);
+        let state = AppState::build(cfg).unwrap();
+        let app = build_app(state.clone());
+        TestApp { dir, state, app }
+    }
+
+    /// Send a request as if it arrived from [`PEER`] (unless the request
+    /// already carries a `ConnectInfo` extension).
+    pub async fn request(&self, mut req: Request<Body>) -> Response {
+        if req.extensions().get::<ConnectInfo<SocketAddr>>().is_none() {
+            let peer: SocketAddr = PEER.parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+        }
+        self.app.clone().oneshot(req).await.unwrap()
+    }
+
+    /// Creates an invite, signs `username` up, confirms the recovery key and
+    /// opens a session, all through `state` (no HTTP).
+    pub fn session_for(&self, username: &str) -> Client {
+        self.session_with_role(username, Role::User)
+    }
+
+    pub fn admin_session_for(&self, username: &str) -> Client {
+        self.session_with_role(username, Role::Admin)
+    }
+
+    fn session_with_role(&self, username: &str, role: Role) -> Client {
+        let client = self.pending_session_with_role(username, role);
+        self.state.sessions.confirm_recovery(&client.cookie);
+        client
+    }
+
+    /// Like [`TestApp::session_for`], but the recovery key is not confirmed yet.
+    pub fn pending_session_for(&self, username: &str) -> Client {
+        self.pending_session_with_role(username, Role::User)
+    }
+
+    fn pending_session_with_role(&self, username: &str, role: Role) -> Client {
+        let url = self.state.accounts.create_invite(role, now()).unwrap();
+        let token = url.rsplit('/').next().unwrap();
+        let (unlocked, user, recovery) = self
+            .state
+            .accounts
+            .signup(token, username, PASSWORD, now())
+            .unwrap();
+        let (cookie, csrf) = self.state.sessions.create(&user, unlocked, Some(recovery));
+        Client { cookie, csrf }
+    }
+
+    /// Signs up and logs in. Until Task 10 adds the real routes this is
+    /// [`TestApp::session_for`].
+    pub async fn signup_and_login(&self, username: &str) -> Client {
+        self.session_for(username)
+    }
+
+    pub async fn get(&self, path: &str, client: &Client) -> Response {
+        self.request(
+            builder(Method::GET, path, client)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    /// htmx-style GET (`HX-Request: true`).
+    pub async fn hx_get(&self, path: &str, client: &Client) -> Response {
+        let req = builder(Method::GET, path, client)
+            .header("hx-request", "true")
+            .body(Body::empty())
+            .unwrap();
+        self.request(req).await
+    }
+
+    /// A plain HTML form POST. The client's CSRF token is sent as the `csrf`
+    /// field unless `fields` already contains one.
+    pub async fn post_form(
+        &self,
+        path: &str,
+        fields: &[(&str, &str)],
+        client: &Client,
+    ) -> Response {
+        let mut all: Vec<(&str, &str)> = fields.to_vec();
+        if !client.csrf.is_empty() && !fields.iter().any(|(k, _)| *k == "csrf") {
+            all.push(("csrf", &client.csrf));
+        }
+        self.post_form_raw(path, &all, client).await
+    }
+
+    /// A form POST with exactly `fields` (no CSRF field is added).
+    pub async fn post_form_raw(
+        &self,
+        path: &str,
+        fields: &[(&str, &str)],
+        client: &Client,
+    ) -> Response {
+        let body = fields
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let req = builder(Method::POST, path, client)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        self.request(req).await
+    }
+
+    /// A multipart POST as `app.js` sends it: text `fields`, then `files` as
+    /// `(field name, filename, content type, bytes)`, with the CSRF token in
+    /// the `X-CSRF-Token` header.
+    pub async fn post_multipart(
+        &self,
+        path: &str,
+        fields: &[(&str, &str)],
+        files: &[(&str, &str, &str, &[u8])],
+        client: &Client,
+    ) -> Response {
+        const BOUNDARY: &str = "pm-test-boundary-7f3a9c";
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        for (name, filename, content_type, bytes) in files {
+            body.extend_from_slice(
+                format!(
+                    "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(bytes);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+        let mut b = builder(Method::POST, path, client).header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        );
+        if !client.csrf.is_empty() {
+            b = b.header("x-csrf-token", &client.csrf);
+        }
+        self.request(b.body(Body::from(body)).unwrap()).await
+    }
+}
+
+/// A request builder for `path` carrying the client's session cookie (if any).
+pub fn builder(method: Method, path: &str, client: &Client) -> axum::http::request::Builder {
+    let b = Request::builder().method(method).uri(path);
+    if client.cookie.is_empty() {
+        b
+    } else {
+        b.header(header::COOKIE, format!("pm_session={}", client.cookie))
+    }
+}
+
+pub fn header_str<'a>(resp: &'a Response, name: &str) -> &'a str {
+    resp.headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("missing header {name}"))
+        .to_str()
+        .unwrap()
+}
+
+pub async fn body_bytes(resp: Response) -> Vec<u8> {
+    resp.into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
+}
+
+pub async fn body_string(resp: Response) -> String {
+    String::from_utf8(body_bytes(resp).await).unwrap()
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}

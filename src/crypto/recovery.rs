@@ -3,7 +3,7 @@ use data_encoding::BASE32_NOPAD;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// 32 random bytes shown to the user as 13 dash-separated groups of 4 base32 chars.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RecoveryKey([u8; 32]);
 
 impl RecoveryKey {
