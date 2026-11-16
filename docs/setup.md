@@ -77,6 +77,8 @@ curl -sI http://127.0.0.1:8080/   # should answer locally
 
 ## 4. Enable Funnel on the existing Tailscale container
 
+> **Your ZimaOS setup:** the ZimaOS Tailscale app (`docs/tailscale.yaml`) overrides the entrypoint and runs `tailscaled` directly. Because of that, `TS_SERVE_CONFIG` (Option B) and `TS_EXTRA_ARGS` have no effect there. Use **`deploy/tailscale-funnel.yaml`** instead. It's the same config with one added line, `tailscale funnel --bg --yes --https=443 http://127.0.0.1:8080`, which runs before `tailscale web`. Paste it into the Tailscale app's compose settings in ZimaOS and restart the app. Then check with `docker exec tailscale tailscale funnel status`. If something else on the ZimaBoard already uses port 8080, change both `PM_BIND` and this line.
+
 Your Tailscale container already runs with `network_mode: host`. Pick **one** of the two ways below.
 
 ### Option A — CLI (simplest)

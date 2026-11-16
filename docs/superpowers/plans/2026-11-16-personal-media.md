@@ -590,6 +590,13 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
 - `GET /documents/{id}/download`: `Content-Type: application/octet-stream`, `Content-Disposition: attachment; filename="{ascii fallback}"; filename*=UTF-8''{percent-encoded}`.
   - ASCII fallback: non-ASCII → `_`; `"`, `\`, `/`, CR and LF → `_`; truncate to 150 chars, keeping the extension.
 - `POST /documents/{id}` (edit), `POST /documents/{id}/delete` (requires `confirm=on`) and `POST /documents/{id}/retry`.
+- **Switchboard in the web UI (spec §13a; "web = off" is Ruling G):**
+  - Every web read uses `ListFilter.access = Some(AccessFilter { channel: Web, cap: Full })`.
+  - A document whose effective web level is `Off` is hidden from the web: it's missing from list and search, and its detail, raw and download pages return 404.
+  - At `Metadata`, the detail page shows metadata and the switchboard form only: no preview, no extracted text, and raw/download return 404.
+  - Uploads call `Documents::store(.., on_dup, Some(&web_filter), now)`. Hidden duplicates are stored as new copies.
+  - Tag filters and suggestions use `list_tags_visible(conn, &web_filter)`.
+  - The detail page has a switchboard form with one `<select>` per channel (`web`, `mcp`, `semantic_index`), each offering `default|off|metadata|full`. It submits to `POST /documents/{id}/access`, which calls `set_document_access` (`default` → `None`). This route skips the web-visibility check, so the owner can always change it, including un-hiding a document from Settings (Task 12).
 
 - [ ] **Step 1: Write the failing tests in `tests/web_docs.rs`**
   - `upload_list_detail_download_roundtrip`
@@ -605,6 +612,9 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
   - `edit_tags_and_title`
   - `delete_requires_confirm`
   - `other_users_document_is_404`: user B requests user A's doc id → 404, because B's index doesn't have it
+  - `web_off_document_hidden_from_list_search_and_detail`
+  - `metadata_level_detail_has_no_preview_or_download`
+  - `access_override_form_roundtrip` (including `default` clearing the override)
   - `end_to_end_ocr_search` (tesseract-gated): upload `scanned.pdf`, poll up to 60 s, then search `versicherungsnummer` → hit
 - [ ] **Step 2:** Run `cargo test --test web_docs`. Expected: FAIL.
 - [ ] **Step 3:** Implement. Keep the upload handler's core in a function `pub async fn handle_upload(state: &AppState, unlocked: Arc<Unlocked>, multipart: Multipart) -> Response` so Task 18 can reuse it. Check the PDF iframe manually in Chrome and Firefox after `cargo run`. If the CSP override blocks the built-in viewer, relax only the raw route's CSP and note why in a code comment.
@@ -634,6 +644,8 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
   - `POST /settings/tokens/{id}/revoke`
   - `GET /settings/export.zip`: streamed via `spawn_blocking` writing to a channel-backed `Write`, served as `attachment; filename="personal-media-export.zip"`
 - The settings page shows this text verbatim next to "change password": "Changing your password does not protect against someone who already copied a backup of the server."
+- **Switchboard defaults:** a form with one row per channel (`web`, `mcp`, `semantic_index`) offering `off|metadata|full`. It submits to `POST /settings/access`, which calls `set_access_defaults`. Show the explanation: "Per-document settings on a document's page override these defaults."
+- **"Hidden from web" section:** lists the title and date of every document whose effective web level is `Off` (computed with `access: None` plus `effective_level`). Each has a "Show in web" button that posts `web=default` to `/documents/{id}/access`. If the default itself is `web = off`, the button posts `web=full` instead.
 
 - [ ] **Step 1: Write the failing tests in `tests/web_settings.rs`**
   - `change_password_flow`
@@ -644,6 +656,8 @@ Dockerfile, docker-compose.yml, .dockerignore, README.md
   - `export_zip_contains_all_files_and_metadata`
   - `export_zip_entry_names_are_safe_and_unique`: two docs named `../a.pdf` and `a.pdf` → entries `files/a.pdf` and `files/a (2).pdf`, and no entry contains `..` or starts with `/`
   - `token_rows_have_no_plaintext_name_in_system_db`: create a token named `HermesMedical`; the `system.db` bytes don't contain it
+  - `access_defaults_form_roundtrip`
+  - `hidden_documents_listed_and_can_be_unhidden`
 - [ ] **Step 2:** Run `cargo test --test web_settings`. Expected: FAIL.
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run `cargo test --test web_settings`. Expected: PASS.
