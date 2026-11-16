@@ -19,8 +19,8 @@ pub use access::{
 };
 pub use documents::{
     Document, ListFilter, NewDocument, SearchHit, TextStatus, delete_document, find_by_sha256,
-    get_document, insert_document, list_documents, list_tags, pending_document_ids, search,
-    set_text, tag_ids, update_document_meta,
+    find_by_sha256_visible, get_document, insert_document, list_documents, list_tags,
+    list_tags_visible, pending_document_ids, search, set_text, tag_ids, update_document_meta,
 };
 pub use meta::{
     Access, Content, TokenMeta, TokenScope, delete_token_meta, get_setting, get_token_meta,

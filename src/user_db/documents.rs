@@ -181,6 +181,23 @@ pub fn list_tags(conn: &Connection) -> Result<Vec<(i64, String)>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Tags attached to at least one document visible under `f` (switchboard access
+/// and tag allow-list). Ignores `tags_all`, dates and paging. Orphan tags are
+/// never returned.
+pub fn list_tags_visible(conn: &Connection, f: &ListFilter) -> Result<Vec<(i64, String)>> {
+    let mut params: Vec<Value> = Vec::new();
+    let mut sql = String::from(
+        "SELECT t.id, t.name FROM tags t WHERE t.id IN \
+         (SELECT dt2.tag_id FROM documents d JOIN document_tags dt2 ON dt2.document_id = d.id",
+    );
+    access_clause(conn, f, &mut sql, &mut params)?;
+    tag_allow_condition(f, &mut sql, &mut params);
+    sql.push_str(") ORDER BY t.name");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 fn set_doc_tags(conn: &Connection, id: &str, tags: &[String]) -> Result<()> {
     conn.execute("DELETE FROM document_tags WHERE document_id = ?1", [id])?;
     for tid in tag_ids(conn, tags)? {
@@ -240,6 +257,24 @@ pub fn find_by_sha256(conn: &Connection, sha: &[u8; 32]) -> Result<Option<Docume
     finish_one(conn, doc)
 }
 
+/// Like [`find_by_sha256`], but only documents visible under `f` count.
+pub fn find_by_sha256_visible(
+    conn: &Connection,
+    sha: &[u8; 32],
+    f: &ListFilter,
+) -> Result<Option<Document>> {
+    let mut params: Vec<Value> = Vec::new();
+    let mut sql = format!("SELECT {DOC_COLS} FROM documents d");
+    access_clause(conn, f, &mut sql, &mut params)?;
+    tag_allow_condition(f, &mut sql, &mut params);
+    sql.push_str(" AND d.sha256 = ? ORDER BY d.created_at, d.id LIMIT 1");
+    params.push(Value::Blob(sha.to_vec()));
+    let doc = conn
+        .query_row(&sql, params_from_iter(params), map_doc)
+        .optional()?;
+    finish_one(conn, doc)
+}
+
 fn finish_one(conn: &Connection, doc: Option<Document>) -> Result<Option<Document>> {
     match doc {
         Some(mut d) => {
@@ -250,15 +285,8 @@ fn finish_one(conn: &Connection, doc: Option<Document>) -> Result<Option<Documen
     }
 }
 
-/// Append filter conditions (each starting with " AND ") and their params.
-fn filter_conditions(f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) {
-    for tag in &f.tags_all {
-        sql.push_str(
-            " AND EXISTS (SELECT 1 FROM document_tags dt JOIN tags t ON t.id = dt.tag_id \
-             WHERE dt.document_id = d.id AND t.name = ?)",
-        );
-        params.push(Value::Text(tag.clone()));
-    }
+/// The token tag allow-list: the document carries ANY of the allowed tag ids.
+fn tag_allow_condition(f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) {
     if let Some(ids) = &f.tag_allow {
         if ids.is_empty() {
             sql.push_str(" AND 1 = 0");
@@ -271,6 +299,42 @@ fn filter_conditions(f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) 
             params.extend(ids.iter().map(|i| Value::Integer(*i)));
         }
     }
+}
+
+/// Append the switchboard join and the start of the WHERE clause (documents
+/// aliased `d`). Always leaves a WHERE clause so callers can append " AND ...".
+fn access_clause(
+    conn: &Connection,
+    f: &ListFilter,
+    sql: &mut String,
+    params: &mut Vec<Value>,
+) -> Result<()> {
+    if let Some(a) = f.access {
+        let default = get_access_defaults(conn)?.level(a.channel);
+        sql.push_str(" LEFT JOIN document_access a ON a.document_id = d.id AND a.channel = ?");
+        params.push(Value::Text(a.channel.as_str().into()));
+        // Effective level is Off when the raw level is off or the cap is off.
+        sql.push_str(" WHERE COALESCE(a.level, ?) != 'off'");
+        params.push(Value::Text(default.as_str().into()));
+        if a.cap == Level::Off {
+            sql.push_str(" AND 1 = 0");
+        }
+    } else {
+        sql.push_str(" WHERE 1 = 1");
+    }
+    Ok(())
+}
+
+/// Append filter conditions (each starting with " AND ") and their params.
+fn filter_conditions(f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) {
+    for tag in &f.tags_all {
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM document_tags dt JOIN tags t ON t.id = dt.tag_id \
+             WHERE dt.document_id = d.id AND t.name = ?)",
+        );
+        params.push(Value::Text(tag.clone()));
+    }
+    tag_allow_condition(f, sql, params);
     if let Some(from) = &f.date_from {
         sql.push_str(" AND d.document_date >= ?");
         params.push(Value::Text(from.clone()));
@@ -293,19 +357,7 @@ fn raw_levels_for(target: Level, cap: Level) -> Vec<&'static str> {
 pub fn list_documents(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>> {
     let mut params: Vec<Value> = Vec::new();
     let mut sql = format!("SELECT {DOC_COLS} FROM documents d");
-    if let Some(a) = f.access {
-        let default = get_access_defaults(conn)?.level(a.channel);
-        sql.push_str(" LEFT JOIN document_access a ON a.document_id = d.id AND a.channel = ?");
-        params.push(Value::Text(a.channel.as_str().into()));
-        // Effective level is Off when the raw level is off or the cap is off.
-        sql.push_str(" WHERE COALESCE(a.level, ?) != 'off'");
-        params.push(Value::Text(default.as_str().into()));
-        if a.cap == Level::Off {
-            sql.push_str(" AND 1 = 0");
-        }
-    } else {
-        sql.push_str(" WHERE 1 = 1");
-    }
+    access_clause(conn, f, &mut sql, &mut params)?;
     filter_conditions(f, &mut sql, &mut params);
     sql.push_str(" ORDER BY d.created_at DESC, d.id LIMIT ? OFFSET ?");
     params.push(Value::Integer(f.limit()));

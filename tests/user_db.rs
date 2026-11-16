@@ -428,3 +428,86 @@ fn temp_store_is_memory_and_set_text_bumps_updated_at() {
     set_text(&conn, "a1", TextStatus::Done, Some("x"), None, 777).unwrap();
     assert_eq!(get_document(&conn, "a1").unwrap().unwrap().updated_at, 777);
 }
+
+fn mcp_full() -> ListFilter {
+    mcp(Level::Full)
+}
+
+#[test]
+fn list_tags_visible_hides_tags_only_on_hidden_documents() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "Shown", &["steuer"], "x");
+    add(&conn, "b1", "Hidden", &["geheim", "steuer"], "x");
+    add(&conn, "c1", "Hidden2", &["nur-hidden"], "x");
+    set_document_access(&conn, "a1", Channel::Mcp, Some(Level::Full)).unwrap();
+    set_document_access(&conn, "b1", Channel::Mcp, Some(Level::Off)).unwrap();
+    set_document_access(&conn, "c1", Channel::Mcp, Some(Level::Off)).unwrap();
+    // Orphan tag: attached to a document that was then deleted.
+    add(&conn, "d1", "Gone", &["orphan"], "x");
+    delete_document(&conn, "d1").unwrap();
+
+    let names = |f: &ListFilter| -> Vec<String> {
+        list_tags_visible(&conn, f)
+            .unwrap()
+            .into_iter()
+            .map(|(_, n)| n)
+            .collect()
+    };
+    assert_eq!(names(&mcp_full()), ["steuer"]);
+    // Unfiltered owner/admin view still sees everything.
+    assert_eq!(list_tags(&conn).unwrap().len(), 4);
+    assert_eq!(names(&ListFilter::default()).len(), 3); // orphan still absent
+    // cap Off sees no tags.
+    assert!(names(&mcp(Level::Off)).is_empty());
+}
+
+#[test]
+fn list_tags_visible_respects_tag_allow() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "A", &["steuer", "miete"], "x");
+    add(&conn, "b1", "B", &["bank"], "x");
+    for id in ["a1", "b1"] {
+        set_document_access(&conn, id, Channel::Mcp, Some(Level::Full)).unwrap();
+    }
+    let steuer = tag_ids(&conn, &["steuer".to_string()]).unwrap()[0];
+    let f = ListFilter {
+        tag_allow: Some(vec![steuer]),
+        ..mcp_full()
+    };
+    let names: Vec<String> = list_tags_visible(&conn, &f)
+        .unwrap()
+        .into_iter()
+        .map(|(_, n)| n)
+        .collect();
+    // Only tags on documents that carry an allowed tag are listed
+    // (the document's own other tags are visible, per the spec's open question).
+    assert_eq!(names, ["miete", "steuer"]);
+    let none = ListFilter {
+        tag_allow: Some(vec![]),
+        ..mcp_full()
+    };
+    assert!(list_tags_visible(&conn, &none).unwrap().is_empty());
+}
+
+#[test]
+fn find_by_sha256_visible_ignores_hidden_documents() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "A", &[], "x");
+    set_document_access(&conn, "a1", Channel::Mcp, Some(Level::Off)).unwrap();
+    let sha = [b'a'; 32];
+    assert!(
+        find_by_sha256_visible(&conn, &sha, &mcp_full())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        find_by_sha256_visible(&conn, &sha, &web())
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        find_by_sha256_visible(&conn, &sha, &ListFilter::default())
+            .unwrap()
+            .is_some()
+    );
+}
