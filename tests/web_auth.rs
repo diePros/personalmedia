@@ -513,3 +513,30 @@ async fn relogin_removes_previous_session() {
     assert_eq!(app.get("/documents", &old).await.status(), 303);
     assert_eq!(app.get("/documents", &new).await.status(), 200);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn login_in_flight_does_not_survive_disable() {
+    use personal_media::web::auth::finish_login;
+    let app = TestApp::new();
+    app.session_for("alice");
+    let headers = axum::http::HeaderMap::new();
+
+    // Argon2 unwrap done, then the admin disables the account.
+    let (unlocked, row) = app.state.accounts.login("alice", PASSWORD, None).unwrap();
+    app.state.accounts.set_disabled(&row.id, true).unwrap();
+    let r = finish_login(&app.state, &headers, &row.id, unlocked, None);
+    assert!(matches!(
+        r,
+        Err(personal_media::accounts::AccountError::Disabled)
+    ));
+
+    // Same for a deleted account.
+    app.state.accounts.set_disabled(&row.id, false).unwrap();
+    let (unlocked, row) = app.state.accounts.login("alice", PASSWORD, None).unwrap();
+    app.state.accounts.delete_user(&row.id).unwrap();
+    let r = finish_login(&app.state, &headers, &row.id, unlocked, None);
+    assert!(matches!(
+        r,
+        Err(personal_media::accounts::AccountError::InvalidCredentials)
+    ));
+}

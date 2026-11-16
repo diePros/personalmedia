@@ -78,6 +78,29 @@ fn start_session(
     resp
 }
 
+/// The last step of login, signup and recover: re-reads the user row right
+/// before the session is created. The Argon2 unwrap that precedes it takes
+/// about a second, so an admin may have disabled or deleted the account in
+/// the meantime; disable and delete write the system DB first and then cut the
+/// sessions that exist, so this re-check is what stops a login in flight from
+/// outliving them. On `Err` the `Unlocked` is dropped and no session exists.
+pub fn finish_login(
+    state: &AppState,
+    headers: &HeaderMap,
+    user_id: &str,
+    unlocked: std::sync::Arc<crate::keyring::Unlocked>,
+    recovery: Option<crate::crypto::RecoveryKey>,
+) -> Result<Response, AccountError> {
+    let row = state
+        .sys
+        .user_by_id(user_id)?
+        .ok_or(AccountError::InvalidCredentials)?;
+    if row.disabled {
+        return Err(AccountError::Disabled);
+    }
+    Ok(start_session(state, headers, &row, unlocked, recovery))
+}
+
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Not found").into_response()
 }
@@ -157,7 +180,14 @@ async fn signup(
     };
     match result {
         Ok((unlocked, user, recovery)) => {
-            start_session(&state, &headers, &user, unlocked, Some(recovery))
+            match finish_login(&state, &headers, &user.id, unlocked, Some(recovery)) {
+                Ok(resp) => resp,
+                Err(AccountError::Disabled) => {
+                    rerender(StatusCode::FORBIDDEN, DISABLED, token, form.username)
+                }
+                Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
+                Err(_) => not_found(),
+            }
         }
         Err(AccountError::Invite(InviteError::Internal)) => {
             internal(&AccountError::Invite(InviteError::Internal))
@@ -319,10 +349,21 @@ async fn login(
         Err(resp) => return resp,
     };
     match result {
-        Ok((unlocked, user)) => {
-            attempt.success();
-            start_session(&state, &headers, &user, unlocked, None)
-        }
+        Ok((unlocked, user)) => match finish_login(&state, &headers, &user.id, unlocked, None) {
+            Ok(resp) => {
+                attempt.success();
+                resp
+            }
+            Err(AccountError::Disabled) => {
+                attempt.failure();
+                login_error(StatusCode::FORBIDDEN, form.username, DISABLED)
+            }
+            Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
+            Err(_) => {
+                attempt.failure();
+                login_error(StatusCode::UNAUTHORIZED, form.username, INVALID_LOGIN)
+            }
+        },
         Err(AccountError::Disabled) => {
             attempt.failure();
             login_error(StatusCode::FORBIDDEN, form.username, DISABLED)
@@ -414,8 +455,25 @@ async fn recover(
     };
     match result {
         Ok((unlocked, user, new_key)) => {
-            attempt.success();
-            start_session(&state, &headers, &user, unlocked, Some(new_key))
+            match finish_login(&state, &headers, &user.id, unlocked, Some(new_key)) {
+                Ok(resp) => {
+                    attempt.success();
+                    resp
+                }
+                Err(AccountError::Disabled) => {
+                    attempt.failure();
+                    recover_error(StatusCode::FORBIDDEN, form.username, DISABLED)
+                }
+                Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
+                Err(_) => {
+                    attempt.failure();
+                    recover_error(
+                        StatusCode::UNAUTHORIZED,
+                        form.username,
+                        "Invalid username or recovery key",
+                    )
+                }
+            }
         }
         // The recovery key was right, so this is not a guess: settle as success.
         Err(AccountError::WeakPassword) => {

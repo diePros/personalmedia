@@ -4,8 +4,11 @@
 //! usernames, roles, dates and the number of bytes stored, nothing else.
 //!
 //! Disable and delete write the system database first, then drop the user's
-//! sessions and cached token unlocks, so a login or token request racing with
-//! the action fails its re-check against the database.
+//! sessions and cached token unlocks. A login racing with the action is
+//! stopped by `auth::finish_login`, which re-reads the user row right before
+//! it creates the session (the database write has happened by then, or the
+//! session it creates is removed by the cut-off that follows). Token requests
+//! must re-check the row the same way.
 
 #![allow(clippy::result_large_err)] // helpers return a ready `Response` as the error
 
