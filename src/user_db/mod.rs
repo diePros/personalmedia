@@ -97,47 +97,51 @@ pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Open `path` read-only and run `init` (key pragma, probe query). A WAL-mode
-/// database in a directory that cannot be written cannot be opened the normal
-/// way (SQLite wants to create `-shm`), so on failure the open is retried with
-/// `immutable=1`, which takes no locks and writes nothing. Only safe for a
-/// backup nobody is writing to; a non-empty `-wal` file would be ignored, so
-/// that case is reported on stderr.
+/// Open `path` read-only and run `init` (key pragma, probe query), writing
+/// nothing next to it. Without a pending `-wal` file the database is opened
+/// `immutable=1` (no locks, no `-shm`/`-wal` created, works on a read-only
+/// mount). With a non-empty `-wal` file the normal read-only open is tried
+/// first so the log is applied; if that fails (unwritable directory), the
+/// log is ignored with a warning on stderr.
 pub(crate) fn open_readonly_with(
     path: &Path,
     init: impl Fn(&Connection) -> Result<()>,
 ) -> Result<Connection> {
     use rusqlite::OpenFlags;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    let immutable = || -> Result<Connection> {
+        let mut uri = String::from("file:");
+        for b in std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()) {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' | b'~' => {
+                    uri.push(*b as char)
+                }
+                _ => uri.push_str(&format!("%{b:02X}")),
+            }
+        }
+        uri.push_str("?immutable=1");
+        let c = Connection::open_with_flags(&uri, flags)
+            .with_context(|| format!("opening {} read-only", path.display()))?;
+        init(&c)?;
+        Ok(c)
+    };
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    if !std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+        return immutable();
+    }
     let plain = Connection::open_with_flags(path, flags)
         .map_err(anyhow::Error::from)
         .and_then(|c| init(&c).map(|()| c));
     match plain {
         Ok(c) => Ok(c),
         Err(_) => {
-            let mut uri = String::from("file:");
-            for b in std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()) {
-                match b {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'/' | b'~' => {
-                        uri.push(*b as char)
-                    }
-                    _ => uri.push_str(&format!("%{b:02X}")),
-                }
-            }
-            uri.push_str("?immutable=1");
-            let mut wal = path.as_os_str().to_owned();
-            wal.push("-wal");
-            if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
-                eprintln!(
-                    "warning: {} has a non-empty -wal file that cannot be applied read-only; \
-                     recent changes may be missing",
-                    path.display()
-                );
-            }
-            let c = Connection::open_with_flags(&uri, flags)
-                .with_context(|| format!("opening {} read-only", path.display()))?;
-            init(&c)?;
-            Ok(c)
+            eprintln!(
+                "warning: {} has a non-empty -wal file that cannot be applied read-only; \
+                 recent changes may be missing",
+                path.display()
+            );
+            immutable()
         }
     }
 }
