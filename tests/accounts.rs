@@ -330,26 +330,39 @@ fn regenerate_recovery_replaces_key() {
 }
 
 #[test]
-fn recover_skips_totp() {
+fn recover_clears_totp() {
     let env = Env::new();
     let (u, row, rk) = env
         .accounts
         .signup(&env.invite(Role::User), "sebi", PW, NOW)
         .unwrap();
-    let secret = enable_totp(&env, &u, "sebi");
+    enable_totp(&env, &u, "sebi");
     drop(u);
 
     let (u, _row, _new_rk) = env.accounts.recover("sebi", &rk.to_display(), PW2).unwrap();
     assert_eq!(u.user_id, row.id);
     drop(u);
 
-    // TOTP stays enabled for normal logins afterwards.
-    assert!(env.accounts.totp_enabled(&row.id));
-    let err = env.accounts.login("sebi", PW2, None).unwrap_err();
-    assert!(matches!(err, AccountError::InvalidCredentials));
-    env.accounts
-        .login("sebi", PW2, Some(&totp_code(&secret)))
+    // Recovery clears TOTP: the authenticator may be lost.
+    assert!(!env.accounts.totp_enabled(&row.id));
+    env.accounts.login("sebi", PW2, None).unwrap();
+}
+
+#[test]
+fn totp_enable_refuses_when_already_enabled() {
+    let env = Env::new();
+    let (u, row, _rk) = env
+        .accounts
+        .signup(&env.invite(Role::User), "sebi", PW, NOW)
         .unwrap();
+    enable_totp(&env, &u, "sebi");
+    let setup = env.accounts.totp_begin("sebi");
+    let err = env
+        .accounts
+        .totp_enable(&u, &setup.secret_b32, &totp_code(&setup.secret_b32))
+        .unwrap_err();
+    assert!(matches!(err, AccountError::TotpAlreadyEnabled));
+    assert!(env.accounts.totp_enabled(&row.id));
 }
 
 #[test]

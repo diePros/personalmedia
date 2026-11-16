@@ -39,6 +39,9 @@ pub enum AccountError {
     InvalidUsername,
     #[error("password too short")]
     WeakPassword,
+    /// TOTP is already enabled; disable it (with a current code) first.
+    #[error("TOTP is already enabled")]
+    TotpAlreadyEnabled,
     #[error("invite: {0}")]
     Invite(#[from] InviteError),
     #[error("internal error")]
@@ -287,8 +290,9 @@ impl Accounts {
         Ok((unlocked, row))
     }
 
-    /// Recovery-key login: skips TOTP, sets a new password and rotates the
-    /// recovery key. Returns the new recovery key.
+    /// Recovery-key login: skips TOTP, sets a new password, rotates the
+    /// recovery key and clears TOTP (the authenticator may be lost).
+    /// Returns the new recovery key.
     pub fn recover(
         &self,
         username: &str,
@@ -316,12 +320,15 @@ impl Accounts {
         self.sys
             .set_password_wrap(&row.id, salt, self.argon2, &by_password)?;
         self.sys.set_recovery_wrap(&row.id, &by_recovery)?;
+        // The authenticator may be lost; the user re-enables TOTP afterwards.
+        self.sys.set_totp(&row.id, None)?;
 
         let row = UserRow {
             salt,
             argon2: self.argon2,
             umk_by_password: by_password,
             umk_by_recovery: by_recovery,
+            totp_sealed: None,
             ..row
         };
         let unlocked = self.keyring.unlock(&row.id, umk, &row.index_key_wrapped)?;
@@ -372,13 +379,20 @@ impl Accounts {
     }
 
     /// Confirm `code` against the secret from [`Accounts::totp_begin`] and store
-    /// the secret sealed under the UMK.
+    /// the secret sealed under the UMK. Refuses if TOTP is already enabled.
     pub fn totp_enable(
         &self,
         u: &Unlocked,
         secret_b32: &str,
         code: &str,
     ) -> Result<(), AccountError> {
+        let row = self
+            .sys
+            .user_by_id(&u.user_id)?
+            .ok_or(AccountError::InvalidCredentials)?;
+        if row.totp_sealed.is_some() {
+            return Err(AccountError::TotpAlreadyEnabled);
+        }
         let secret =
             Secret::try_from_base32(secret_b32).map_err(|_| AccountError::InvalidCredentials)?;
         if !totp_code_valid(secret.clone(), code) {
