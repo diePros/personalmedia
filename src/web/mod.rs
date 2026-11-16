@@ -248,9 +248,11 @@ fn origin_of(url: &str) -> String {
 }
 
 /// Rejects cross-origin state-changing requests (login CSRF: the cookie-less
-/// login/signup/recover posts have no token). 403 when `Sec-Fetch-Site` is
-/// `cross-site` or an `Origin` header differs from `cfg.public_url`. Requests
-/// with neither header pass (curl, old browsers). Bearer-authenticated
+/// login/signup/recover posts have no token). When `Sec-Fetch-Site` is present
+/// it decides alone: `same-origin` and `none` pass, everything else is 403.
+/// Only without it, an `Origin` header must equal the origin of
+/// `cfg.public_url` (`null` is rejected). Requests with neither header pass
+/// (curl, old browsers). Bearer-authenticated
 /// requests without a session cookie and [`ORIGIN_EXEMPT_PATHS`] are exempt.
 async fn origin_guard(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
@@ -266,15 +268,20 @@ async fn origin_guard(State(state): State<AppState>, req: Request, next: Next) -
     {
         return next.run(req).await;
     }
-    let cross_site = headers
-        .get("sec-fetch-site")
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"cross-site"));
-    let bad_origin = headers.get(header::ORIGIN).is_some_and(|v| {
-        v.to_str().map_or(true, |o| {
-            o.to_ascii_lowercase() != origin_of(&state.cfg.public_url)
-        })
-    });
-    if cross_site || bad_origin {
+    let allowed = match headers.get("sec-fetch-site") {
+        // Authoritative when present. Chrome sends `Origin: null` on form
+        // posts under `Referrer-Policy: no-referrer`, so Origin is not
+        // consulted. `same-site` is rejected: sibling subdomains are other tenants.
+        Some(v) => {
+            v.as_bytes().eq_ignore_ascii_case(b"same-origin")
+                || v.as_bytes().eq_ignore_ascii_case(b"none")
+        }
+        None => headers.get(header::ORIGIN).is_none_or(|v| {
+            v.to_str()
+                .is_ok_and(|o| o.to_ascii_lowercase() == origin_of(&state.cfg.public_url))
+        }),
+    };
+    if !allowed {
         return StatusCode::FORBIDDEN.into_response();
     }
     next.run(req).await

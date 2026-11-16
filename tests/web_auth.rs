@@ -401,6 +401,32 @@ async fn cross_site_login_post_is_403() {
             .status(),
         403
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn form_post_with_null_origin_and_same_origin_fetch_site_ok() {
+    let app = TestApp::new();
+    app.session_for("alice");
+    let r = login_with(
+        &app,
+        &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+    )
+    .await;
+    assert_eq!(r.status(), 303);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_site_fetch_site_is_403() {
+    let app = TestApp::new();
+    app.session_for("alice");
+    let r = login_with(&app, &[("sec-fetch-site", "same-site")]).await;
+    assert_eq!(r.status(), 403);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn null_origin_without_fetch_site_is_403() {
+    let app = TestApp::new();
+    app.session_for("alice");
     assert_eq!(login_with(&app, &[("origin", "null")]).await.status(), 403);
 }
 
