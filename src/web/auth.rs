@@ -65,7 +65,8 @@ fn start_session(
     unlocked: std::sync::Arc<crate::keyring::Unlocked>,
     recovery: Option<crate::crypto::RecoveryKey>,
 ) -> Response {
-    let to = if recovery.is_some() {
+    let pending_key = recovery.is_some();
+    let to = if pending_key {
         "/recovery-key"
     } else {
         "/documents"
@@ -76,20 +77,24 @@ fn start_session(
     }
     // A share staged before login (`POST /share` without a session) continues
     // on its review page, once. Not after signup/recovery, which first have to
-    // show the recovery key.
+    // show the recovery key; the continue cookie is kept until that is
+    // confirmed (`recovery_key_confirm` then follows it).
+    let proof = continue_id(headers);
     let share = recovery
         .is_none()
-        .then(|| continue_id(headers))
+        .then_some(proof)
         .flatten()
-        .filter(|id| state.shared.exists(id));
+        .filter(|id| state.shared.exists_for(id, &user.id, Some(id)));
     let (cookie, _csrf) = state.sessions.create(user, unlocked, recovery);
+    // The review page needs the cookie as proof, and clears it itself.
+    let followed = share.is_some();
     let mut resp = match share {
         Some(id) => redirect(headers, &format!("/share/{id}")),
         None => redirect(headers, to),
     };
     resp.headers_mut()
         .insert(header::SET_COOKIE, session_cookie(&cookie));
-    if continue_id(headers).is_some() {
+    if proof.is_some() && !pending_key && !followed {
         resp.headers_mut()
             .append(header::SET_COOKIE, clear_continue_cookie());
     }
@@ -306,7 +311,12 @@ async fn recovery_key_confirm(
         return internal(&AccountError::Internal(e));
     }
     state.sessions.confirm_recovery(&session.id);
-    redirect(&headers, "/documents")
+    // A share that was waiting for this login continues now.
+    let proof = continue_id(&headers);
+    match proof.filter(|id| state.shared.exists_for(id, &session.user_id, Some(id))) {
+        Some(id) => redirect(&headers, &format!("/share/{id}")),
+        None => redirect(&headers, "/documents"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +351,22 @@ fn login_error(status: StatusCode, username: String, msg: &str) -> Response {
     resp
 }
 
-async fn login_page() -> Response {
+/// `GET /login`. A browser that is already logged in and carries the continue
+/// cookie of a live share it may claim (the session cookie did not reach the
+/// cross-site `POST /share`, but did reach this follow-up) goes straight to
+/// the review page.
+async fn login_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    session: Option<axum::Extension<super::session::Session>>,
+) -> Response {
+    if let Some(axum::Extension(s)) = session
+        && s.must_confirm_recovery.is_none()
+        && let Some(id) = continue_id(&headers)
+        && state.shared.exists_for(id, &s.user_id, Some(id))
+    {
+        return redirect(&headers, &format!("/share/{id}"));
+    }
     render(&LoginPage {
         page: Page::anonymous(),
         username: String::new(),

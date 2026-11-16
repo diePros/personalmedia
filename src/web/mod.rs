@@ -71,10 +71,14 @@ pub struct AppState {
     /// Bounds concurrent MCP `upload_document` calls (each holds the base64
     /// text and the decoded bytes in memory).
     pub mcp_write_permits: Arc<Semaphore>,
+    /// Bodies of `POST /share` being read at once (try-acquire, 503 when full).
+    pub share_permits: Arc<Semaphore>,
 }
 
 /// Concurrent MCP uploads.
 const MCP_WRITE_PERMITS: usize = 2;
+/// Concurrent `POST /share` uploads (the route needs no session).
+pub const SHARE_PERMITS: usize = 2;
 
 impl AppState {
     /// Opens the data directory, wipes OCR scratch left by a previous run and
@@ -118,6 +122,7 @@ impl AppState {
             tokens,
             kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
             mcp_write_permits: Arc::new(Semaphore::new(MCP_WRITE_PERMITS)),
+            share_permits: Arc::new(Semaphore::new(SHARE_PERMITS)),
         })
     }
 }
@@ -394,7 +399,7 @@ async fn origin_guard(State(state): State<AppState>, req: Request, next: Next) -
     if (bearer
         && session::session_id(headers).is_none()
         && BEARER_PATHS.contains(&req.uri().path()))
-        || ORIGIN_EXEMPT_PATHS.contains(&req.uri().path())
+        || (*req.method() == Method::POST && ORIGIN_EXEMPT_PATHS.contains(&req.uri().path()))
     {
         return next.run(req).await;
     }

@@ -28,7 +28,7 @@
 //! only reachable with the header. A plain `Form<T>` on such a route is a bug.
 //! Requests without a session (login, signup) carry no CSRF token.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -500,6 +500,9 @@ where
 /// Most files one share may carry.
 pub const MAX_SHARED_FILES: usize = 20;
 
+/// Most bytes anonymous (no session) staging may hold in total, and per entry.
+pub const ANON_STAGING_MAX: usize = 25 * 1024 * 1024;
+
 /// A staging id is 32 random bytes as unpadded base64url.
 pub fn is_staging_id(s: &str) -> bool {
     s.len() == 43
@@ -523,160 +526,256 @@ pub struct Staged {
 /// What the review page may show: names and sizes, never the bytes.
 pub struct StagedView {
     pub files: Vec<(String, usize)>,
+    /// Never set for an anonymous share: its text is not the user's own.
     pub title: Option<String>,
+    /// Staged before any login (the sender is unproven).
+    pub anonymous: bool,
 }
 
-/// The staged share does not fit the size caps.
-#[derive(Debug)]
-pub struct StagingFull;
+/// Who a staging budget is charged to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Owner {
+    /// Staged with a session: charged to that user.
+    User(String),
+    /// Staged without one: charged to the client (the `ratelimit::ip_key`).
+    Anon(String),
+}
+
+/// The share does not fit a budget or the client already has one waiting.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// A size cap (entry, per-user, anonymous or global) would be exceeded.
+    OverBudget,
+    /// This client already has a live anonymous share.
+    AnonBusy,
+}
 
 struct Entry {
-    /// `None` until a logged-in user first opens the share.
-    user_id: Option<String>,
+    /// `None` until a logged-in user claims it with the continue cookie.
+    bound: Option<String>,
+    /// Who the bytes are charged to.
+    charged: Owner,
     files: Vec<StagedFile>,
     title: Option<String>,
     created: Instant,
+    /// Bytes charged for this entry.
     total: usize,
 }
 
+#[derive(Default)]
+struct Inner {
+    entries: HashMap<String, Entry>,
+    /// Bytes reserved while streaming plus bytes of live entries.
+    global: usize,
+    anon: usize,
+    per_user: HashMap<String, usize>,
+    /// Clients with an in-flight or live anonymous share.
+    anon_clients: HashSet<String>,
+}
+
+impl Inner {
+    fn charge(&mut self, owner: &Owner, n: usize) {
+        self.global += n;
+        match owner {
+            Owner::Anon(_) => self.anon += n,
+            Owner::User(u) => *self.per_user.entry(u.clone()).or_default() += n,
+        }
+    }
+
+    fn refund(&mut self, owner: &Owner, n: usize) {
+        self.global = self.global.saturating_sub(n);
+        match owner {
+            Owner::Anon(_) => self.anon = self.anon.saturating_sub(n),
+            Owner::User(u) => {
+                if let Some(v) = self.per_user.get_mut(u) {
+                    *v = v.saturating_sub(n);
+                    if *v == 0 {
+                        self.per_user.remove(u);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes an entry out and gives its bytes and client slot back.
+    fn remove(&mut self, id: &str) -> Option<Entry> {
+        let e = self.entries.remove(id)?;
+        self.refund(&e.charged, e.total);
+        if let Owner::Anon(ip) = &e.charged {
+            self.anon_clients.remove(ip);
+        }
+        Some(e)
+    }
+}
+
 /// Files shared to the app (Web Share Target) that wait for the user's
-/// review. They live **only in memory** (wiped on drop), bounded per entry by
-/// `max_upload_bytes` and overall by four times that, and expire after the
-/// configured TTL. An entry belongs to one user: the one it was staged by, or
-/// else the first logged-in user who opens it; everyone else gets "not found".
+/// review. They live **only in memory** (wiped on drop) and expire after the
+/// configured TTL.
+///
+/// # Memory budget
+///
+/// `POST /share` is reachable without a session, so memory is counted
+/// **while the body streams in** ([`Reservation::reserve`]), not when the
+/// share is complete, and handed back when the request fails or the entry is
+/// saved, discarded or expires:
+///
+/// * anonymous: at most [`ANON_STAGING_MAX`] (also per entry) in total, and one
+///   live or in-flight anonymous share per client;
+/// * logged in: at most `max_upload_bytes` per user (in flight plus staged);
+/// * everything together: at most twice `max_upload_bytes`.
+///
+/// Residual (spec §5 accepts that the operator can read process memory): the
+/// multipart parser's chunk buffers and a regrown `Vec` are freed without
+/// being wiped; the staged bytes themselves are pre-sized from `Content-Length`
+/// to avoid regrowth and are wiped on drop.
+///
+/// An entry belongs to one user: the one it was staged by, or for an
+/// anonymous share the user whose browser carries its continue cookie.
 pub struct SharedStaging {
-    entries: Mutex<HashMap<String, Entry>>,
+    inner: Mutex<Inner>,
     ttl: Duration,
     entry_max: usize,
-    total_max: usize,
+}
+
+/// Bytes reserved for one share while it streams in. Dropping it (the request
+/// failed or was cut off) gives them back; [`Reservation::commit`] turns them
+/// into a staged entry.
+pub struct Reservation<'a> {
+    staging: &'a SharedStaging,
+    owner: Owner,
+    reserved: usize,
+    committed: bool,
 }
 
 impl SharedStaging {
     pub fn new(ttl: Duration, entry_max: usize) -> SharedStaging {
         SharedStaging {
-            entries: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner::default()),
             ttl,
             entry_max,
-            total_max: entry_max.saturating_mul(4),
         }
-    }
-
-    /// Per-entry size cap (the largest share accepted).
-    pub fn entry_max(&self) -> usize {
-        self.entry_max
     }
 
     pub fn ttl(&self) -> Duration {
         self.ttl
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<String, Entry>> {
-        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    /// Bytes currently reserved or staged (for tests and diagnostics).
+    pub fn budget_used(&self) -> usize {
+        self.lock().global
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn live(&self, e: &Entry, now: Instant) -> bool {
         now.duration_since(e.created) < self.ttl
     }
 
-    /// Stages `files` for `user_id` (`None`: nobody logged in yet) and returns
-    /// the staging id. Fails when the share exceeds the per-entry cap or the
-    /// global cap over all live entries.
-    pub fn stage(
-        &self,
-        user_id: Option<String>,
-        files: Vec<StagedFile>,
-        title: Option<String>,
-    ) -> Result<String, StagingFull> {
-        let total: usize = files.iter().map(|f| f.bytes.len()).sum();
-        if total > self.entry_max {
-            return Err(StagingFull);
-        }
+    /// Removes expired entries. The caller drops the result after releasing
+    /// the lock (wiping can take a moment).
+    fn purge(&self, inner: &mut Inner) -> Vec<Entry> {
         let now = Instant::now();
-        let mut map = self.lock();
-        let (expired, live): (Vec<String>, usize) = {
-            let mut sum = 0;
-            let mut dead = Vec::new();
-            for (id, e) in map.iter() {
-                if self.live(e, now) {
-                    sum += e.total;
-                } else {
-                    dead.push(id.clone());
-                }
-            }
-            (dead, sum)
-        };
-        let dead: Vec<Entry> = expired.iter().filter_map(|id| map.remove(id)).collect();
-        if live.saturating_add(total) > self.total_max {
-            drop(map);
-            drop(dead);
-            return Err(StagingFull);
+        let ids: Vec<String> = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| !self.live(e, now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.iter().filter_map(|id| inner.remove(id)).collect()
+    }
+
+    fn entry_cap(&self, owner: &Owner) -> usize {
+        match owner {
+            Owner::Anon(_) => self.entry_max.min(ANON_STAGING_MAX),
+            Owner::User(_) => self.entry_max,
         }
-        let id = random_token();
-        map.insert(
-            id.clone(),
-            Entry {
-                user_id,
-                files,
-                title,
-                created: now,
-                total,
-            },
-        );
-        drop(map);
+    }
+
+    /// Starts a share for `owner`. An anonymous client that already has a live
+    /// or in-flight share is refused.
+    pub fn begin(&self, owner: Owner) -> Result<Reservation<'_>, Refused> {
+        let mut inner = self.lock();
+        let dead = self.purge(&mut inner);
+        if let Owner::Anon(ip) = &owner
+            && !inner.anon_clients.insert(ip.clone())
+        {
+            drop(inner);
+            drop(dead);
+            return Err(Refused::AnonBusy);
+        }
+        drop(inner);
         drop(dead);
-        Ok(id)
+        Ok(Reservation {
+            staging: self,
+            owner,
+            reserved: 0,
+            committed: false,
+        })
     }
 
-    /// Whether a live entry exists (to decide where login sends the user).
-    pub fn exists(&self, id: &str) -> bool {
-        self.lock()
-            .get(id)
-            .is_some_and(|e| self.live(e, Instant::now()))
+    /// Whether a live entry exists that `user_id` may continue to: their own,
+    /// or an unbound one named by the continue cookie (`proof`).
+    pub fn exists_for(&self, id: &str, user_id: &str, proof: Option<&str>) -> bool {
+        let inner = self.lock();
+        inner.entries.get(id).is_some_and(|e| {
+            self.live(e, Instant::now())
+                && match &e.bound {
+                    Some(owner) => owner == user_id,
+                    None => proof == Some(id),
+                }
+        })
     }
 
-    /// Looks `id` up for `user_id`, binding an unbound entry to that user.
-    /// `None` for a missing, expired or foreign entry.
+    /// Looks `id` up for `user_id`. An unbound (anonymous) entry is bound only
+    /// by a request that carries its continue cookie (`proof == Some(id)`);
+    /// without it, or for a foreign or expired entry, the answer is `None`.
     fn claim<'a>(
         &self,
-        map: &'a mut HashMap<String, Entry>,
+        inner: &'a mut Inner,
         id: &str,
         user_id: &str,
+        proof: Option<&str>,
     ) -> Option<&'a mut Entry> {
-        let now = Instant::now();
-        let entry = map.get_mut(id)?;
-        if !self.live(entry, now) {
+        let entry = inner.entries.get_mut(id)?;
+        if !self.live(entry, Instant::now()) {
             return None;
         }
-        match &entry.user_id {
+        match &entry.bound {
             Some(owner) if owner != user_id => None,
             Some(_) => Some(entry),
-            None => {
-                entry.user_id = Some(user_id.to_owned());
+            None if proof == Some(id) => {
+                entry.bound = Some(user_id.to_owned());
                 Some(entry)
             }
+            None => None,
         }
     }
 
     /// Names and sizes of a share, for its review page.
-    pub fn view(&self, id: &str, user_id: &str) -> Option<StagedView> {
-        let mut map = self.lock();
-        let e = self.claim(&mut map, id, user_id)?;
+    pub fn view(&self, id: &str, user_id: &str, proof: Option<&str>) -> Option<StagedView> {
+        let mut inner = self.lock();
+        let e = self.claim(&mut inner, id, user_id, proof)?;
+        let anonymous = matches!(e.charged, Owner::Anon(_));
         Some(StagedView {
             files: e
                 .files
                 .iter()
                 .map(|f| (f.filename.clone(), f.bytes.len()))
                 .collect(),
-            title: e.title.clone(),
+            title: if anonymous { None } else { e.title.clone() },
+            anonymous,
         })
     }
 
-    /// Removes a share (to save or discard it). One caller wins; a second
-    /// gets `None`.
-    pub fn take(&self, id: &str, user_id: &str) -> Option<Staged> {
-        let mut map = self.lock();
-        self.claim(&mut map, id, user_id)?;
-        let e = map.remove(id)?;
+    /// Removes a share (to save or discard it) and releases its budget. One
+    /// caller wins; a second gets `None`.
+    pub fn take(&self, id: &str, user_id: &str, proof: Option<&str>) -> Option<Staged> {
+        let mut inner = self.lock();
+        self.claim(&mut inner, id, user_id, proof)?;
+        let e = inner.remove(id)?;
+        drop(inner);
         Some(Staged {
             files: e.files,
             title: e.title,
@@ -685,16 +784,98 @@ impl SharedStaging {
 
     /// Drops expired shares (every minute, so bytes do not linger unread).
     pub fn sweep(&self) {
-        let now = Instant::now();
-        let dead: Vec<Entry> = {
-            let mut map = self.lock();
-            let ids: Vec<String> = map
-                .iter()
-                .filter(|(_, e)| !self.live(e, now))
-                .map(|(id, _)| id.clone())
-                .collect();
-            ids.iter().filter_map(|id| map.remove(id)).collect()
+        let dead = {
+            let mut inner = self.lock();
+            self.purge(&mut inner)
         };
         drop(dead);
+    }
+}
+
+impl Reservation<'_> {
+    /// The most bytes this share may hold.
+    pub fn cap(&self) -> usize {
+        self.staging.entry_cap(&self.owner)
+    }
+
+    pub fn reserved(&self) -> usize {
+        self.reserved
+    }
+
+    /// Reserves `n` more bytes; call it for every chunk **before** keeping
+    /// the chunk. `Err` means stop reading the body.
+    pub fn reserve(&mut self, n: usize) -> Result<(), Refused> {
+        let s = self.staging;
+        if self.reserved.saturating_add(n) > self.cap() {
+            return Err(Refused::OverBudget);
+        }
+        let fits = |inner: &Inner| {
+            let owner_ok = match &self.owner {
+                Owner::Anon(_) => inner.anon.saturating_add(n) <= ANON_STAGING_MAX,
+                Owner::User(u) => {
+                    inner
+                        .per_user
+                        .get(u)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(n)
+                        <= s.entry_max
+                }
+            };
+            owner_ok && inner.global.saturating_add(n) <= s.entry_max.saturating_mul(2)
+        };
+        let mut inner = s.lock();
+        let mut dead = Vec::new();
+        if !fits(&inner) {
+            // Expired entries may be what is in the way.
+            dead = s.purge(&mut inner);
+        }
+        if !fits(&inner) {
+            drop(inner);
+            drop(dead);
+            return Err(Refused::OverBudget);
+        }
+        inner.charge(&self.owner, n);
+        self.reserved += n;
+        drop(inner);
+        drop(dead);
+        Ok(())
+    }
+
+    /// Stages `files` and returns the staging id. The reserved bytes now
+    /// belong to the entry.
+    pub fn commit(mut self, files: Vec<StagedFile>, title: Option<String>) -> String {
+        let id = random_token();
+        let mut inner = self.staging.lock();
+        let (bound, charged) = match &self.owner {
+            Owner::User(u) => (Some(u.clone()), self.owner.clone()),
+            Owner::Anon(_) => (None, self.owner.clone()),
+        };
+        inner.entries.insert(
+            id.clone(),
+            Entry {
+                bound,
+                charged,
+                files,
+                title,
+                created: Instant::now(),
+                total: self.reserved,
+            },
+        );
+        self.committed = true;
+        id
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut inner = self.staging.lock();
+        inner.refund(&self.owner, self.reserved);
+        if let Owner::Anon(ip) = &self.owner {
+            inner.anon_clients.remove(ip);
+        }
     }
 }

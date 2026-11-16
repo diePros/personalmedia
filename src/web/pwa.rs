@@ -4,7 +4,7 @@
 //! # Share target
 //!
 //! `POST /share` receives the OS share sheet's multipart body and only
-//! *stages* the files in server memory ([`SharedStaging`]): never on disk,
+//! *stages* the files in server memory ([`super::session::SharedStaging`]): never on disk,
 //! nothing is stored in the vault. The user then reviews them on
 //! `GET /share/{id}` and saves with `POST /share/{id}`, a normal
 //! CSRF-protected form. So the one route exempt from the origin guard and the
@@ -13,32 +13,41 @@
 //! The share is a top-level cross-site POST navigation. Whether the browser
 //! sends the `SameSite=Strict` session cookie with it is not guaranteed
 //! (Chrome often treats an installed-PWA share as same-site; this is to be
-//! confirmed on a real Android phone). The flow works either way: with a
-//! session the staged share is bound to that user and the redirect goes to the
-//! review page; without one the staging id travels in the `__Host-pm_continue`
-//! cookie (`SameSite=Lax`) through login, which then redirects to the review
-//! page. `__Host-pm_session` stays `Strict` for now; relaxing it to `Lax`
-//! would be the fallback if the phone test shows the continue cookie is not
-//! enough.
+//! confirmed on a real Android phone, a manual owner check). The flow works
+//! either way. With a session the staged share is bound to that user and the
+//! redirect goes to the review page. Without one the share goes through login:
+//! the staging id travels in the `__Host-pm_continue` cookie
+//! (`SameSite=Lax`), and login (or `GET /login` for a browser that is already
+//! logged in) redirects to the review page. `__Host-pm_session` stays
+//! `Strict`: a `Lax` cookie would not be sent on a cross-site POST either, so
+//! relaxing it cannot help and would only expose the app to cross-site GETs.
 //!
-//! Staged shares are bound to one user: the one who staged them while logged
-//! in, else the first logged-in user to open the review page.
+//! # Who may claim a share
+//!
+//! A share staged with a session belongs to that user at once. One staged
+//! without a session is claimed only by a request that carries its
+//! `__Host-pm_continue` cookie (proof that this browser sent it); anyone else
+//! gets 404. Its review page warns that the sender is unproven and does not
+//! prefill the title. Memory is budgeted while the body streams in, see
+//! [`super::session::SharedStaging`].
 
 use askama::Template;
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream;
 use serde::Deserialize;
+use std::net::SocketAddr;
 use zeroize::Zeroizing;
 
 use super::docs::{human_size, now, parse_tags, read_text_field, web_filter};
+use super::ratelimit::{client_ip, ip_key, too_many_requests};
 use super::session::{
-    CsrfForm, CurrentUser, MAX_SHARED_FILES, NoFields, Session, StagedFile, clear_continue_cookie,
-    continue_cookie, continue_id, is_staging_id,
+    CsrfForm, CurrentUser, MAX_SHARED_FILES, NoFields, Owner, Refused, Session, StagedFile,
+    clear_continue_cookie, continue_cookie, continue_id, is_staging_id,
 };
 use super::{ASSET_VERSION, AppState, Page, redirect, render};
 use crate::documents::{DocError, OnDuplicate, StoreOutcome, UploadMeta, validate_meta};
@@ -129,21 +138,58 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+#[derive(Template)]
+#[template(path = "share_text_only.html")]
+struct TextOnlyPage {
+    page: Page,
+}
+
 /// `POST /share`, called by the OS. No CSRF token and no origin check (see the
-/// module docs): it only stages the files in memory.
-async fn stage_share(State(state): State<AppState>, req: Request) -> Response {
+/// module docs): it only stages the files in memory, within the budget of
+/// [`super::session::SharedStaging`] and at most [`SHARE_PERMITS`](super::SHARE_PERMITS)
+/// bodies at a time.
+async fn stage_share(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+) -> Response {
+    let Ok(_permit) = state.share_permits.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "5")],
+            "busy, try again",
+        )
+            .into_response();
+    };
     // A session that still has to confirm its recovery key counts as none.
     let session = req
         .extensions()
         .get::<Session>()
         .filter(|s| s.must_confirm_recovery.is_none())
         .cloned();
+    let owner = match &session {
+        Some(s) => Owner::User(s.user_id.clone()),
+        None => Owner::Anon(ip_key(client_ip(
+            peer,
+            req.headers(),
+            state.cfg.trusted_proxy,
+        ))),
+    };
+    let mut reservation = match state.shared.begin(owner) {
+        Ok(r) => r,
+        Err(Refused::AnonBusy) => return too_many_requests(state.shared.ttl()),
+        Err(Refused::OverBudget) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let content_length = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
     let mut multipart = match Multipart::from_request(req, &state).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    let cap = state.shared.entry_max();
-    let (mut files, mut title, mut total) = (Vec::new(), None, 0usize);
+    let (mut files, mut title) = (Vec::new(), None);
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
@@ -166,9 +212,18 @@ async fn stage_share(State(state): State<AppState>, req: Request) -> Response {
         loop {
             match field.chunk().await {
                 Ok(Some(chunk)) => {
-                    total += chunk.len();
-                    if total > cap {
+                    // Count first, keep after: over budget stops the read here.
+                    if reservation.reserve(chunk.len()).is_err() {
                         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                    }
+                    if bytes.capacity() == 0 {
+                        // One allocation up front (no regrowth that would
+                        // leave unwiped copies behind), never beyond the budget.
+                        let hint = content_length
+                            .unwrap_or(0)
+                            .min(reservation.cap())
+                            .saturating_sub(reservation.reserved() - chunk.len());
+                        bytes.reserve_exact(hint.max(chunk.len()));
                     }
                     bytes.extend_from_slice(&chunk);
                 }
@@ -189,13 +244,17 @@ async fn stage_share(State(state): State<AppState>, req: Request) -> Response {
         });
     }
     if files.is_empty() {
-        return (StatusCode::BAD_REQUEST, "nothing to share").into_response();
+        // Typically a link or snippet shared as text.
+        let page = match &session {
+            Some(s) => Page::for_session(s),
+            None => Page::anonymous(),
+        };
+        let mut resp = render(&TextOnlyPage { page });
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return resp;
     }
-    let user_id = session.map(|s| s.user_id);
-    let logged_in = user_id.is_some();
-    let Ok(id) = state.shared.stage(user_id, files, title) else {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
-    };
+    let logged_in = session.is_some();
+    let id = reservation.commit(files, title);
     let to = if logged_in {
         format!("/share/{id}")
     } else {
@@ -227,17 +286,20 @@ struct ReviewPage {
     title: String,
     tags: String,
     error: Option<String>,
+    /// Staged before any login: show the warning, no prefill.
+    anonymous: bool,
 }
 
 fn review_response(
     session: &Session,
     id: &str,
+    proof: Option<&str>,
     state: &AppState,
     title: Option<String>,
     tags: String,
     error: Option<&str>,
 ) -> Option<Response> {
-    let view = state.shared.view(id, &session.user_id)?;
+    let view = state.shared.view(id, &session.user_id, proof)?;
     let page = ReviewPage {
         page: Page::for_session(session),
         id: id.to_owned(),
@@ -252,6 +314,7 @@ fn review_response(
         title: title.or(view.title).unwrap_or_default(),
         tags,
         error: error.map(str::to_owned),
+        anonymous: view.anonymous,
     };
     let mut resp = render(&page);
     if error.is_some() {
@@ -269,10 +332,12 @@ async fn review_page(
     if !is_staging_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(mut resp) = review_response(&session, &id, &state, None, String::new(), None) else {
+    let proof = continue_id(&headers);
+    let Some(mut resp) = review_response(&session, &id, proof, &state, None, String::new(), None)
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if continue_id(&headers).is_some() {
+    if proof.is_some() {
         resp.headers_mut()
             .append(header::SET_COOKIE, clear_continue_cookie());
     }
@@ -319,6 +384,7 @@ async fn save_share(
     if !is_staging_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let proof = continue_id(&headers);
     let title = Some(form.title.trim().to_owned()).filter(|t| !t.is_empty());
     let tags = parse_tags(&form.tags);
     // Same caps as /api/upload, checked before the share is taken so a typo
@@ -328,12 +394,12 @@ async fn save_share(
             DocError::InvalidInput(m) => m,
             _ => "invalid title or tags",
         };
-        return match review_response(&session, &id, &state, title, form.tags, Some(msg)) {
+        return match review_response(&session, &id, proof, &state, title, form.tags, Some(msg)) {
             Some(resp) => resp,
             None => StatusCode::NOT_FOUND.into_response(),
         };
     }
-    let Some(staged) = state.shared.take(&id, &session.user_id) else {
+    let Some(staged) = state.shared.take(&id, &session.user_id, proof) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let filter = web_filter();
@@ -350,7 +416,7 @@ async fn save_share(
         let body = stream::iter(
             file.bytes
                 .chunks(CHUNK)
-                .map(|c| Ok::<_, anyhow::Error>(Bytes::copy_from_slice(c))),
+                .map(|c| Ok::<_, anyhow::Error>(Bytes::from_owner(Zeroizing::new(c.to_vec())))),
         );
         let outcome = state
             .docs
@@ -421,7 +487,12 @@ async fn discard_share(
     headers: axum::http::HeaderMap,
     CsrfForm(_): CsrfForm<NoFields>,
 ) -> Response {
-    if !is_staging_id(&id) || state.shared.take(&id, &session.user_id).is_none() {
+    if !is_staging_id(&id)
+        || state
+            .shared
+            .take(&id, &session.user_id, continue_id(&headers))
+            .is_none()
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
     redirect(&headers, "/documents")
