@@ -872,3 +872,89 @@ async fn hidden_by_default_posts_full_and_preserves_other_overrides() {
     assert!(html.contains("<input type=\"hidden\" name=\"mcp\" value=\"off\">"));
     assert!(html.contains("<input type=\"hidden\" name=\"semantic_index\" value=\"default\">"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn token_form_new_restricted_tag() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+
+    // The input is offered even when the user has no tags at all.
+    let html = body_string(t.get("/settings", &c).await).await;
+    let form = &html[html.find("New token").unwrap()..];
+    assert!(form.contains("Restrict to a new tag"), "{form}");
+    assert!(form.contains("name=\"new_tag\""));
+
+    // A new tag creates the tag and restricts the token to it.
+    let resp = t
+        .post_form(
+            "/settings/tokens",
+            &[
+                ("name", "iPhone share"),
+                ("access", "read_write"),
+                ("content", "metadata_only"),
+                ("new_tag", "  Inbox "),
+                ("password", PASSWORD),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+    let tags = u.with_db(|conn| personal_media::user_db::list_tags(conn).unwrap());
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].1, "Inbox", "trimmed, case kept like any tag");
+    let metas = u.with_db(|conn| list_token_meta(conn).unwrap());
+    assert_eq!(metas[0].scope.tags, Some(vec![tags[0].0]));
+    assert_eq!(metas[0].scope.access, Access::ReadWrite);
+    let settings = body_string(t.get("/settings", &c).await).await;
+    assert!(settings.contains("tags: Inbox"), "restriction is visible");
+
+    // Combined with a ticked existing tag: both are on the allow-list.
+    upload_named(&t, &c, "a.pdf", PDF, "Doc").await;
+    t.post_multipart(
+        "/api/upload",
+        &[("tags", "medical")],
+        &[("file", "b.pdf", "application/pdf", b"%PDF-1.4 other")],
+        &c,
+    )
+    .await;
+    let medical = u
+        .with_db(|conn| personal_media::user_db::list_tags(conn).unwrap())
+        .into_iter()
+        .find(|(_, n)| n == "medical")
+        .unwrap()
+        .0;
+    let id = medical.to_string();
+    let resp = t
+        .post_form(
+            "/settings/tokens",
+            &[
+                ("name", "both"),
+                ("tags[]", &id),
+                ("new_tag", "inbox"),
+                ("password", PASSWORD),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+    let metas = u.with_db(|conn| list_token_meta(conn).unwrap());
+    let both = metas.iter().find(|m| m.name == "both").unwrap();
+    assert_eq!(both.scope.tags.as_ref().unwrap().len(), 2);
+
+    // An over-long tag is refused and nothing is created.
+    let long = "g".repeat(65);
+    let before = u.with_db(|conn| list_token_meta(conn).unwrap()).len();
+    let resp = t
+        .post_form(
+            "/settings/tokens",
+            &[("name", "x"), ("new_tag", &long), ("password", PASSWORD)],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        u.with_db(|conn| list_token_meta(conn).unwrap()).len(),
+        before
+    );
+}

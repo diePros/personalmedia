@@ -108,6 +108,11 @@
 {% endfor -%}
 </fieldset>
 {% endif -%}
+<div>
+<label for="token-new-tag">Restrict to a new tag (optional)</label>
+<input type="text" id="token-new-tag" name="new_tag" maxlength="64" autocomplete="off">
+<p class="muted">Creates the tag and adds it to the allow-list above. A token with no tag selected can reach every document.</p>
+</div>
 <button type="submit">Create token</button>
 </form>
 </section>

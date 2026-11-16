@@ -9,10 +9,12 @@ You need the server's public URL (`PM_PUBLIC_URL`, for example `https://node.tai
 1. In the web UI open **Settings → Tokens → New token**.
 2. Name it something like `iPhone share`.
 3. Choose these options:
-   - Access: **`read_write`** (an upload needs write access).
-   - Content level: **`metadata_only`**. The Shortcut only uploads; it never needs to read document text.
-   - Tag allow-list: **`inbox`**. Every upload made with this token is tagged `inbox`, and the token cannot see or touch documents outside that tag.
-4. Copy the token (`pm_…`). It is shown only once.
+   - Access: **Read and write** (`read_write`; an upload needs write access).
+   - Content: **Metadata only** (`metadata_only`). The Shortcut only uploads; it never needs to read document text.
+   - **Restrict to a new tag**: type `inbox`. This creates the tag and puts it on the token's allow-list, so you do not need an existing tag. (If you already have an `inbox` tag, tick it under *Only these tags* instead.) Every upload made with this token is tagged `inbox`, and the token can only reach documents with that tag.
+   - **Your password**: type your account password; creating a token asks for it again.
+4. Create the token and copy it (`pm_…`). It is shown only once.
+5. **Verify the restriction.** Back in **Settings → Tokens**, the new token's row must read `read and write`, `metadata only` and `tags: inbox`. If it says `all documents`, the token is **not** restricted: revoke it and create it again. A token with no tag restriction can reach every document in your vault.
 
 ## 2. Build the Shortcut
 
@@ -31,7 +33,7 @@ Open the **Shortcuts** app, tap **+** (new shortcut) and add these actions in or
    - **Request Body**: **Form**.
    - **Add new field** → **File**: key `file`, value **Repeat Item** (tap the value and choose the magic variable *Repeat Item*).
    - Optional: to set a title, add a **Text** field first with key `title` and the value you want. Text fields must come **before** the `file` field, because the server streams the file and ignores everything after it.
-6. After the loop (outside **Repeat with Each**, at the very bottom) add **Show Result**, or **Show Notification** with *Contents of URL* if you prefer a banner. It shows `{"status":"stored","id":"…"}` for a new document or `{"status":"duplicate",…}` if the same file is already in your vault (duplicates are skipped and not stored twice).
+6. Still **inside** the loop, after **Get Contents of URL**, add **Show Result** (or **Show Notification** with *Contents of URL* if you prefer a banner). It then shows one result per file. (Placed after **End Repeat** it would show the list of all repeat results instead, and a banner would show only the last response.) Each result is `{"status":"stored","id":"…"}` for a new document or `{"status":"duplicate",…}` if the same file is already in your vault (duplicates are skipped and not stored twice).
 7. Tap **Done**.
 
 ## 3. Use it
@@ -42,7 +44,7 @@ Limits: the server rejects a file over `PM_MAX_UPLOAD_MB` (default 100 MB) with 
 
 ## 4. About the token on your phone
 
-The token is stored **in plain text inside the Shortcut on your phone** (and is included in iCloud if Shortcuts sync is on, and in any copy of the Shortcut you share with someone else). Anyone who can open the Shortcut can read it. That is why the token is restricted to `read_write`, `metadata_only` and the `inbox` tag: even if it leaks, it can add files tagged `inbox` and see only documents already in that tag, never your other documents and never their text.
+The token is stored **in plain text inside the Shortcut on your phone** (and is included in iCloud if Shortcuts sync is on, and in any copy of the Shortcut you share with someone else). Anyone who can open the Shortcut can read it. That is why the token is restricted to `read_write`, `metadata_only` and the `inbox` tag. If it leaks, whoever holds it can add files tagged `inbox`, and can also list, retitle and retag the documents already tagged `inbox` (a `read_write` token may change their metadata); it cannot reach documents outside that tag and never gets any document text. This holds only if the token really has the `inbox` restriction (step 5 of section 1).
 
 Do not share the Shortcut file with anyone; share a fresh Shortcut with their own token instead.
 

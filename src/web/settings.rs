@@ -29,8 +29,10 @@ use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
 use super::session::{CsrfForm, CurrentUser, NoFields, Session};
 use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::{AccountError, TotpSetup};
+use crate::documents::{DocError, validate_meta};
 use crate::export;
 use crate::tokens::{create_token, revoke_token};
+use crate::user_db::tag_ids as tag_ids_for;
 use crate::user_db::{
     Access, Channel, Content, Level, TokenScope, document_overrides, get_access_defaults,
     get_token_meta, hidden_from, list_tags, list_tags_visible, list_token_meta,
@@ -801,6 +803,19 @@ async fn create_token_route(
         }
     }
 
+    // An optional new tag the token is restricted to (created if needed), so a
+    // dedicated token needs no existing tag.
+    let new_tag = field(&pairs, "new_tag")
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    if !new_tag.is_empty() {
+        let names = std::slice::from_ref(&new_tag);
+        if let Err(DocError::InvalidInput(msg)) = validate_meta(None, None, names) {
+            return bad(msg).await;
+        }
+    }
+
     // A token outlives logout and password changes, so minting one asks for
     // the password again.
     let keys = limiter_keys(&state, peer, &headers, &session);
@@ -830,6 +845,13 @@ async fn create_token_route(
         let known = u.with_db(|c| list_tags_visible(c, &ListFilter::default()))?;
         if tag_ids.iter().any(|id| !known.iter().any(|(k, _)| k == id)) {
             return Ok(None);
+        }
+        if !new_tag.is_empty() {
+            for id in u.with_db(|c| tag_ids_for(c, std::slice::from_ref(&new_tag)))? {
+                if !tag_ids.contains(&id) {
+                    tag_ids.push(id);
+                }
+            }
         }
         let scope = TokenScope {
             access,
