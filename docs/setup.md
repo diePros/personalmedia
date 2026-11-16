@@ -96,7 +96,9 @@ Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` i
   docker compose up -d --build      # first Rust build on the N150 takes a while; it also runs the tests
   ```
 
-  If docker prints `WARNING: Error loading config file: open /DATA/.docker/config.json: permission denied`, your docker client config folder belongs to root (usually because `sudo docker …` ran once). It's harmless for builds, but fix it before logging in to a registry: `sudo chown -R "$(id -u):$(id -g)" /DATA/.docker`.
+  **ZimaOS notes:**
+  - Run `docker compose` **without `sudo`**. ZimaOS's root filesystem is read-only, so `sudo docker compose …` fails with `mkdir /root/.docker: read-only file system`. If you really need root, point it at a writable config folder: `sudo DOCKER_CONFIG=/DATA/.docker docker compose up -d --build`.
+  - If docker prints `WARNING: Error loading config file: open /DATA/.docker/config.json: permission denied`, the docker client folder belongs to root (usually after one `sudo docker …`). Compose builds use buildx, which keeps its state in that folder, so fix the ownership first: `sudo chown -R "$(id -u):$(id -g)" /DATA/.docker`.
 
 - **Without git:** build the image on your dev machine and transfer it, then start it from the compose file without `--build`:
 
