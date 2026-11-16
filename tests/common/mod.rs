@@ -159,7 +159,8 @@ impl TestApp {
         self.request(req).await
     }
 
-    /// A plain HTML form POST. The client's CSRF token is sent as the `csrf`
+    /// A plain HTML form POST as a browser sends it (`Sec-Fetch-Site: same-origin`,
+    /// `Origin: null` under `no-referrer`). The client's CSRF token is sent as the `csrf`
     /// field unless `fields` already contains one.
     pub async fn post_form(
         &self,
@@ -187,6 +188,8 @@ impl TestApp {
             .collect::<Vec<_>>()
             .join("&");
         let req = builder(Method::POST, path, client)
+            .header("sec-fetch-site", "same-origin")
+            .header("origin", "null")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
             .body(Body::from(body))
             .unwrap();
@@ -224,10 +227,13 @@ impl TestApp {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
-        let mut b = builder(Method::POST, path, client).header(
-            header::CONTENT_TYPE,
-            format!("multipart/form-data; boundary={BOUNDARY}"),
-        );
+        let mut b = builder(Method::POST, path, client)
+            .header("sec-fetch-site", "same-origin")
+            .header("origin", "null")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            );
         if !client.csrf.is_empty() {
             b = b.header("x-csrf-token", &client.csrf);
         }

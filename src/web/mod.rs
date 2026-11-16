@@ -308,11 +308,26 @@ pub fn render(template: &impl Template) -> Response {
 /// an OS share target). Empty for now; Task 18 adds `/share`.
 const ORIGIN_EXEMPT_PATHS: &[&str] = &[];
 
-/// `scheme://host[:port]` of a URL, lowercased.
+/// `scheme://host[:port]` of a URL, lowercased, without the scheme's default
+/// port (`https` 443, `http` 80), so `https://h:443` and `https://h` compare equal.
 fn origin_of(url: &str) -> String {
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    format!("{scheme}://{authority}").to_ascii_lowercase()
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let default_port = match scheme.as_str() {
+        "https" => ":443",
+        "http" => ":80",
+        _ => "",
+    };
+    let authority = match authority.strip_suffix(default_port) {
+        Some(host) if !default_port.is_empty() => host,
+        _ => &authority,
+    };
+    format!("{scheme}://{authority}")
 }
 
 /// Rejects cross-origin state-changing requests (login CSRF: the cookie-less
@@ -346,7 +361,7 @@ async fn origin_guard(State(state): State<AppState>, req: Request, next: Next) -
         }
         None => headers.get(header::ORIGIN).is_none_or(|v| {
             v.to_str()
-                .is_ok_and(|o| o.to_ascii_lowercase() == origin_of(&state.cfg.public_url))
+                .is_ok_and(|o| origin_of(o) == origin_of(&state.cfg.public_url))
         }),
     };
     if !allowed {
@@ -446,6 +461,25 @@ async fn static_file(Path(file): Path<String>) -> Response {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn origin_of_drops_default_ports_only() {
+        assert_eq!(
+            origin_of("https://Host.Example:443/x?y"),
+            "https://host.example"
+        );
+        assert_eq!(origin_of("https://host.example"), "https://host.example");
+        assert_eq!(origin_of("http://host.example:80"), "http://host.example");
+        assert_eq!(
+            origin_of("https://host.example:8443"),
+            "https://host.example:8443"
+        );
+        assert_eq!(
+            origin_of("http://host.example:443"),
+            "http://host.example:443"
+        );
+        assert_ne!(origin_of("null"), origin_of("https://host.example"));
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn kdf_semaphore_limits_concurrency() {

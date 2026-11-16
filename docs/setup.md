@@ -150,6 +150,10 @@ curl -sI https://<node-name>.<tailnet-name>.ts.net/
 
 The first request after enabling Funnel can take a minute while the certificate is issued and DNS propagates.
 
+### Supported browsers
+
+State-changing requests are checked with the `Sec-Fetch-Site` header, so use a browser that sends it: Chrome 76+, Firefox 90+ or Safari 16.4+ (and the matching mobile versions). Older browsers send `Origin: null` on form posts because the app sets `Referrer-Policy: no-referrer`, and the app rejects those posts, so forms fail with 403 there. `PM_PUBLIC_URL` may be written with or without the default port (`https://host` and `https://host:443` are the same origin).
+
 ## 6. First admin and users 🚧
 
 ```bash

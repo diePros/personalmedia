@@ -484,15 +484,28 @@ async fn bearer_request_without_cookie_skips_origin_check() {
     // Passes the guard (the login handler then answers, not a 403).
     assert_ne!(login_with(&app, &hdrs).await.status(), 403);
     // With a session cookie the exemption does not apply.
+    // The body is a valid urlencoded form with the right CSRF field, so only
+    // the origin guard can answer 403.
     let c = app.session_for("alice");
     use axum::body::Body;
-    use axum::http::Method;
-    let req = common::builder(Method::POST, "/logout", &c)
-        .header("authorization", "Bearer pm_x")
-        .header("origin", "https://evil.example")
-        .body(Body::empty())
-        .unwrap();
-    assert_eq!(app.request(req).await.status(), 403);
+    use axum::http::{Method, header};
+    let post = |origin: &'static str| {
+        common::builder(Method::POST, "/logout", &c)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("authorization", "Bearer pm_x")
+            .header("origin", origin)
+            .body(Body::from(format!("csrf={}", c.csrf)))
+            .unwrap()
+    };
+    assert_eq!(
+        app.request(post("https://evil.example")).await.status(),
+        403
+    );
+    // Control: the same request from the right origin goes through.
+    assert_eq!(
+        app.request(post("https://test.example")).await.status(),
+        303
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -673,4 +686,32 @@ async fn recover_ends_other_sessions() {
     }
     let fresh = client_from_response(&resp);
     assert_eq!(app.get("/recovery-key", &fresh).await.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_site_post_with_valid_csrf_is_403() {
+    use axum::body::Body;
+    use axum::http::{Method, header};
+    let app = TestApp::new();
+    let c = app.session_for("alice");
+    let post = |site: &'static str| {
+        common::builder(Method::POST, "/logout", &c)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("sec-fetch-site", site)
+            .body(Body::from(format!("csrf={}", c.csrf)))
+            .unwrap()
+    };
+    assert_eq!(app.request(post("cross-site")).await.status(), 403);
+    assert_eq!(app.request(post("same-site")).await.status(), 403);
+    // The session survived both, and the same-origin post is accepted.
+    assert_eq!(app.get("/documents", &c).await.status(), 200);
+    assert_eq!(app.request(post("same-origin")).await.status(), 303);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_with_default_port_in_public_url_matches() {
+    let app = TestApp::with_config(|cfg| cfg.public_url = "https://test.example:443".into());
+    app.session_for("alice");
+    let r = login_with(&app, &[("origin", "https://test.example")]).await;
+    assert_eq!(r.status(), 303);
 }
