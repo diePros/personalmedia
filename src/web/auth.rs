@@ -662,6 +662,20 @@ async fn recover(
             // token unlock survives the recovery.
             state.sessions.remove_user(&user.id);
             state.tokens.evict_user(&user.id);
+            // Remembered devices were granted under the old credentials. A
+            // new remember below still works: it creates a fresh device.
+            let (sys, u2) = (state.sys.clone(), unlocked.clone());
+            match tokio::task::spawn_blocking(move || crate::devices::revoke_all_devices(&sys, &u2))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return internal(&AccountError::Internal(e)),
+                Err(e) => {
+                    return internal(&AccountError::Internal(anyhow::anyhow!(
+                        "device revocation task failed: {e}"
+                    )));
+                }
+            }
             let label = remember_label(&headers, form.remember.as_deref());
             match finish_login(
                 &state,

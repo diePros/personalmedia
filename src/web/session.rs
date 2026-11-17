@@ -251,6 +251,13 @@ impl SessionStore {
         }
     }
 
+    /// The session stops belonging to a remembered device (it was revoked).
+    pub fn clear_device(&self, id: &str) {
+        if let Some(s) = self.lock().get_mut(id) {
+            s.device_id = None;
+        }
+    }
+
     /// Logout.
     pub fn remove(&self, id: &str) {
         drop(self.take(id));

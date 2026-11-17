@@ -527,3 +527,201 @@ async fn remember_on_recover_sets_device_cookie() {
     .await;
     assert_eq!(header_str(&resumed, "location"), "/recovery-key");
 }
+
+/// A client for the session a login response started, with its CSRF token,
+/// and the settings page it sees.
+async fn settings_client(app: &TestApp, resp: &Response) -> (Client, String) {
+    let mut client = client_from_response(resp);
+    let html = body_string(app.get("/settings", &client).await).await;
+    client.csrf = csrf_from_html(&html);
+    (client, html)
+}
+
+fn device_id_of_token(token: &str) -> String {
+    token.split('_').nth(1).unwrap().to_owned()
+}
+
+fn clears_device_cookie(resp: &Response) -> bool {
+    set_cookies(resp)
+        .iter()
+        .any(|c| c.starts_with("__Host-pm_device=;") && c.contains("Max-Age=0"))
+}
+
+async fn resumes(app: &TestApp, token: &str) -> bool {
+    let resp = send(
+        app,
+        Method::GET,
+        "/documents",
+        &device_cookie_header(token),
+        None,
+    )
+    .await;
+    resp.status() == 200
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_lists_devices_with_this_device_marker() {
+    let (app, token_a) = setup().await;
+    let resp_b = login(&app, true).await;
+    let token_b = device_of(&resp_b).unwrap();
+    let (_, html) = settings_client(&app, &resp_b).await;
+    assert!(html.contains("Remembered devices"));
+    assert!(html.contains("Anyone holding one of them unlocked can open your documents."));
+    assert_eq!(html.matches(">this device<").count(), 1);
+    for t in [&token_a, &token_b] {
+        let id = device_id_of_token(t);
+        assert!(html.contains(&format!("/settings/devices/{id}/revoke")));
+    }
+    assert!(html.contains("Sign out all other devices"));
+    assert!(html.contains("added "));
+    assert!(html.contains("last used "));
+    // The marker sits on B's own row.
+    let id_b = device_id_of_token(&token_b);
+    let at = html.find(&id_b).unwrap();
+    let row = &html[html[..at].rfind("<li").unwrap()..];
+    let row = &row[..row.find("</li>").unwrap()];
+    assert!(row.contains(">this device<"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_shows_empty_state_without_devices() {
+    let app = TestApp::new();
+    let c = app.session_for(USER);
+    let html = body_string(app.get("/settings", &c).await).await;
+    assert!(html.contains("No remembered devices."));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_device_from_settings() {
+    let (app, token_a) = setup().await;
+    let resp_b = login(&app, true).await;
+    let token_b = device_of(&resp_b).unwrap();
+    let (client_b, _) = settings_client(&app, &resp_b).await;
+
+    let id_a = device_id_of_token(&token_a);
+    let resp = app
+        .post_form(&format!("/settings/devices/{id_a}/revoke"), &[], &client_b)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(
+        !clears_device_cookie(&resp),
+        "another device's cookie stays"
+    );
+    assert!(!resumes(&app, &token_a).await);
+    assert!(resumes(&app, &token_b).await);
+
+    // Unknown ids are not found.
+    let resp = app
+        .post_form(
+            &format!("/settings/devices/{}/revoke", "0".repeat(32)),
+            &[],
+            &client_b,
+        )
+        .await;
+    assert_eq!(resp.status(), 404);
+
+    // Revoking the current device also clears this browser's cookie.
+    let id_b = device_id_of_token(&token_b);
+    let resp = app
+        .post_form(&format!("/settings/devices/{id_b}/revoke"), &[], &client_b)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(clears_device_cookie(&resp));
+    assert!(!resumes(&app, &token_b).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_out_other_devices_keeps_current() {
+    let (app, token_a) = setup().await;
+    let resp_b = login(&app, true).await;
+    let token_b = device_of(&resp_b).unwrap();
+    let (client_b, _) = settings_client(&app, &resp_b).await;
+
+    let resp = app
+        .post_form("/settings/devices/revoke-others", &[], &client_b)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(!clears_device_cookie(&resp));
+    assert!(!resumes(&app, &token_a).await);
+    assert!(resumes(&app, &token_b).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn password_change_revokes_all_devices() {
+    let (app, token_a) = setup().await;
+    let resp_b = login(&app, true).await;
+    let token_b = device_of(&resp_b).unwrap();
+    let (client_b, _) = settings_client(&app, &resp_b).await;
+
+    let resp = app
+        .post_form(
+            "/settings/password",
+            &[
+                ("current", PASSWORD),
+                ("new", "a different passphrase"),
+                ("new_confirm", "a different passphrase"),
+            ],
+            &client_b,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(clears_device_cookie(&resp), "this browser's cookie goes");
+    assert!(header_str(&resp, "location").contains("notice=password"));
+
+    // The current session keeps working; no device survives.
+    assert_eq!(app.get("/settings", &client_b).await.status(), 200);
+    for token in [&token_a, &token_b] {
+        let resp = send(
+            &app,
+            Method::GET,
+            "/documents",
+            &device_cookie_header(token),
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), 303);
+        assert_eq!(header_str(&resp, "location"), "/login");
+        assert!(clears_device_cookie(&resp));
+    }
+    let html = body_string(app.get("/settings", &client_b).await).await;
+    assert!(html.contains("No remembered devices."));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_login_revokes_all_devices() {
+    let (app, token) = setup().await;
+    // The recovery key was shown at signup, but `setup` dropped it: make a
+    // new one from Settings.
+    let session = login(&app, false).await;
+    let (client, _) = settings_client(&app, &session).await;
+    let resp = app
+        .post_form("/settings/recovery", &[("password", PASSWORD)], &client)
+        .await;
+    assert_eq!(resp.status(), 303);
+    let html = body_string(app.get("/recovery-key", &client).await).await;
+    let start = html.find("<code").unwrap();
+    let inner = &html[start..];
+    let key = inner[inner.find('>').unwrap() + 1..inner.find("</code>").unwrap()]
+        .trim()
+        .to_owned();
+
+    let uid = app.state.sessions.get(&client.cookie).unwrap().user_id;
+    let pw = "a brand new passphrase";
+    let resp = app
+        .post_form(
+            "/recover",
+            &[
+                ("username", USER),
+                ("recovery_key", &key),
+                ("new_password", pw),
+                ("new_password_confirm", pw),
+            ],
+            &Client::anon(),
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(!resumes(&app, &token).await);
+    // The row itself is gone, not just unusable.
+    let ids = app.state.sys.token_ids_for_user(&uid).unwrap();
+    assert!(!ids.contains(&device_id_of_token(&token)), "{ids:?}");
+}

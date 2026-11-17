@@ -199,6 +199,12 @@ This prints a one-time invite URL. Open it, choose a username and password, and 
 
 Invite friends from the admin page. Each invite link is single-use and expires after 7 days.
 
+### Remembered devices
+
+The login and recovery forms have a "Remember this device" box, ticked by default. It keeps that browser logged in for 90 days (renewed when used) without asking for the password, even after the server restarts or the session times out. It works for every login method, and a second factor is not asked again on that browser.
+
+The risk: anyone holding a remembered device unlocked can open your documents, and a stolen device cookie works until you revoke it. Untick the box on shared computers. Logging out forgets only the current device. To revoke, open Settings, "Remembered devices": revoke one device, or "Sign out all other devices". Changing your password or logging in with the recovery key signs out every remembered device. Turning off two-factor authentication needs your password.
+
 ## 7. Connect Hermes (MCP)
 
 1. In the web UI: **Settings → Tokens → New token**. Choose the access (`read` / `read_write`), the content level (`metadata_only` / `full_text`) and optionally a tag allow-list. Copy the token (`pm_…`); it's shown only once.

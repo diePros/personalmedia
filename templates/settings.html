@@ -178,6 +178,11 @@
 <label for="totp-disable-code">Code</label>
 <input type="text" id="totp-disable-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
 </div>
+<div>
+{% include "_username_hint.html" %}
+<label for="totp-disable-password">Your password</label>
+<input type="password" id="totp-disable-password" name="password" autocomplete="current-password" required>
+</div>
 <button type="submit" class="danger">Turn off</button>
 </form>
 {% else if let Some(setup) = totp_setup -%}
@@ -202,6 +207,31 @@
 <form method="post" action="/settings/totp/begin">
 <input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
 <button type="submit">Set up</button>
+</form>
+{% endif -%}
+</section>
+
+<section id="devices">
+<h2>Remembered devices</h2>
+<p>These devices stay logged in without your password. Anyone holding one of them unlocked can open your documents. Changing your password signs all of them out.</p>
+{% if devices.is_empty() -%}
+<p class="muted">No remembered devices.</p>
+{% else -%}
+<ul class="doc-list">
+{% for d in devices -%}
+<li class="doc-item">
+<span class="doc-title">{{ d.label }}{% if d.current %} <span class="device-badge">this device</span>{% endif %}</span>
+<span class="muted doc-meta">added {{ d.added }} · last used {{ d.last_used }}</span>
+<form method="post" action="/settings/devices/{{ d.id }}/revoke">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit" class="danger">Revoke</button>
+</form>
+</li>
+{% endfor -%}
+</ul>
+<form method="post" action="/settings/devices/revoke-others">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit">Sign out all other devices</button>
 </form>
 {% endif -%}
 </section>
