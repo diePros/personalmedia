@@ -1376,3 +1376,19 @@ fn ios_shortcut_url_validated() {
         &id[..31]
     )));
 }
+
+/// Every password field in Settings has a hidden `autocomplete="username"`
+/// field with the account name, so password managers can fill it.
+#[tokio::test(flavor = "multi_thread")]
+async fn password_fields_carry_a_username_hint_for_password_managers() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let html = body_string(t.get("/settings", &c).await).await;
+    let hint = r#"name="pm_username_hint" value="alice" autocomplete="username""#;
+    let passwords = html.matches(r#"autocomplete="current-password""#).count();
+    assert!(
+        passwords >= 4,
+        "expected several password forms, got {passwords}"
+    );
+    assert_eq!(html.matches(hint).count(), passwords);
+}

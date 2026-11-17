@@ -108,6 +108,7 @@
 </select>
 </div>
 <div>
+{% include "_username_hint.html" %}
 <label for="token-password">Your password</label>
 <input type="password" id="token-password" name="password" autocomplete="current-password" required>
 </div>
@@ -137,6 +138,7 @@
 <form method="post" action="/settings/ios" class="stack">
 <input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
 <div>
+{% include "_username_hint.html" %}
 <label for="ios-password">Your password</label>
 <input type="password" id="ios-password" name="password" autocomplete="current-password" required>
 </div>
@@ -189,6 +191,7 @@
 <input type="text" id="totp-enable-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
 </div>
 <div>
+{% include "_username_hint.html" %}
 <label for="totp-enable-password">Your password</label>
 <input type="password" id="totp-enable-password" name="password" autocomplete="current-password" required>
 </div>
@@ -208,6 +211,7 @@
 <form method="post" action="/settings/password" class="stack">
 <input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
 <div>
+{% include "_username_hint.html" %}
 <label for="current">Current password</label>
 <input type="password" id="current" name="current" autocomplete="current-password" required>
 </div>
@@ -230,6 +234,7 @@
 <form method="post" action="/settings/recovery" class="stack">
 <input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
 <div>
+{% include "_username_hint.html" %}
 <label for="recovery-password">Your password</label>
 <input type="password" id="recovery-password" name="password" autocomplete="current-password" required>
 </div>
@@ -248,6 +253,7 @@
 <form method="post" action="/settings/export" class="stack">
 <input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
 <div>
+{% include "_username_hint.html" %}
 <label for="export-password">Your password</label>
 <input type="password" id="export-password" name="password" autocomplete="current-password" required>
 </div>
