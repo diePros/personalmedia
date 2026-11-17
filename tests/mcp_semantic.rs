@@ -114,7 +114,8 @@ impl Fx {
             .unwrap()
             .to_owned();
         // Let the extraction worker finish first, or it would overwrite the text.
-        for _ in 0..200 {
+        // (No fixed short deadline: a slow runner must not make this flaky.)
+        for _ in 0..2400 {
             let st = self
                 .u
                 .with_db(|c| get_document(c, &id))
@@ -126,6 +127,15 @@ impl Fx {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+        assert_ne!(
+            self.u
+                .with_db(|c| get_document(c, &id))
+                .unwrap()
+                .unwrap()
+                .text_status,
+            TextStatus::Pending,
+            "extraction did not finish in 60 s"
+        );
         self.u.with_db(|c| {
             set_text(c, &id, TextStatus::Done, Some(text), None, 1).unwrap();
             set_document_access(c, &id, Channel::Mcp, Some(mcp)).unwrap();
@@ -438,17 +448,12 @@ async fn semantic_search_limits() {
     let (_, v) = f.call(&tok, json!({"query": "apples", "limit": 3})).await;
     assert_eq!(v.as_array().unwrap().len(), 3);
 
-    // Query length: 1000 chars is fine, 1001 is invalid params.
+    // Query length: 1000 chars is fine, 1001 is a tool error that names the limit.
     let (err, _) = f.call(&tok, json!({"query": "a".repeat(1000)})).await;
     assert!(!err);
-    let r = f
-        .post(
-            &tok,
-            &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                    "params":{"name":"semantic_search","arguments":{"query":"a".repeat(1001)}}}),
-        )
-        .await;
-    assert_eq!(r["error"]["code"], -32602, "{r}");
+    let (err, msg) = f.call(&tok, json!({"query": "a".repeat(1001)})).await;
+    assert!(err, "{msg}");
+    assert!(msg.as_str().unwrap().contains("1000"), "{msg}");
 
     // A long chunk is cut to 1200 chars with an ellipsis.
     let long = "word ".repeat(2000);
@@ -567,4 +572,22 @@ async fn slow_download_does_not_block_search_or_web() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
     assert!(!engine.is_available());
     assert_eq!(server.hits(), 1, "the download must still be the first one");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn semantic_search_without_candidates_does_not_load_the_model() {
+    let Some(m) = models_dir() else {
+        eprintln!("SKIP semantic_search_without_candidates_does_not_load_the_model: no model");
+        return;
+    };
+    let f = Fx::new(Some(m));
+    let tok = f.token(Content::FullText, None);
+    // Nothing is indexed at all.
+    let (err, v) = f.call(&tok, json!({"query": "anything"})).await;
+    assert!(!err, "{v}");
+    assert_eq!(v, json!([]));
+    assert!(
+        !f.t.state.engine.is_loaded(),
+        "a search that cannot match must not load the model"
+    );
 }

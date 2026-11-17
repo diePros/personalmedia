@@ -322,7 +322,7 @@ fn tool_definitions(can_write: bool, full_text: bool) -> Value {
         },
         {
             "name": "semantic_search",
-            "description": "Meaning-based search over document passages (full_text tokens only). Returns the best passage per document.",
+            "description": "Meaning-based search over document passages (full_text tokens only). Returns the best passage per document. An empty result can also mean that the semantic index is still being built or that the matching documents are not indexed.",
             "inputSchema": {"type": "object", "properties": {
                 "query": {"type": "string", "maxLength": 1000},
                 "tags": tags, "date_from": date, "date_to": date,
@@ -580,8 +580,12 @@ async fn semantic_search(
     if p.cap() != Level::Full {
         return Err(ToolError::Tool("token cannot use semantic search".into()));
     }
+    // Tool errors (isError) rather than protocol errors: the model can read
+    // them and correct itself.
     if a.query.chars().count() > QUERY_MAX_CHARS {
-        return Err(ToolError::Params("query too long"));
+        return Err(ToolError::Tool(format!(
+            "query too long (at most {QUERY_MAX_CHARS} characters)"
+        )));
     }
     if a.query.trim().is_empty() {
         return Err(ToolError::Tool("query must not be empty".into()));
@@ -594,6 +598,23 @@ async fn semantic_search(
         Ok(false) => return Err(ToolError::Tool(NO_INDEX.into())),
         Err(e) => return Err(ToolError::Tool(internal(e))),
     }
+    let mut f = p.filter();
+    f.tags_all = a.tags;
+    f.date_from = clean(a.date_from);
+    f.date_to = clean(a.date_to);
+    let limit = a.limit.unwrap_or(8).clamp(1, 20) as usize;
+    // Nothing visible (or a filter on a foreign tag): answer without loading
+    // the model. This reveals nothing the caller cannot see anyway.
+    let (p1, f1) = (p.clone(), f.clone());
+    let any = blocking(&p.unlocked, move |c| {
+        Ok(tags_filter_allowed(&p1, c, &f1.tags_all)?
+            && crate::user_db::vectors::has_candidates(c, &f1)?)
+    })
+    .await
+    .map_err(ToolError::Tool)?;
+    if !any {
+        return Ok(Value::Array(vec![]));
+    }
     let query = a.query;
     let qv = match tokio::task::spawn_blocking(move || engine.embed_query(&query)).await {
         Ok(Ok(v)) => v,
@@ -603,11 +624,6 @@ async fn semantic_search(
         }
         Err(e) => return Err(ToolError::Tool(internal(e))),
     };
-    let mut f = p.filter();
-    f.tags_all = a.tags;
-    f.date_from = clean(a.date_from);
-    f.date_to = clean(a.date_to);
-    let limit = a.limit.unwrap_or(8).clamp(1, 20) as usize;
     let p2 = p.clone();
     let hits = blocking(&p.unlocked, move |c| {
         if !tags_filter_allowed(&p2, c, &f.tags_all)? {

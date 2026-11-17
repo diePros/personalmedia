@@ -65,6 +65,7 @@ host allow-list. There is no SSE stream: `GET /mcp` is 405.
   documents whose `semantic_index` level is `full`. `semantic_search` is only available to
   `full_text` tokens and only returns fully MCP-visible documents, within the token's tag allow-list.
   The model is public and holds no user data; queries and passages never leave the process.
+- Supply chain of the embedding runtime: `ort` is pinned to `=2.0.0-rc.15`; its `ort-sys` build step downloads a static ONNX Runtime from `cdn.pyke.io` and checks it against a hash pinned in `ort-sys`. That download happens at image build time only; the runtime image contains just the binary. The model files are fetched from a revision-pinned URL and verified against SHA-256 values pinned in the source (see docs/setup.md section 7c).
 - Tag-restricted MCP tokens never see tag names outside their allow-list: not in `list_tags`, not
   on documents (the `tags` of every returned document are filtered), not through search or tag
   filters. `update_document` keeps tags the token cannot see on the document.

@@ -19,7 +19,7 @@ use personal_media::extract::{
     EMBED_BATCH, EmbedEvent, EmbedRuntime, ExtractConfig, ExtractQueue, ExtractReceiver, JobKind,
     start_workers,
 };
-use personal_media::keyring::{Keyring, Unlocked, index_db_path};
+use personal_media::keyring::{Keyring, OnUnlock, Unlocked, index_db_path};
 use personal_media::system_db::{Role, SYSTEM_DB_FILE, SystemDb};
 use personal_media::user_db::vectors::{
     docs_needing_embedding, get_embed_status, get_vectors, replace_vectors,
@@ -238,8 +238,17 @@ async fn only_full_semantic_index_documents_get_vectors() {
     let vs = e.u.with_db(|c| get_vectors(c, &full)).unwrap();
     assert_eq!(vs[0].model, MODEL.name);
     assert_eq!(vs[0].vector.len(), 384);
-    // Give a wrongly queued job time to show up.
-    std::thread::sleep(Duration::from_millis(500));
+    // The worker is a single FIFO consumer: once a sentinel document queued
+    // after the others is embedded, any wrongly queued job for `off`/`meta`
+    // would already have run.
+    let sentinel = e
+        .upload_text("sentinel.txt", "Vierter Text über Zinsen.")
+        .await;
+    e.wait_text_done(&sentinel);
+    e.u.with_db(|c| set_document_access(c, &sentinel, Channel::SemanticIndex, Some(Level::Full)))
+        .unwrap();
+    e.queue.enqueue_embeds_needed(&e.u);
+    e.wait("sentinel vectors", |e| e.count(&sentinel) > 0);
     assert_eq!(e.count(&off), 0);
     assert_eq!(e.count(&meta), 0);
     assert_eq!(e.status(&off), "none");
@@ -318,13 +327,19 @@ async fn lowering_semantic_index_mid_job_leaves_no_vectors() {
     };
     let (reached_tx, reached_rx) = mpsc::channel::<()>();
     let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
     let go_rx = Mutex::new(go_rx);
     let reached_tx = Mutex::new(reached_tx);
-    let hook: Hook = Arc::new(move |ev| {
-        if ev == EmbedEvent::BeforeCommit {
+    let done_tx = Mutex::new(done_tx);
+    let hook: Hook = Arc::new(move |ev| match ev {
+        EmbedEvent::BeforeCommit => {
             reached_tx.lock().unwrap().send(()).unwrap();
             let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(60));
         }
+        EmbedEvent::Finished => {
+            let _ = done_tx.lock().unwrap().send(());
+        }
+        _ => {}
     });
     let e = Env::new(Some((models, Some(hook))));
     e.set_default(Level::Full);
@@ -339,7 +354,10 @@ async fn lowering_semantic_index_mid_job_leaves_no_vectors() {
     e.u.with_db(|c| set_document_access(c, &id, Channel::SemanticIndex, Some(Level::Metadata)))
         .unwrap();
     go_tx.send(()).unwrap();
-    std::thread::sleep(Duration::from_secs(1));
+    // Wait for the job to really end instead of sleeping.
+    tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(60)).unwrap())
+        .await
+        .unwrap();
     assert_eq!(e.count(&id), 0);
     assert_eq!(e.status(&id), "none");
 }
@@ -356,8 +374,12 @@ async fn raising_default_enqueues_existing_documents() {
         .await;
     e.wait_text_done(&a);
     e.wait_text_done(&b);
-    std::thread::sleep(Duration::from_millis(300));
+    // Default is off: nothing is eligible, so nothing can have been queued.
     assert_eq!(e.count(&a) + e.count(&b), 0);
+    assert_eq!(
+        (e.status(&a).as_str(), e.status(&b).as_str()),
+        ("none", "none")
+    );
     assert!(
         e.u.with_db(|c| docs_needing_embedding(c, MODEL.name))
             .unwrap()
@@ -411,6 +433,10 @@ async fn long_document_embeds_in_batches() {
     assert_eq!(sizes.len(), n.div_ceil(EMBED_BATCH));
     assert!(sizes.iter().all(|s| *s <= EMBED_BATCH), "{sizes:?}");
     assert_eq!(sizes.iter().sum::<usize>(), n);
+    // Ruling AB: the whole vector set of a document is held until the single
+    // guarded write; the input cap bounds it.
+    assert!(n <= personal_media::embed::MAX_VECTORS_PER_DOCUMENT, "{n}");
+    assert_eq!(personal_media::embed::MAX_VECTORS_PER_DOCUMENT, 8000);
 }
 
 #[test]
@@ -609,4 +635,121 @@ fn duplicate_enqueue_is_ignored() {
     assert_eq!(drain(rx), vec![(JobKind::Embed, id.clone())]);
     assert_eq!(e.status(&id), "pending");
     drop(rt);
+}
+
+#[test]
+fn semantic_status_ignores_old_model_vectors() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (e, id) = rt.block_on(async {
+        let e = Env::new(None);
+        let id = e.upload_text("a.txt", SAMPLE).await;
+        (e, id)
+    });
+    e.set_default(Level::Full);
+    e.u.with_db(|c| set_text(c, &id, TextStatus::Done, Some(SAMPLE), None, NOW))
+        .unwrap();
+    let items = vec![(Chunk { start: 0, end: 10 }, fake_vec(0.3))];
+    // Vectors of another model: search ignores them, so they do not count.
+    e.u.with_db(|c| replace_vectors(c, &id, "some-old-model", &items))
+        .unwrap();
+    let st = e.u.with_db(semantic_status).unwrap();
+    assert_eq!((st.eligible, st.indexed, st.pending), (1, 0, 1), "{st:?}");
+    e.u.with_db(|c| replace_vectors(c, &id, MODEL.name, &items))
+        .unwrap();
+    let st = e.u.with_db(semantic_status).unwrap();
+    assert_eq!((st.eligible, st.indexed, st.pending), (1, 1, 0), "{st:?}");
+    // A text without chunks has no vectors and still counts as indexed.
+    e.u.with_db(|c| replace_vectors(c, &id, MODEL.name, &[]))
+        .unwrap();
+    let st = e.u.with_db(semantic_status).unwrap();
+    assert_eq!((st.indexed, st.pending), (1, 0), "{st:?}");
+    drop(rt);
+}
+
+#[test]
+fn unlock_removes_vectors_of_documents_below_full() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (e, id) = rt.block_on(async {
+        let e = Env::new(None);
+        let id = e.upload_text("a.txt", SAMPLE).await;
+        (e, id)
+    });
+    e.u.with_db(|c| set_text(c, &id, TextStatus::Done, Some(SAMPLE), None, NOW))
+        .unwrap();
+    // As left behind by a downgrade/upgrade cycle: vectors on a document whose
+    // semantic_index is off (written behind the switchboard's back).
+    let items = vec![(Chunk { start: 0, end: 10 }, fake_vec(0.3))];
+    e.u.with_db(|c| replace_vectors(c, &id, MODEL.name, &items))
+        .unwrap();
+    assert_eq!(e.count(&id), 1);
+    e.queue.unlocked(&e.u);
+    assert_eq!(e.count(&id), 0);
+    assert_eq!(e.status(&id), "none");
+    drop(rt);
+}
+
+#[test]
+fn readonly_open_works_on_v1_and_v2_databases() {
+    use personal_media::user_db::open_user_db_readonly;
+    let dir = tempfile::tempdir().unwrap();
+    let key = personal_media::crypto::Key32::random();
+    let insert = "INSERT INTO documents(id, wrapped_dek, original_filename, title, mime, size,
+                                        sha256, created_at, updated_at)
+                  VALUES ('d1', x'00', 'a.txt', 'Old doc', 'text/plain', 3, x'01', 1, 1)";
+    let user_version = |c: &Connection| -> i64 {
+        c.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // v1: as written by 1.1.x. Recovery must not migrate it.
+    let v1 = dir.path().join("v1.db");
+    {
+        let conn = Connection::open(&v1).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA key = \"x'{}'\";",
+            hex::encode(key.as_bytes())
+        ))
+        .unwrap();
+        conn.execute_batch(&format!(
+            "BEGIN; {} PRAGMA user_version = 1; COMMIT;",
+            personal_media::user_db::SCHEMA_V1
+        ))
+        .unwrap();
+        conn.execute(insert, []).unwrap();
+    }
+    let ro = open_user_db_readonly(&v1, &key).unwrap();
+    let title: String = ro
+        .query_row("SELECT title FROM documents WHERE id = 'd1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(title, "Old doc");
+    assert_eq!(user_version(&ro), 1);
+
+    // v2: migrated by the server; vectors and embed_status are readable.
+    let v2 = dir.path().join("v2.db");
+    {
+        let conn = open_user_db(&v2, &key).unwrap();
+        conn.execute(insert, []).unwrap();
+        conn.execute(
+            "INSERT INTO chunk_vectors(document_id, chunk_no, start, end, model, vector)
+             VALUES ('d1', 0, 0, 3, 'm', x'00')",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE documents SET embed_status = 'partial'", [])
+            .unwrap();
+    }
+    let ro = open_user_db_readonly(&v2, &key).unwrap();
+    assert_eq!(user_version(&ro), 2);
+    let (n, st): (i64, String) = ro
+        .query_row(
+            "SELECT (SELECT count(*) FROM chunk_vectors), embed_status FROM documents",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((n, st.as_str()), (1, "partial"));
+    // read-only really means read-only
+    assert!(ro.execute("DELETE FROM documents", []).is_err());
 }

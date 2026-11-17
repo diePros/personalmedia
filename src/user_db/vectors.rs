@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::access::{Channel, Level, effective_level};
-use super::documents::{Document, ListFilter, semantic_candidates};
+use super::documents::{Document, ListFilter, load_tags, semantic_candidates};
 use crate::embed::{Chunk, MODEL};
 
 /// f32 little-endian.
@@ -325,7 +325,17 @@ pub fn search(
     }
     best.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
     best.truncate(limit);
+    // Tags only for the documents that are returned.
+    for (doc, _, _) in &mut best {
+        load_tags(conn, doc)?;
+    }
     Ok(best)
+}
+
+/// Whether any document is visible to a semantic search under `filter`
+/// (so the caller can skip loading the model for a search that cannot match).
+pub fn has_candidates(conn: &Connection, filter: &ListFilter) -> Result<bool> {
+    Ok(!semantic_candidates(conn, filter)?.is_empty())
 }
 
 /// Counts over the documents whose effective `semantic_index` is full.

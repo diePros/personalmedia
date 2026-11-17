@@ -128,7 +128,7 @@ fn map_doc(r: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
     })
 }
 
-fn load_tags(conn: &Connection, doc: &mut Document) -> Result<()> {
+pub(crate) fn load_tags(conn: &Connection, doc: &mut Document) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "SELECT t.name FROM document_tags dt JOIN tags t ON t.id = dt.tag_id
          WHERE dt.document_id = ?1 ORDER BY t.name",
@@ -387,6 +387,7 @@ pub fn list_documents(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>
 /// `Full` under the filter's cap (which must itself be `Full`), effective
 /// `semantic_index` `Full`, plus the tag allow-list and date filters. Decided
 /// in SQL; no limit. `f.access` must be `Some(Mcp, Full)` or nothing matches.
+/// The documents come without tags (the caller loads them for the few it keeps).
 pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>> {
     let Some(a) = f.access else {
         return Ok(vec![]);
@@ -410,12 +411,9 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
     filter_conditions(f, &mut sql, &mut params);
     sql.push_str(" ORDER BY d.id");
     let mut stmt = conn.prepare(&sql)?;
-    let mut docs: Vec<Document> = stmt
+    let docs: Vec<Document> = stmt
         .query_map(params_from_iter(params), map_doc)?
         .collect::<rusqlite::Result<_>>()?;
-    for d in &mut docs {
-        load_tags(conn, d)?;
-    }
     Ok(docs)
 }
 

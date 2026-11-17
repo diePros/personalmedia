@@ -245,9 +245,11 @@ Semantic search lets an assistant find documents by meaning (also across German 
 - **Who can use it.** Only tokens with content `full_text` see the tool, and only for documents whose MCP level is `full`. Vectors are stored encrypted in the user's index database, like the text.
 - **Model download.** The model (multilingual-e5-small, int8, about 135 MB, pinned revision and SHA-256) is not part of the image. It is downloaded on first indexing into `/data/models/<name>/` and verified against the pinned hash; a mismatch is a hard error. The container needs outbound access to huggingface.co for that, once.
 - **Pre-download:** `sudo docker exec personal-media personal-media fetch-model` (idempotent).
+- **Download safety.** Downloads run under a lock on `/data/models/.lock` (so `fetch-model` and the server never write the same file), are hashed again on disk before they are moved into place, and are aborted past twice the pinned size or after 60 s without data. After a failed download or load the server waits 15 minutes before it tries again; documents queued meanwhile show "Indexing failed" and are retried after that (next login or settings save).
+- **Long documents.** Only the first 2,000,000 characters of a document (roughly 600 pages) are indexed; such documents show as "partially indexed". Text extraction (OCR) of new uploads always runs before queued indexing work.
 - **Air-gapped:** copy the two files (`model_qint8_avx512_vnni.onnx`, `tokenizer.json`) into `/data/models/multilingual-e5-small/` yourself. They are hash-checked on load.
 - **Memory.** Loading and running the model needs a few hundred MB; it unloads after 10 minutes idle and runs one job at a time. The compose file sets `mem_limit: 1536m` for this.
-- **Self-test (run once after the first 1.2 deploy).** Checks that the quantized model ranks sensibly on this CPU and reports speed and peak memory:
+- **Self-test (run once after the first 1.2 deploy).** Checks that the quantized model ranks sensibly on this CPU and reports speed and peak memory. It loads a second copy of the model (about 450 MB), so run it while the server is idle (no indexing running), or better in a separate one-off container with its own memory limit (`docker run --rm --memory 1g -v /DATA/AppData/personal-media:/data personal-media embed-selftest`), so it cannot push the server's container over `mem_limit`:
 
   ```bash
   sudo docker exec personal-media personal-media embed-selftest
