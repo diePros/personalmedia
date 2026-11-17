@@ -5,7 +5,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 
-use super::access::{AccessFilter, Channel, Level, get_access_defaults};
+use super::access::{AccessFilter, Channel, Level, base_default};
 
 #[derive(Clone, Copy, PartialEq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -321,7 +321,7 @@ fn access_clause(
     params: &mut Vec<Value>,
 ) -> Result<()> {
     if let Some(a) = f.access {
-        let default = get_access_defaults(conn)?.level(a.channel);
+        let default = base_default(conn, a.channel)?;
         sql.push_str(" LEFT JOIN document_access a ON a.document_id = d.id AND a.channel = ?");
         params.push(Value::Text(a.channel.as_str().into()));
         // Effective level is Off when the raw level is off or the cap is off.
@@ -396,7 +396,6 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
     if !matches!(a.channel, Channel::Mcp | Channel::Web) || a.cap != Level::Full {
         return Ok(vec![]);
     }
-    let defaults = get_access_defaults(conn)?;
     let mut params: Vec<Value> = vec![Value::Text(Channel::SemanticIndex.as_str().into())];
     let mut sql = format!(
         "SELECT {DOC_COLS} FROM documents d \
@@ -404,10 +403,10 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
     );
     access_clause(conn, f, &mut sql, &mut params)?;
     sql.push_str(" AND COALESCE(a.level, ?) = 'full'");
-    params.push(Value::Text(defaults.level(a.channel).as_str().into()));
+    params.push(Value::Text(base_default(conn, a.channel)?.as_str().into()));
     sql.push_str(" AND COALESCE(s.level, ?) = 'full'");
     params.push(Value::Text(
-        defaults.level(Channel::SemanticIndex).as_str().into(),
+        base_default(conn, Channel::SemanticIndex)?.as_str().into(),
     ));
     filter_conditions(f, &mut sql, &mut params);
     sql.push_str(" ORDER BY d.id");
@@ -421,7 +420,7 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
 /// Documents whose effective level on `channel` is off (the raw level, or the
 /// channel default when there is no override), newest first. One query.
 pub fn hidden_from(conn: &Connection, channel: Channel) -> Result<Vec<Document>> {
-    let default = get_access_defaults(conn)?.level(channel);
+    let default = base_default(conn, channel)?;
     let sql = format!(
         "SELECT {DOC_COLS} FROM documents d \
          LEFT JOIN document_access a ON a.document_id = d.id AND a.channel = ?1 \
@@ -613,7 +612,7 @@ pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<Searc
              JOIN documents d ON d.id = documents_fts.doc_id"
         );
         if let (Some(a), Some(raw)) = (f.access, &raw) {
-            let default = get_access_defaults(conn)?.level(a.channel);
+            let default = base_default(conn, a.channel)?;
             sql.push_str(" LEFT JOIN document_access a ON a.document_id = d.id AND a.channel = ?");
             params.push(Value::Text(a.channel.as_str().into()));
             sql.push_str(" WHERE documents_fts MATCH ?");

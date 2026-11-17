@@ -178,7 +178,17 @@ pub fn document_overrides(conn: &Connection, doc_id: &str) -> Result<HashMap<Cha
     Ok(out)
 }
 
-/// `min(override.unwrap_or(default), cap)`.
+/// The level a document without an override starts from on `channel`.
+/// Ruling AJ: on the MCP channel the token/app scope governs, so the stored
+/// user default is ignored there (treated as `Full` before the cap applies).
+pub fn base_default(conn: &Connection, channel: Channel) -> Result<Level> {
+    if channel == Channel::Mcp {
+        return Ok(Level::Full);
+    }
+    Ok(get_access_defaults(conn)?.level(channel))
+}
+
+/// `min(override.unwrap_or(base_default), cap)`.
 pub fn effective_level(
     conn: &Connection,
     doc_id: &str,
@@ -194,7 +204,7 @@ pub fn effective_level(
         .optional()?;
     let base = match over {
         Some(s) => Level::parse(&s).ok_or_else(|| anyhow!("unknown level in db"))?,
-        None => get_access_defaults(conn)?.level(channel),
+        None => base_default(conn, channel)?,
     };
     Ok(base.min(cap))
 }

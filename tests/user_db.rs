@@ -114,12 +114,9 @@ fn metadata_only_never_matches_content() {
             .unwrap()
             .is_empty()
     );
-    // default mcp = metadata, so even a Full cap sees no content
-    assert!(
-        search(&conn, "geheim", &mcp(Level::Full))
-            .unwrap()
-            .is_empty()
-    );
+    // Ruling AJ: without an override the cap governs, so a Full cap sees content
+    // even though the stored mcp default is metadata.
+    assert_eq!(search(&conn, "geheim", &mcp(Level::Full)).unwrap().len(), 1);
     set_document_access(&conn, "a1", Channel::Mcp, Some(Level::Full)).unwrap();
     let hits = search(&conn, "geheim", &mcp(Level::Full)).unwrap();
     assert_eq!(hits.len(), 1);
@@ -163,7 +160,9 @@ fn switchboard_defaults_and_effective_level() {
     assert_eq!(d.level(Channel::SemanticIndex), Level::Off);
     assert!(Level::Off < Level::Metadata && Level::Metadata < Level::Full);
     let eff = |c, cap| effective_level(&conn, "a1", c, cap).unwrap();
-    assert_eq!(eff(Channel::Mcp, Level::Full), Level::Metadata);
+    // Ruling AJ: the stored mcp default is ignored; the cap governs.
+    assert_eq!(eff(Channel::Mcp, Level::Full), Level::Full);
+    assert_eq!(eff(Channel::Mcp, Level::Metadata), Level::Metadata);
     let mut nd_ = d.clone();
     nd_.0.insert(Channel::Mcp, Level::Full);
     set_access_defaults(&conn, &nd_).unwrap();
@@ -189,7 +188,7 @@ fn switchboard_defaults_and_effective_level() {
 fn metadata_level_hit_has_no_snippet() {
     let (_d, conn) = db();
     add(&conn, "a1", "Steuerbescheid", &[], "inhalt");
-    let hits = search(&conn, "steuer", &mcp(Level::Full)).unwrap();
+    let hits = search(&conn, "steuer", &mcp(Level::Metadata)).unwrap();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].level, Level::Metadata);
     assert!(hits[0].snippet.is_none());
@@ -200,7 +199,8 @@ fn mixed_levels_merge_and_paginate() {
     let (_d, conn) = db();
     add(&conn, "a1", "alpha", &[], "alpha");
     add(&conn, "b1", "alpha", &[], "beta");
-    set_document_access(&conn, "a1", Channel::Mcp, Some(Level::Full)).unwrap();
+    // b1 is limited by an explicit per-document override; a1 follows the cap.
+    set_document_access(&conn, "b1", Channel::Mcp, Some(Level::Metadata)).unwrap();
     let mut f = mcp(Level::Full);
     let hits = search(&conn, "alpha", &f).unwrap();
     assert_eq!(hits.len(), 2);
@@ -555,4 +555,78 @@ fn hidden_from_lists_documents_whose_effective_level_is_off() {
     defaults.0.insert(Channel::Web, Level::Off);
     set_access_defaults(&conn, &defaults).unwrap();
     assert_eq!(ids(Channel::Web), ["d1", "c1", "a1"]);
+}
+
+#[test]
+fn full_text_token_sees_content_despite_metadata_default() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "Brief", &[], "das ist geheim");
+    assert_eq!(
+        get_access_defaults(&conn).unwrap().level(Channel::Mcp),
+        Level::Metadata
+    );
+    assert_eq!(
+        effective_level(&conn, "a1", Channel::Mcp, Level::Full).unwrap(),
+        Level::Full
+    );
+    let hits = search(&conn, "geheim", &mcp(Level::Full)).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].snippet.is_some());
+}
+
+#[test]
+fn per_document_override_still_limits_full_text_token() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "Brief", &[], "das ist geheim");
+    set_document_access(&conn, "a1", Channel::Mcp, Some(Level::Metadata)).unwrap();
+    assert_eq!(
+        effective_level(&conn, "a1", Channel::Mcp, Level::Full).unwrap(),
+        Level::Metadata
+    );
+    assert!(
+        search(&conn, "geheim", &mcp(Level::Full))
+            .unwrap()
+            .is_empty()
+    );
+    set_document_access(&conn, "a1", Channel::Mcp, Some(Level::Off)).unwrap();
+    assert!(list_documents(&conn, &mcp(Level::Full)).unwrap().is_empty());
+}
+
+#[test]
+fn metadata_token_never_sees_content_without_override() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "Brief", &[], "das ist geheim");
+    assert_eq!(
+        effective_level(&conn, "a1", Channel::Mcp, Level::Metadata).unwrap(),
+        Level::Metadata
+    );
+    assert!(
+        search(&conn, "geheim", &mcp(Level::Metadata))
+            .unwrap()
+            .is_empty()
+    );
+    // An override of Full cannot raise a metadata token either.
+    set_document_access(&conn, "a1", Channel::Mcp, Some(Level::Full)).unwrap();
+    assert!(
+        search(&conn, "geheim", &mcp(Level::Metadata))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn web_channel_still_uses_user_default() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "Brief", &[], "das ist geheim");
+    let mut d = get_access_defaults(&conn).unwrap();
+    d.0.insert(Channel::Web, Level::Metadata);
+    set_access_defaults(&conn, &d).unwrap();
+    assert_eq!(
+        effective_level(&conn, "a1", Channel::Web, Level::Full).unwrap(),
+        Level::Metadata
+    );
+    assert!(search(&conn, "geheim", &web()).unwrap().is_empty());
+    d.0.insert(Channel::Web, Level::Off);
+    set_access_defaults(&conn, &d).unwrap();
+    assert!(list_documents(&conn, &web()).unwrap().is_empty());
 }

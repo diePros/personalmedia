@@ -772,12 +772,13 @@ async fn access_defaults_form_roundtrip() {
     assert_eq!(resp.status(), 303);
     let d = u.with_db(|conn| get_access_defaults(conn).unwrap());
     assert_eq!(d.level(Channel::Web), Level::Metadata);
-    assert_eq!(d.level(Channel::Mcp), Level::Full);
+    // Ruling AJ: a posted mcp field is accepted but ignored; the stored value is untouched.
+    assert_eq!(d.level(Channel::Mcp), Level::Metadata);
     assert_eq!(d.level(Channel::SemanticIndex), Level::Off);
 
     let html = body_string(t.get("/settings", &c).await).await;
     assert!(html.contains("<option value=\"metadata\" selected>"));
-    assert!(html.contains("<option value=\"full\" selected>"));
+    assert!(html.contains("<option value=\"off\" selected>"));
 
     let bad = t
         .post_form(
@@ -1250,4 +1251,20 @@ async fn orphan_grant_meta_is_pruned_on_unlock() {
     assert!(ids.contains(&live));
     // The static token's meta is untouched.
     assert_eq!(ids.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_shows_mcp_explanation_not_default_row() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(
+        html.contains(
+            "AI assistants (MCP) see what each token or connected app is allowed to see."
+        )
+    );
+    assert!(html.contains("limit a specific document for every app."));
+    assert!(!html.contains("default-mcp"));
+    assert!(html.contains("id=\"default-web\""));
+    assert!(html.contains("id=\"default-semantic_index\""));
 }

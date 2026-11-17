@@ -223,9 +223,10 @@ Each user decides, per **access channel**, how much of a document that channel m
   - v1.2: `semantic_index` (whether a document's content is embedded for meaning-based search, §17a)
   - Future channels (WebDAV, sharing, external AI) are added to the same table and default to `off` until the user enables them.
 - **Levels:** `off`, `metadata` (title, tags, date, filename, type, size) and `full` (also content: extracted text, snippets, preview/download, and later semantic matches).
-- **User defaults** live in Settings, shown as one row per channel with three options. Initial defaults *(my call)*: `web = full`, `mcp = metadata`, `semantic_index = off`. Opting in to new kinds of processing is a deliberate step.
+- **User defaults** live in Settings, shown as one row per channel with three options. Initial defaults *(my call)*: `web = full`, `semantic_index = off`. There is no `mcp` default row any more (Ruling AJ below); a stored `access_defaults.mcp` value is unused. Opting in to new kinds of processing is a deliberate step.
 - **Per-document overrides** appear on the document detail page, where each channel can be `default`, `off`, `metadata` or `full`. Upload accepts the same overrides as optional fields.
-- **Effective access** for a request = `min(document level for that channel, the caller's own limit)`, where the caller's limit is the token scope for MCP and `full` for the owner's web session. Example: a `full_text` token reading a document set to `mcp = metadata` gets metadata only.
+- **Effective access** for a request = `min(base level, the caller's own limit)`, where the caller's limit is the token or app scope for MCP (`metadata_only` = `metadata`, `full_text` = `full`) and `full` for the owner's web session. The base level is the document's override if it has one, else the channel default. **Ruling AJ (channel `mcp` only):** a document without an `mcp` override has base level `full`, so the token or app scope governs; a document with an `mcp` override gets `min(override, cap)`, so explicit per-document choices still limit every token. `web` and `semantic_index` still use the user defaults. Example: a `full_text` token reading a document with no override gets full content; the same token on a document set to `mcp = metadata` gets metadata only. `semantic_search` needs effective `semantic_index = full` and effective `mcp = full`, so a `full_text` token searches by meaning every semantically indexed document without a restricting `mcp` override. Tag allow-lists are unchanged.
+- **Note (2026-11-17):** the owner changed this on 2026-11-17 (Ruling AJ). He connected claude.ai through OAuth and a `full_text` app saw only metadata because the `mcp = metadata` user default capped it. A token's or app's own permission now takes precedence over the defaults. Settings shows an explanation instead of an MCP default row, and the document page's MCP select labels the no-override option "follow app permission".
 - **Search follows the effective level per document:**
   - Documents at `metadata` match only on title, filename and tags, with no snippet.
   - Documents at `off` are invisible to that channel (list, search, get, tags).
@@ -356,6 +357,18 @@ Meaning-based search over each user's documents, exposed through MCP so that **e
 - **MCP tool:** `semantic_search { query, tags?, date_from?, date_to?, limit? ≤ 20 }` → `[{id, title, document_date, tags, score, passage}]`. `passage` is the matching chunk text, subject to the switchboard and token scope as above.
 
 ## 18. Later
+
+- **Local handwriting recognition (HTR)** *(owner request, 2026-11-17)*:
+  - **Goal:** handwritten pages become searchable without anything leaving the box. It runs in-process, CPU-only, the same way as §17a.
+  - **Candidates:** TrOCR (encoder-decoder, ONNX export) or a smaller line-level HTR model.
+  - **Requirements:**
+    - line or word segmentation first (e.g. a small layout model, or projection-profile segmentation for simple notes)
+    - German + English
+    - bounded memory in the 1.5 GiB container, lazy load/unload like the embedding engine
+  - **Process:**
+    - Run a measured spike on the N150 first, like the embedding spike: accuracy on real German handwriting samples, seconds per page, RSS. Only ship if accuracy is useful.
+    - It becomes a new switchboard channel `handwriting` (off by default) and writes `text_source = 'htr'`.
+    - It never overwrites a user- or AI-provided transcription without confirmation.
 
 - Ollama/external AI (auto-tagging, summaries) as a new switchboard channel, off by default and opted into per user and per document.
 - Sharing between users via X25519.

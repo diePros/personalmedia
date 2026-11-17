@@ -209,9 +209,12 @@ fn level_label(l: Level) -> &'static str {
     }
 }
 
+/// The user-default rows. MCP has none: a token's or app's own scope governs
+/// (Ruling AJ), so only Web and the semantic index have defaults.
 fn channel_rows(defaults: &AccessDefaults) -> Vec<ChannelRow> {
     CHANNELS
         .iter()
+        .filter(|(ch, _)| *ch != Channel::Mcp)
         .map(|(ch, label)| ChannelRow {
             name: ch.as_str(),
             label,
@@ -459,6 +462,9 @@ async fn page(
 #[derive(Deserialize)]
 struct DefaultsForm {
     web: String,
+    /// Accepted and ignored so old forms keep working (Ruling AJ).
+    #[allow(dead_code)]
+    #[serde(default)]
     mcp: String,
     semantic_index: String,
 }
@@ -469,11 +475,8 @@ async fn set_defaults(
     CurrentUser(session): CurrentUser,
     CsrfForm(form): CsrfForm<DefaultsForm>,
 ) -> Response {
-    let (Some(web), Some(mcp), Some(sem)) = (
-        Level::parse(&form.web),
-        Level::parse(&form.mcp),
-        Level::parse(&form.semantic_index),
-    ) else {
+    let (Some(web), Some(sem)) = (Level::parse(&form.web), Level::parse(&form.semantic_index))
+    else {
         return failure(
             &state,
             &session,
@@ -482,17 +485,25 @@ async fn set_defaults(
         )
         .await;
     };
-    let defaults = AccessDefaults(
-        [
-            (Channel::Web, web),
-            (Channel::Mcp, mcp),
-            (Channel::SemanticIndex, sem),
-        ]
-        .into(),
-    );
     let u = session.unlocked.clone();
     let u2 = u.clone();
-    match blocking(move || u.with_db(|c| set_access_defaults(c, &defaults))).await {
+    let saved = blocking(move || {
+        u.with_db(|c| {
+            // The stored mcp default is unused now; keep whatever is there.
+            let mcp = get_access_defaults(c)?.level(Channel::Mcp);
+            let defaults = AccessDefaults(
+                [
+                    (Channel::Web, web),
+                    (Channel::Mcp, mcp),
+                    (Channel::SemanticIndex, sem),
+                ]
+                .into(),
+            );
+            set_access_defaults(c, &defaults)
+        })
+    })
+    .await;
+    match saved {
         Ok(Ok(())) => {
             // Lowering already deleted vectors inside set_access_defaults.
             let queue = state.queue.clone();
