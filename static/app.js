@@ -242,7 +242,7 @@
   }
 
   // Bottom tab bar (shown when standalone or at phone width, see app.css): highlights the
-  // current tab and makes Search focus the documents search field.
+  // current tab and makes Search focus the search field.
   function initTabbar() {
     var bar = document.querySelector(".tabbar");
     if (!bar) {
@@ -251,10 +251,7 @@
     var tabs = bar.querySelectorAll(".tab");
     function current() {
       var path = window.location.pathname;
-      if (path === "/documents" && window.location.hash === "#q") {
-        return "/documents#q";
-      }
-      if (path === "/scan" || path === "/settings") {
+      if (path === "/scan" || path === "/settings" || path === "/search") {
         return path;
       }
       return path.indexOf("/documents") === 0 ? "/documents" : "";
@@ -280,22 +277,36 @@
       return !!q;
     }
     Array.prototype.forEach.call(tabs, function (tab) {
-      if (tab.getAttribute("href") !== "/documents#q") {
+      if (tab.getAttribute("href") !== "/search") {
         return;
       }
       tab.addEventListener("click", function (e) {
-        // Already on the documents page: no reload, just focus the field.
-        if (window.location.pathname === "/documents" && focusSearch()) {
+        // Already on the search page: no reload, just focus the field.
+        if (window.location.pathname === "/search" && focusSearch()) {
           e.preventDefault();
-          window.history.replaceState(null, "", "/documents#q");
-          mark();
         }
       });
     });
     mark();
-    if (window.location.pathname === "/documents" && window.location.hash === "#q") {
+    var box = document.getElementById("q");
+    if (window.location.pathname === "/search" && box && !box.value) {
       focusSearch();
     }
+  }
+
+  // Search page: the Best match / Newest switch only makes sense with a query.
+  function initSortSwitch() {
+    var box = document.getElementById("q");
+    var sw = document.getElementById("sort-switch");
+    if (!box || !sw) {
+      return;
+    }
+    function sync() {
+      sw.hidden = box.value.trim() === "";
+    }
+    box.addEventListener("input", sync);
+    box.addEventListener("search", sync);
+    sync();
   }
 
   function initInstallHint() {
@@ -357,15 +368,31 @@
     });
   }
 
+  // The browser's UTC offset (minutes east of UTC) for the day headings on
+  // the Documents list. Refreshed on every page load: it follows DST and travel.
+  function setTimeZoneCookie() {
+    try {
+      var secure = location.protocol === "https:" ? "; Secure" : "";
+      document.cookie =
+        "pm_tz=" +
+        -new Date().getTimezoneOffset() +
+        "; Path=/; SameSite=Lax; Max-Age=31536000" +
+        secure;
+    } catch (e) {}
+  }
+  setTimeZoneCookie();
+
   markStandalone();
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initUpload);
     document.addEventListener("DOMContentLoaded", initInstallHint);
     document.addEventListener("DOMContentLoaded", initTabbar);
+    document.addEventListener("DOMContentLoaded", initSortSwitch);
   } else {
     initUpload();
     initInstallHint();
     initTabbar();
+    initSortSwitch();
   }
 })();

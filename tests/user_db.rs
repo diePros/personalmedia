@@ -955,3 +955,29 @@ fn index_migration_v3_to_v4_keeps_data() {
     // Reopening does not migrate again.
     open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
 }
+
+#[test]
+fn search_newest_orders_by_created_at() {
+    let (_d, conn) = db();
+    // The older document is the stronger match.
+    for (id, at, text) in [
+        ("old", 100, "zebra zebra zebra"),
+        ("new", 200, "one zebra among many other filler words here"),
+    ] {
+        insert_document(&conn, &nd(id, id, &format!("{id}.pdf"), &[], at)).unwrap();
+        set_text(&conn, id, TextStatus::Done, Some(text), Some(1), 7).unwrap();
+    }
+    let ids = |f: &ListFilter| -> Vec<String> {
+        search(&conn, "zebra", f)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.doc.id)
+            .collect()
+    };
+    assert_eq!(ids(&web()), ["old", "new"]);
+    let newest = ListFilter {
+        sort_newest: true,
+        ..web()
+    };
+    assert_eq!(ids(&newest), ["new", "old"]);
+}

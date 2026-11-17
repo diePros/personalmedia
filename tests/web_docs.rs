@@ -1,5 +1,7 @@
 mod common;
 
+use axum::body::Body;
+use axum::http::{Method, header};
 use common::*;
 use personal_media::user_db::{Channel, Level, document_overrides};
 use personal_media::web::docs::content_disposition;
@@ -100,19 +102,19 @@ async fn search_partial_for_htmx() {
     )
     .await;
     wait_extracted(&t, &c, "vertrag").await;
-    let resp = t.hx_get("/documents?q=vertrag", &c).await;
+    let resp = t.hx_get("/search?q=vertrag", &c).await;
     assert_eq!(resp.status(), 200);
     let html = body_string(resp).await;
     assert!(!html.contains("<html"));
     assert!(html.contains("Notiz"));
-    let full = body_string(t.get("/documents?q=vertrag", &c).await).await;
+    let full = body_string(t.get("/search?q=vertrag", &c).await).await;
     assert!(full.contains("<html"));
     assert!(full.contains("hx-push-url=\"false\""));
 }
 
 async fn wait_extracted(t: &TestApp, c: &Client, q: &str) {
     for _ in 0..100 {
-        let html = body_string(t.hx_get(&format!("/documents?q={q}"), c).await).await;
+        let html = body_string(t.hx_get(&format!("/search?q={q}"), c).await).await;
         if html.contains("doc-item") {
             return;
         }
@@ -135,7 +137,7 @@ async fn snippet_is_escaped() {
     )
     .await;
     wait_extracted(&t, &c, "vertrag").await;
-    let html = body_string(t.hx_get("/documents?q=vertrag", &c).await).await;
+    let html = body_string(t.hx_get("/search?q=vertrag", &c).await).await;
     assert!(html.contains("&lt;script&gt;"), "{html}");
     assert!(html.contains("<mark>Vertrag</mark>"), "{html}");
     assert!(!html.contains("<script>"));
@@ -481,7 +483,7 @@ async fn web_off_document_hidden_from_list_search_and_detail() {
             .contains("Geheimtitel")
     );
     assert!(
-        !body_string(t.get("/documents?q=vertrag", &c).await)
+        !body_string(t.get("/search?q=vertrag", &c).await)
             .await
             .contains("Geheimtitel")
     );
@@ -643,7 +645,7 @@ async fn end_to_end_ocr_search() {
     upload_id(&t, &c, "scanned.pdf", "application/pdf", &bytes).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
-        let html = body_string(t.hx_get("/documents?q=versicherungsnummer", &c).await).await;
+        let html = body_string(t.hx_get("/search?q=versicherungsnummer", &c).await).await;
         if html.contains("doc-item") {
             return;
         }
@@ -755,7 +757,7 @@ async fn notes_edit_roundtrip_web() {
     assert!(html.contains("recognised by OCR") || html.contains("Text"));
 
     // Searchable like the title.
-    let list = body_string(t.get("/documents?q=tiramisu", &c).await).await;
+    let list = body_string(t.get("/search?q=tiramisu", &c).await).await;
     assert!(list.contains("Handwritten"), "{list}");
 
     // Cleared again.
@@ -772,7 +774,7 @@ async fn notes_edit_roundtrip_web() {
         )
         .await;
     assert_eq!(resp.status(), 303);
-    let list = body_string(t.get("/documents?q=tiramisu", &c).await).await;
+    let list = body_string(t.get("/search?q=tiramisu", &c).await).await;
     assert!(!list.contains("Handwritten"));
 
     // Over the cap.
@@ -812,17 +814,20 @@ async fn needs_transcription_filter_and_pagination_url() {
     upload_id(&t, &c, "b.bin", "application/octet-stream", b"other").await;
     let hw_id = hw["id"].as_str().unwrap();
 
-    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    let html = body_string(t.get("/search?needs_transcription=1", &c).await).await;
     assert_eq!(html.matches("doc-item").count(), 1, "{html}");
     assert!(checkbox_checked(&html));
     let all = body_string(t.get("/documents", &c).await).await;
     assert_eq!(all.matches("doc-item").count(), 2);
-    assert!(!checkbox_checked(&all));
+    // The filter lives on /search only; the list has no such control.
+    assert!(!all.contains("name=\"needs_transcription\""));
+    let search = body_string(t.get("/search", &c).await).await;
+    assert!(!checkbox_checked(&search));
 
     let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
     u.with_db(|conn| personal_media::user_db::set_transcription(conn, hw_id, "text", 5))
         .unwrap();
-    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    let html = body_string(t.get("/search?needs_transcription=1", &c).await).await;
     assert_eq!(html.matches("doc-item").count(), 0);
 }
 
@@ -849,20 +854,51 @@ async fn needs_transcription_kept_in_pagination() {
         )
         .await;
     }
-    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    let html = body_string(t.get("/search?needs_transcription=1", &c).await).await;
     assert_eq!(html.matches("doc-item").count(), 50);
     assert!(
-        html.contains("href=\"/documents?needs_transcription=1&#38;page=2\""),
+        html.contains("href=\"/search?needs_transcription=1&#38;page=2\""),
         "{html}"
     );
     // Page 2 holds the one remaining handwritten document, not plain ones.
-    let html = body_string(t.get("/documents?needs_transcription=1&page=2", &c).await).await;
+    let html = body_string(t.get("/search?needs_transcription=1&page=2", &c).await).await;
     assert_eq!(html.matches("doc-item").count(), 1);
     assert!(!html.contains("rel=\"next\""));
     // Any other value is off and not forwarded.
-    let html = body_string(t.get("/documents?needs_transcription=yes", &c).await).await;
+    // (/search lists nothing without a query or filter, so a tag filter stands in
+    // for the old unfiltered list.)
+    let html = body_string(
+        t.get("/search?needs_transcription=yes&tag=handwritten", &c)
+            .await,
+    )
+    .await;
     assert!(!checkbox_checked(&html));
-    assert!(html.contains("href=\"/documents?page=2\""));
+    assert!(
+        html.contains("href=\"/search?tag=handwritten&#38;page=2\""),
+        "{html}"
+    );
+    // "yes" is off, not on: a plain (non-handwritten) document still matches.
+    upload(
+        &t,
+        &c,
+        "p.bin",
+        "application/octet-stream",
+        b"plain tagged",
+        &[("tags", "plainone")],
+    )
+    .await;
+    let html = body_string(
+        t.get("/search?needs_transcription=yes&tag=plainone", &c)
+            .await,
+    )
+    .await;
+    assert_eq!(html.matches("doc-item").count(), 1, "{html}");
+    let html = body_string(
+        t.get("/search?needs_transcription=1&tag=plainone", &c)
+            .await,
+    )
+    .await;
+    assert_eq!(html.matches("doc-item").count(), 0, "{html}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -881,10 +917,323 @@ async fn needs_transcription_with_words_search() {
     upload_id(&t, &c, "plain.txt", "text/plain", b"zebra herd").await;
     wait_extracted(&t, &c, "herd").await;
     wait_extracted(&t, &c, "stripes").await;
-    let both = body_string(t.get("/documents?q=zebra", &c).await).await;
+    let both = body_string(t.get("/search?q=zebra", &c).await).await;
     assert_eq!(both.matches("doc-item").count(), 2, "{both}");
-    let one = body_string(t.get("/documents?q=zebra&needs_transcription=1", &c).await).await;
+    let one = body_string(t.get("/search?q=zebra&needs_transcription=1", &c).await).await;
     assert_eq!(one.matches("doc-item").count(), 1, "{one}");
     assert!(one.contains(">handwritten<"));
     assert!(!one.contains("herd"));
+}
+
+async fn upload_at(t: &TestApp, c: &Client, name: &str, body: &[u8], tags: &str) -> String {
+    let v = upload(
+        t,
+        c,
+        name,
+        "text/plain",
+        body,
+        &[("title", name), ("tags", tags), ("date", "2024-05-05")],
+    )
+    .await;
+    v["id"].as_str().unwrap().to_owned()
+}
+
+fn set_created(t: &TestApp, c: &Client, id: &str, ts: i64) {
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    u.with_db(|conn| {
+        conn.execute(
+            "UPDATE documents SET created_at = ?1 WHERE id = ?2",
+            (ts, id),
+        )?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn search_page_shows_form_and_hint() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let html = body_string(t.get("/search", &c).await).await;
+    assert!(html.contains("<title>Search"), "{html}");
+    assert!(html.contains("role=\"search\""));
+    assert!(html.contains("id=\"q\""));
+    assert!(html.contains("Search your documents by words or meaning."));
+    assert!(!html.contains("doc-item"));
+    assert!(html.contains("<details"));
+    assert!(!html.contains("<details class=\"filters-box\" open"));
+    // The hint is also what a live (htmx) request without input gets.
+    let part = body_string(t.hx_get("/search", &c).await).await;
+    assert!(part.contains("Search your documents by words or meaning."));
+    assert!(!part.contains("<html"));
+    // Header nav has a Search link.
+    assert!(html.contains("<a href=\"/search\">Search</a>"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_words_best_match_then_newest() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    // The older document is the stronger match (term repeated, short text).
+    let old = upload_at(&t, &c, "older.txt", b"zebra zebra zebra", "").await;
+    let new = upload_at(
+        &t,
+        &c,
+        "newer.txt",
+        b"one zebra among many other words that dilute the match here",
+        "",
+    )
+    .await;
+    wait_extracted(&t, &c, "zebra").await;
+    set_created(&t, &c, &old, 1_000_000);
+    set_created(&t, &c, &new, 2_000_000);
+    for url in ["/search?q=zebra", "/search?q=zebra&sort=best"] {
+        let html = body_string(t.get(url, &c).await).await;
+        assert!(
+            html.find(&format!("/documents/{old}")).unwrap()
+                < html.find(&format!("/documents/{new}")).unwrap(),
+            "{url}: {html}"
+        );
+    }
+    let html = body_string(t.get("/search?q=zebra&sort=newest", &c).await).await;
+    assert!(
+        html.find(&format!("/documents/{new}")).unwrap()
+            < html.find(&format!("/documents/{old}")).unwrap(),
+        "{html}"
+    );
+    assert!(
+        html.contains("name=\"sort\" value=\"newest\" checked"),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn search_filters_without_query_list_newest_and_hide_sort() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let a = upload_at(&t, &c, "a.txt", b"aaa", "red").await;
+    let b = upload_at(&t, &c, "b.txt", b"bbb", "red").await;
+    upload_at(&t, &c, "c.txt", b"ccc", "blue").await;
+    set_created(&t, &c, &a, 1_000_000);
+    set_created(&t, &c, &b, 2_000_000);
+    let html = body_string(t.get("/search?tag=red", &c).await).await;
+    assert_eq!(html.matches("doc-item").count(), 2, "{html}");
+    assert!(
+        html.find(&format!("/documents/{b}")).unwrap()
+            < html.find(&format!("/documents/{a}")).unwrap()
+    );
+    // The switch is in the markup but hidden: nothing to rank without a query.
+    assert!(
+        html.contains("<fieldset class=\"mode\" id=\"sort-switch\" hidden>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<details class=\"filters-box\" open"),
+        "{html}"
+    );
+    // With a query the switch is not hidden.
+    let html = body_string(t.get("/search?q=aaa&tag=red", &c).await).await;
+    assert!(
+        html.contains("<fieldset class=\"mode\" id=\"sort-switch\">"),
+        "{html}"
+    );
+    // The Meaning radio survives an empty query.
+    let html = body_string(t.get("/search?mode=meaning", &c).await).await;
+    assert!(html.contains("value=\"meaning\" checked"), "{html}");
+    // app.js shows the switch as soon as a query is typed.
+    assert!(include_str!("../static/app.js").contains("sort-switch"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn search_htmx_returns_partial() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    upload_at(&t, &c, "n.txt", b"Vertrag mit Inhalt", "").await;
+    wait_extracted(&t, &c, "vertrag").await;
+    let resp = t.hx_get("/search?q=vertrag&sort=newest", &c).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("vary").unwrap(), "HX-Request");
+    let html = body_string(resp).await;
+    assert!(!html.contains("<html"));
+    assert!(!html.contains("<form"));
+    assert!(html.contains("doc-item"));
+}
+
+#[tokio::test]
+async fn old_documents_search_url_redirects() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let resp = t.get("/documents?q=x&tag=y", &c).await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(resp.headers().get("location").unwrap(), "/search?q=x&tag=y");
+    for qs in [
+        "tag=a",
+        "from=2020-01-01",
+        "to=2020-01-01",
+        "needs_transcription=1",
+        "mode=meaning&q=z",
+        "sort=newest",
+    ] {
+        let resp = t.get(&format!("/documents?{qs}"), &c).await;
+        assert_eq!(resp.status(), 303, "{qs}");
+        assert_eq!(
+            resp.headers().get("location").unwrap().to_str().unwrap(),
+            format!("/search?{qs}")
+        );
+    }
+    // Plain and paged lists are not redirected.
+    assert_eq!(t.get("/documents", &c).await.status(), 200);
+    assert_eq!(t.get("/documents?page=2", &c).await.status(), 200);
+}
+
+#[tokio::test]
+async fn search_pagination_keeps_sort_and_filters() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    for i in 0..51 {
+        upload_at(&t, &c, "f.txt", format!("doc {i}").as_bytes(), "red").await;
+    }
+    let html = body_string(
+        t.get(
+            "/search?tag=red&from=2000-01-01&to=2100-01-01&sort=newest",
+            &c,
+        )
+        .await,
+    )
+    .await;
+    let next = html
+        .split("href=\"")
+        .filter(|s| s.contains("rel=\"next\""))
+        .map(|s| s.split('"').next().unwrap().to_owned())
+        .next()
+        .expect("next link");
+    assert!(next.starts_with("/search?"), "{next}");
+    for p in [
+        "tag=red",
+        "from=2000-01-01",
+        "to=2100-01-01",
+        "sort=newest",
+        "page=2",
+    ] {
+        assert!(next.contains(p), "{p} missing from {next}");
+    }
+}
+
+#[tokio::test]
+async fn documents_page_has_no_search_form() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let html = body_string(t.get("/documents", &c).await).await;
+    assert!(!html.contains("role=\"search\""), "{html}");
+    assert!(!html.contains("id=\"q\""), "{html}");
+    assert!(!html.contains("name=\"tag\""), "{html}");
+    assert!(html.contains("id=\"dropzone\""), "{html}");
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test]
+async fn documents_list_grouped_by_day() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let fresh = upload_at(&t, &c, "fresh.txt", b"fresh", "").await;
+    let old = upload_at(&t, &c, "old.txt", b"old", "").await;
+    // Midnight-relative, so the groups do not depend on the time of day.
+    let now = now_secs();
+    let midnight = now - now.rem_euclid(86_400);
+    set_created(&t, &c, &fresh, midnight);
+    let old_ts = midnight - 40 * 86_400;
+    set_created(&t, &c, &old, old_ts);
+    let html = body_string(t.get("/documents", &c).await).await;
+    let old_month = {
+        let d = time::OffsetDateTime::from_unix_timestamp(old_ts).unwrap();
+        format!("{} {}", d.month(), d.year())
+    };
+    let today = html
+        .find("<h2 class=\"day-group\">Today</h2>")
+        .expect(&html);
+    let month = html
+        .find(&format!("<h2 class=\"day-group\">{old_month}</h2>"))
+        .expect(&html);
+    assert!(today < month, "{html}");
+    assert!(
+        today < html.find(&format!("/documents/{fresh}")).unwrap()
+            && html.find(&format!("/documents/{fresh}")).unwrap() < month
+            && month < html.find(&format!("/documents/{old}")).unwrap(),
+        "{html}"
+    );
+    // One heading per group, not per row.
+    assert_eq!(html.matches("day-group").count(), 2, "{html}");
+    // Search results stay ungrouped.
+    let s = body_string(t.get("/search?tag=", &c).await).await;
+    assert!(!s.contains("day-group"), "{s}");
+}
+
+#[tokio::test]
+async fn day_groups_ignore_bad_tz_cookie() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_at(&t, &c, "late.txt", b"late", "").await;
+    // Half an hour either side of UTC midnight, with a +-60 minute cookie that
+    // moves it across the boundary: every case is far from the real midnights.
+    let now = now_secs();
+    let midnight = now - now.rem_euclid(86_400);
+    let (ts, cookie, utc_label, local_label) = if now.rem_euclid(86_400) < 23 * 3600 {
+        (midnight - 1_800, "pm_tz=60", "Yesterday", "Today")
+    } else {
+        (midnight + 1_800, "pm_tz=-60", "Today", "Yesterday")
+    };
+    set_created(&t, &c, &id, ts);
+    let get = |cookie: Option<&'static str>| {
+        let t = &t;
+        let c = &c;
+        async move {
+            let mut value = format!("__Host-pm_session={}", c.cookie);
+            if let Some(extra) = cookie {
+                value = format!("{value}; {extra}");
+            }
+            let req = builder(Method::GET, "/documents", c)
+                .header(header::COOKIE, value)
+                .body(Body::empty())
+                .unwrap();
+            let resp = t.request(req).await;
+            assert_eq!(resp.status(), 200, "{cookie:?}");
+            body_string(resp).await
+        }
+    };
+    let none = get(None).await;
+    assert!(none.contains(&format!(">{utc_label}</h2>")), "{none}");
+    for bad in ["pm_tz=abc", "pm_tz=999999"] {
+        let html = get(Some(bad)).await;
+        assert!(
+            html.contains(&format!(">{utc_label}</h2>")),
+            "{bad}: {html}"
+        );
+        let heading = |h: &str| h[h.find("<h2").unwrap()..h.find("</h2>").unwrap()].to_owned();
+        assert_eq!(heading(&html), heading(&none), "{bad}");
+    }
+    let html = get(Some(cookie)).await;
+    assert!(html.contains(&format!(">{local_label}</h2>")), "{html}");
+}
+
+#[tokio::test]
+async fn day_groups_use_separate_lists_and_search_has_one() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let a = upload_at(&t, &c, "a.txt", b"aaa", "red").await;
+    let b = upload_at(&t, &c, "b.txt", b"bbb", "red").await;
+    let now = now_secs();
+    let midnight = now - now.rem_euclid(86_400);
+    set_created(&t, &c, &a, midnight);
+    set_created(&t, &c, &b, midnight - 40 * 86_400);
+    let html = body_string(t.get("/documents", &c).await).await;
+    assert_eq!(html.matches("<ul class=\"doc-list\">").count(), 2, "{html}");
+    assert!(!html.contains("<li class=\"day-heading"), "{html}");
+    let s = body_string(t.get("/search?tag=red", &c).await).await;
+    assert_eq!(s.matches("<ul class=\"doc-list\">").count(), 1, "{s}");
 }

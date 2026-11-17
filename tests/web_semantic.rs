@@ -1,4 +1,4 @@
-//! Web search by meaning (`/documents?mode=meaning`). Tests that run the real model need it present
+//! Web search by meaning (`/search?mode=meaning`). Tests that run the real model need it present
 //! (set `PM_TEST_MODELS_DIR`) and print `SKIP` otherwise.
 
 mod common;
@@ -151,7 +151,7 @@ impl Fx {
     async fn search(&self, params: &str) -> (u16, String) {
         let resp = self
             .t
-            .hx_get(&format!("/documents?mode=meaning&{params}"), &self.c)
+            .hx_get(&format!("/search?mode=meaning&{params}"), &self.c)
             .await;
         (resp.status().as_u16(), body_string(resp).await)
     }
@@ -189,9 +189,7 @@ async fn web_semantic_search_finds_cross_language_match() {
         "{html}"
     );
     // The page works without htmx too.
-    let resp =
-        f.t.get("/documents?mode=meaning&q=cat+on+couch", &f.c)
-            .await;
+    let resp = f.t.get("/search?mode=meaning&q=cat+on+couch", &f.c).await;
     let full = body_string(resp).await;
     assert!(
         full.contains("<title>") && full.contains("Die Katze"),
@@ -229,7 +227,7 @@ async fn web_semantic_search_without_model_shows_hint() {
     assert!(html.contains(raw), "{html}");
     assert!(!html.contains("<html"), "partial only: {html}");
     // Full page, as without JS.
-    let resp = f.t.get("/documents?mode=meaning&q=cat", &f.c).await;
+    let resp = f.t.get("/search?mode=meaning&q=cat", &f.c).await;
     assert!(body_string(resp).await.contains(raw));
 }
 
@@ -256,7 +254,7 @@ async fn web_semantic_concurrent_query_gets_429() {
     assert_eq!(status, 429, "{html}");
     assert!(html.contains("already running"), "{html}");
     // Words search is unaffected.
-    let resp = f.t.hx_get("/documents?q=cat", &f.c).await;
+    let resp = f.t.hx_get("/search?q=cat", &f.c).await;
     assert_eq!(resp.status(), 200);
     drop(_slot);
     let (status, _) = f.search("q=cat").await;
@@ -316,7 +314,7 @@ async fn web_semantic_query_not_in_access_log() {
     assert!(!out.contains("meaning"), "{out}");
     assert!(
         out.lines()
-            .any(|l| l.contains("path=\"/documents\"") && l.contains("status=200")),
+            .any(|l| l.contains("path=\"/search\"") && l.contains("status=200")),
         "no access log line: {out}"
     );
 }
@@ -324,7 +322,7 @@ async fn web_semantic_query_not_in_access_log() {
 #[tokio::test(flavor = "multi_thread")]
 async fn meaning_toggle_rendered() {
     let f = Fx::new(None);
-    let html = body_string(f.t.get("/documents", &f.c).await).await;
+    let html = body_string(f.t.get("/search", &f.c).await).await;
     assert!(
         html.contains("name=\"mode\" value=\"words\" checked"),
         "{html}"
@@ -338,7 +336,7 @@ async fn meaning_toggle_rendered() {
 #[tokio::test(flavor = "multi_thread")]
 async fn meaning_form_replaces_in_flight_requests() {
     let f = Fx::new(None);
-    let html = body_string(f.t.get("/documents", &f.c).await).await;
+    let html = body_string(f.t.get("/search", &f.c).await).await;
     let form = &html[html.find("<form class=\"search\"").unwrap()..];
     let form = &form[..form.find('>').unwrap()];
     assert!(form.contains("hx-sync=\"this:replace\""), "{form}");

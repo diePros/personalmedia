@@ -20,11 +20,11 @@ use askama::Template;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{
-    ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query, Request,
-    State,
+    ConnectInfo, DefaultBodyLimit, FromRequest, FromRequestParts, Multipart, Path, Query, RawQuery,
+    Request, State,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
@@ -68,6 +68,7 @@ pub fn routes(state: &AppState) -> Router<AppState> {
     let limit = state.cfg.max_upload_bytes as usize + BODY_SLACK;
     Router::new()
         .route("/documents", get(list_page))
+        .route("/search", get(search_page))
         .route("/documents/{id}", get(detail_page).post(edit))
         .route("/documents/{id}/raw", get(raw))
         .route("/documents/{id}/download", get(download))
@@ -498,6 +499,38 @@ struct ListQuery {
     page: Option<String>,
     /// `words` (default) or `meaning`.
     mode: Option<String>,
+    /// `best` (default) or `newest`.
+    sort: Option<String>,
+}
+
+impl ListQuery {
+    fn newest(&self) -> bool {
+        non_empty(&self.sort).is_some_and(|v| v == "newest")
+    }
+
+    /// Any search text or filter: what `/search` needs to show a list.
+    fn is_active(&self) -> bool {
+        non_empty(&self.q).is_some()
+            || non_empty(&self.tag).is_some()
+            || non_empty(&self.from).is_some()
+            || non_empty(&self.to).is_some()
+            || needs_transcription_on(self)
+    }
+
+    /// Whether the old `/documents?...` search URL is being used.
+    fn has_search_params(&self) -> bool {
+        [
+            &self.q,
+            &self.tag,
+            &self.from,
+            &self.to,
+            &self.needs_transcription,
+            &self.mode,
+            &self.sort,
+        ]
+        .iter()
+        .any(|v| v.is_some())
+    }
 }
 
 fn non_empty(s: &Option<String>) -> Option<String> {
@@ -561,6 +594,10 @@ struct Row {
     metadata_only: bool,
     /// Search by meaning only: the relative match, 0-100.
     match_pct: Option<u32>,
+    created_at: i64,
+    /// The day heading shown before this row (the Documents list only: set on
+    /// the first row of each group).
+    heading: Option<String>,
 }
 
 struct ResultsView {
@@ -571,6 +608,31 @@ struct ResultsView {
     page_no: u32,
     prev_url: Option<String>,
     next_url: Option<String>,
+}
+
+/// Consecutive rows under one day heading (`None`: ungrouped results).
+struct Group<'a> {
+    heading: Option<&'a str>,
+    rows: &'a [Row],
+}
+
+impl ResultsView {
+    /// The rows split into runs, one per heading; each starts at a row that
+    /// carries a heading. Without headings, a single group.
+    fn groups(&self) -> Vec<Group<'_>> {
+        let mut groups: Vec<Group<'_>> = Vec::new();
+        let mut start = 0;
+        for i in 1..=self.rows.len() {
+            if i == self.rows.len() || self.rows[i].heading.is_some() {
+                groups.push(Group {
+                    heading: self.rows[start].heading.as_deref(),
+                    rows: &self.rows[start..i],
+                });
+                start = i;
+            }
+        }
+        groups
+    }
 }
 
 #[derive(Template)]
@@ -584,6 +646,13 @@ struct ResultsPartial {
 struct DocumentsPage {
     page: Page,
     results: ResultsView,
+}
+
+#[derive(Template)]
+#[template(path = "search.html")]
+struct SearchPage {
+    page: Page,
+    results: ResultsView,
     tags: Vec<String>,
     q: String,
     tag: String,
@@ -591,8 +660,13 @@ struct DocumentsPage {
     to: String,
     needs_transcription: bool,
     meaning: bool,
+    newest: bool,
+    /// The Best match / Newest switch: only meaningful with a query.
+    show_sort: bool,
+    filters_open: bool,
 }
 
+const SEARCH_HINT: &str = "Search your documents by words or meaning.";
 const MEANING_NO_MODEL: &str = "Search by meaning isn't available yet. Turn on the semantic index in Settings → Access defaults (or per document); the model downloads on first indexing.";
 const MEANING_NO_INDEX: &str = "No documents are indexed for meaning search yet.";
 const MEANING_NO_MATCH: &str = "No matches for these filters.";
@@ -615,7 +689,7 @@ fn needs_transcription_on(q: &ListQuery) -> bool {
     non_empty(&q.needs_transcription).is_some_and(|v| v == "1")
 }
 
-fn page_url(q: &ListQuery, page: u32) -> String {
+fn page_url(base: &str, q: &ListQuery, page: u32) -> String {
     let mut pairs: Vec<(&str, String)> = Vec::new();
     for (k, v) in [
         ("q", &q.q),
@@ -630,9 +704,12 @@ fn page_url(q: &ListQuery, page: u32) -> String {
     if needs_transcription_on(q) {
         pairs.push(("needs_transcription", "1".into()));
     }
+    if base == "/search" && q.newest() {
+        pairs.push(("sort", "newest".into()));
+    }
     pairs.push(("page", page.to_string()));
     format!(
-        "/documents?{}",
+        "{base}?{}",
         serde_urlencoded::to_string(&pairs).unwrap_or_default()
     )
 }
@@ -726,12 +803,29 @@ async fn meaning_results(
     Ok(results)
 }
 
-async fn list_page(
-    State(state): State<AppState>,
-    CurrentUser(session): CurrentUser,
-    headers: HeaderMap,
-    Query(query): Query<ListQuery>,
-) -> Response {
+#[derive(Clone, Copy, PartialEq)]
+enum Surface {
+    Documents,
+    Search,
+}
+
+impl Surface {
+    fn base(self) -> &'static str {
+        match self {
+            Surface::Documents => "/documents",
+            Surface::Search => "/search",
+        }
+    }
+}
+
+/// Query params to a filter and a results view; shared by `/documents` and
+/// `/search`. `Err` is a finished response (busy slot, database error).
+async fn run_query(
+    state: &AppState,
+    session: &super::session::Session,
+    query: &ListQuery,
+    surface: Surface,
+) -> Result<(ResultsView, Vec<String>), Response> {
     let page_no = query
         .page
         .as_deref()
@@ -744,11 +838,14 @@ async fn list_page(
     filter.tags_all = non_empty(&query.tag).into_iter().collect();
     filter.date_from = non_empty(&query.from);
     filter.date_to = non_empty(&query.to);
-    filter.needs_transcription = needs_transcription_on(&query);
+    filter.needs_transcription = needs_transcription_on(query);
+    filter.sort_newest = query.newest();
     filter.limit = PAGE_SIZE + 1; // one extra row tells whether there is a next page
     filter.offset = (page_no - 1) * PAGE_SIZE;
 
     let tag_filter = web_filter();
+    // Nothing to search for: the Search page shows only its hint.
+    let idle = surface == Surface::Search && !query.is_active();
     let meaning = q.is_some() && query.mode.as_deref() == Some("meaning");
     let mut meaning_view: Option<ResultsView> = None;
     if meaning {
@@ -764,23 +861,28 @@ async fn list_page(
             };
             let mut resp = render(&ResultsPartial { results });
             *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            return resp;
+            return Err(resp);
         };
-        match meaning_results(
-            &state,
-            &session,
+        let mut view = meaning_results(
+            state,
+            session,
             filter.clone(),
             q.clone().unwrap_or_default(),
         )
-        .await
-        {
-            Ok(v) => meaning_view = Some(v),
-            Err(r) => return r,
+        .await?;
+        if query.newest() {
+            view.rows.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
         }
+        meaning_view = Some(view);
     }
     let search_text = if meaning { None } else { q.clone() };
     let loaded = db(&session.unlocked, move |c| {
         let rows: anyhow::Result<Vec<Row>> = match &search_text {
+            _ if idle => Ok(vec![]),
             Some(text) => search(c, text, &filter).map(|hits| {
                 hits.into_iter()
                     .map(|h| Row {
@@ -793,43 +895,103 @@ async fn list_page(
             None if meaning => Ok(vec![]),
             None => list_documents(c, &filter).map(|d| d.into_iter().map(row_of).collect()),
         };
-        let tags = list_tags_visible(c, &tag_filter);
+        // Only the Search page has a tag filter.
+        let tags = if surface == Surface::Search {
+            list_tags_visible(c, &tag_filter)
+        } else {
+            Ok(vec![])
+        };
         rows.and_then(|r| tags.map(|t| (r, t)))
     })
     .await;
     let (mut rows, tags) = match loaded {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) => return internal(e),
-        Err(r) => return r,
+        Ok(Err(e)) => return Err(internal(e)),
+        Err(r) => return Err(r),
     };
     let has_next = rows.len() > PAGE_SIZE as usize;
     rows.truncate(PAGE_SIZE as usize);
+    let base = surface.base();
     let results = meaning_view.unwrap_or_else(|| ResultsView {
-        notice: None,
+        notice: idle.then_some(SEARCH_HINT),
         rows,
         searching: q.is_some(),
         page_no,
-        prev_url: (page_no > 1).then(|| page_url(&query, page_no - 1)),
-        next_url: has_next.then(|| page_url(&query, page_no + 1)),
+        prev_url: (page_no > 1).then(|| page_url(base, query, page_no - 1)),
+        next_url: has_next.then(|| page_url(base, query, page_no + 1)),
     });
-    let mut resp = if is_htmx(&headers) {
+    Ok((results, tags.into_iter().map(|(_, n)| n).collect()))
+}
+
+fn vary_htmx(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("HX-Request"));
+    resp
+}
+
+async fn list_page(
+    State(state): State<AppState>,
+    CurrentUser(session): CurrentUser,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    // Old bookmarks: search and filters moved to /search.
+    if query.has_search_params() {
+        let to = format!("/search?{}", raw.unwrap_or_default());
+        return Redirect::to(&to).into_response();
+    }
+    let (mut results, _tags) = match run_query(&state, &session, &query, Surface::Documents).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    add_day_headings(&mut results.rows, now(), tz_offset_from(&headers));
+    vary_htmx(if is_htmx(&headers) {
         render(&ResultsPartial { results })
     } else {
         render(&DocumentsPage {
             page: Page::for_session(&session),
             results,
-            tags: tags.into_iter().map(|(_, n)| n).collect(),
-            q: q.unwrap_or_default(),
-            tag: non_empty(&query.tag).unwrap_or_default(),
-            from: non_empty(&query.from).unwrap_or_default(),
-            to: non_empty(&query.to).unwrap_or_default(),
-            needs_transcription: needs_transcription_on(&query),
-            meaning: query.mode.as_deref() == Some("meaning"),
         })
+    })
+}
+
+async fn search_page(
+    State(state): State<AppState>,
+    CurrentUser(session): CurrentUser,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let (results, tags) = match run_query(&state, &session, &query, Surface::Search).await {
+        Ok(v) => v,
+        Err(r) => return r,
     };
-    resp.headers_mut()
-        .insert(header::VARY, HeaderValue::from_static("HX-Request"));
-    resp
+    let q = non_empty(&query.q).unwrap_or_default();
+    let tag = non_empty(&query.tag).unwrap_or_default();
+    let from = non_empty(&query.from).unwrap_or_default();
+    let to = non_empty(&query.to).unwrap_or_default();
+    let needs_transcription = needs_transcription_on(&query);
+    vary_htmx(if is_htmx(&headers) {
+        render(&ResultsPartial { results })
+    } else {
+        render(&SearchPage {
+            page: Page::for_session(&session),
+            results,
+            tags,
+            filters_open: !tag.is_empty()
+                || !from.is_empty()
+                || !to.is_empty()
+                || needs_transcription,
+            show_sort: !q.is_empty(),
+            newest: query.newest(),
+            meaning: query.mode.as_deref() == Some("meaning"),
+            q,
+            tag,
+            from,
+            to,
+            needs_transcription,
+        })
+    })
 }
 
 fn row_of(d: Document) -> Row {
@@ -841,6 +1003,57 @@ fn row_of(d: Document) -> Row {
         snippet: None,
         metadata_only: false,
         match_pct: None,
+        created_at: d.created_at,
+        heading: None,
+    }
+}
+
+/// The browser's UTC offset in minutes east of UTC, from the `pm_tz` cookie.
+/// Anything that is not an integer within +-840 (UTC+14 / UTC-14 and a bit
+/// more) counts as UTC. On the first visit the page renders in UTC: app.js sets
+/// the cookie only after that page has loaded.
+fn tz_offset_from(headers: &HeaderMap) -> i32 {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|kv| kv.trim().strip_prefix("pm_tz="))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|m| (-840..=840).contains(m))
+        .unwrap_or(0)
+}
+
+/// The Documents list heading for a document created at `created_at`, in the
+/// viewer's local days (`tz_offset_min`: minutes east of UTC): `Today`,
+/// `Yesterday`, `This week`, then `<Month> <YYYY>`. `This week` means the
+/// last 7 local days (today included) minus today and yesterday, so 2 to 6
+/// days back. A date in the future counts as today.
+fn day_group(created_at: i64, now: i64, tz_offset_min: i32) -> String {
+    let shift = i64::from(tz_offset_min) * 60;
+    let day = |ts: i64| (ts + shift).div_euclid(86_400);
+    match day(now) - day(created_at) {
+        ..=0 => "Today".to_owned(),
+        1 => "Yesterday".to_owned(),
+        2..=6 => "This week".to_owned(),
+        _ => {
+            let d = time::OffsetDateTime::from_unix_timestamp(created_at + shift)
+                .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+            format!("{} {}", d.month(), d.year())
+        }
+    }
+}
+
+/// Mark the first row of each run of equal headings. Per page of results, so
+/// a heading can repeat on the next page.
+fn add_day_headings(rows: &mut [Row], now: i64, tz_offset_min: i32) {
+    let mut last: Option<String> = None;
+    for row in rows {
+        let g = day_group(row.created_at, now, tz_offset_min);
+        if last.as_deref() != Some(&g) {
+            row.heading = Some(g.clone());
+            last = Some(g);
+        }
     }
 }
 
@@ -1299,6 +1512,59 @@ async fn set_access(
 #[cfg(test)]
 mod meaning_tests {
     use super::*;
+
+    /// 2026-11-17 12:28:00 UTC.
+    const NOW: i64 = 1_794_918_480;
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn day_group_labels() {
+        // Offset +60: local time is 13:28 on 2026-11-17.
+        assert_eq!(day_group(NOW, NOW, 60), "Today");
+        assert_eq!(day_group(NOW - 3600, NOW, 60), "Today");
+        assert_eq!(day_group(NOW - DAY, NOW, 60), "Yesterday");
+        assert_eq!(day_group(NOW - 3 * DAY, NOW, 60), "This week");
+        // "This week" is 2 to 6 local days back, today and yesterday excluded.
+        assert_eq!(day_group(NOW - 2 * DAY, NOW, 60), "This week");
+        assert_eq!(day_group(NOW - 6 * DAY, NOW, 60), "This week");
+        assert_eq!(day_group(NOW - 7 * DAY, NOW, 60), "November 2026");
+        assert_eq!(day_group(NOW - 40 * DAY, NOW, 60), "October 2026");
+        // A future date is today.
+        assert_eq!(day_group(NOW + 5 * DAY, NOW, 60), "Today");
+    }
+
+    #[test]
+    fn day_group_uses_the_local_day() {
+        // 23:30 UTC on the 16th is 01:30 on the 17th at +120: Today, and the
+        // UTC reading (Yesterday) differs.
+        let ts = NOW - 13 * 3600; // 2026-11-16 23:28 UTC
+        assert_eq!(day_group(ts, NOW, 0), "Yesterday");
+        assert_eq!(day_group(ts, NOW, 120), "Today");
+        // Month boundary in local time: 2026-11-30 23:30 UTC is 1 December at +60.
+        let nov30 = 1_796_081_400; // 2026-11-30 23:30 UTC
+        let later = nov30 + 20 * DAY;
+        assert_eq!(day_group(nov30, later, 0), "November 2026");
+        assert_eq!(day_group(nov30, later, 60), "December 2026");
+    }
+
+    #[test]
+    fn tz_cookie_parsing() {
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::COOKIE, HeaderValue::from_str(v).unwrap());
+            m
+        };
+        assert_eq!(tz_offset_from(&HeaderMap::new()), 0);
+        assert_eq!(tz_offset_from(&h("a=b; pm_tz=60; c=d")), 60);
+        assert_eq!(tz_offset_from(&h("pm_tz=-300")), -300);
+        assert_eq!(tz_offset_from(&h("pm_tz=840")), 840);
+        assert_eq!(tz_offset_from(&h("pm_tz=841")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=-841")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=abc")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=999999")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=99999999999999999999")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=")), 0);
+    }
 
     #[test]
     fn passage_cut_on_char_boundary_with_ellipsis() {

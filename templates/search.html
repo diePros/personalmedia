@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Search · PMS{% endblock %}
+{% block content %}
+<h1>Search</h1>
+
+<form class="search" method="get" action="/search" role="search" hx-get="/search" hx-target="#results" hx-push-url="false" hx-sync="this:replace">
+<div>
+<label for="q">Search</label>
+<input type="search" id="q" name="q" value="{{ q }}" autocomplete="off" hx-get="/search" hx-trigger="input changed delay:300ms, search" hx-target="#results" hx-push-url="false" hx-include="closest form">
+</div>
+<fieldset class="mode">
+<legend>Search by</legend>
+<div class="check"><label><input type="radio" name="mode" value="words"{% if !meaning %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Words</label></div>
+<div class="check"><label><input type="radio" name="mode" value="meaning"{% if meaning %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Meaning</label></div>
+</fieldset>
+<fieldset class="mode" id="sort-switch"{% if !show_sort %} hidden{% endif %}>
+<legend>Sort by</legend>
+<div class="check"><label><input type="radio" name="sort" value="best"{% if !newest %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Best match</label></div>
+<div class="check"><label><input type="radio" name="sort" value="newest"{% if newest %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Newest</label></div>
+</fieldset>
+<details class="filters-box"{% if filters_open %} open{% endif %}>
+<summary>Filters</summary>
+<div class="filters">
+<div>
+<label for="tag">Tag</label>
+<select id="tag" name="tag" hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
+<option value="">Any</option>
+{% for t in tags -%}
+<option value="{{ t }}"{% if *t == tag %} selected{% endif %}>{{ t }}</option>
+{% endfor -%}
+</select>
+</div>
+<div>
+<label for="from">From</label>
+<input type="date" id="from" name="from" value="{{ from }}" hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
+</div>
+<div>
+<label for="to">To</label>
+<input type="date" id="to" name="to" value="{{ to }}" hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
+</div>
+<div class="check">
+<label><input type="checkbox" name="needs_transcription" value="1"{% if needs_transcription %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Needs transcription</label>
+</div>
+</div>
+</details>
+<button type="submit">Search</button>
+</form>
+
+<div id="results" aria-live="polite">
+{% include "_results.html" %}
+</div>
+{% endblock %}

@@ -479,7 +479,7 @@ async fn access_log_omits_query_and_path_params() {
     let alice = app.session_for("alice");
     let uuid = "3f2b8c1e-9d4a-4b7e-8a6f-5c0d1e2f3a4b";
 
-    let resp = app.get("/documents?q=Steuergeheimnis", &alice).await;
+    let resp = app.get("/search?q=Steuergeheimnis", &alice).await;
     assert_eq!(resp.status(), StatusCode::OK);
     app.get(&format!("/documents/{uuid}"), &alice).await;
     app.get(&format!("/static/{uuid}.css?v=Steuergeheimnis"), &alice)
