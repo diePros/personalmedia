@@ -93,6 +93,14 @@ const PLACE_STOP: &[&str] = &[
     "lastschrift",
     "überweisung",
     "invoice",
+    "lieferung",
+    "bestellung",
+    "kontoauszug",
+    "buchung",
+    "zahlung",
+    "auftrag",
+    "order",
+    "payment",
 ];
 
 fn is_period(w: &str) -> bool {
@@ -124,10 +132,20 @@ fn classify(words: &[String]) -> Option<Kind> {
     }
 }
 
-/// Kind carried by the last words of a line (`Rechnungsdatum:`, `Fällig am`).
+/// Kind carried by the end of a line (`Rechnungsdatum:`, `Fällig am`).
+/// Exclusions look at the last 3 words. A label only counts when it is the
+/// last word and the line is short (at most 4 words) or ends with `:`, so
+/// table headers and prose mentioning a label do not leak into the next line.
 fn trailing_kind(line: &str) -> Option<Kind> {
     let words = words_of(line);
-    classify(&words[words.len().saturating_sub(3)..])
+    match classify(&words[words.len().saturating_sub(3)..])? {
+        Kind::Excluded => Some(Kind::Excluded),
+        Kind::Label => {
+            let last_is_label = words.last().is_some_and(|w| LABELS.contains(&w.as_str()));
+            (last_is_label && (words.len() <= 4 || line.trim_end().ends_with(':')))
+                .then_some(Kind::Label)
+        }
+    }
 }
 
 struct Found {
@@ -167,10 +185,15 @@ fn line_candidates(
         period_seen |= words.iter().any(|w| is_period(w));
         let before = i > 0 && joiner(&c[found[i - 1].end..f.start]);
         let after = found.get(i + 1).is_some_and(|n| joiner(&c[f.end..n.start]));
-        let open_range = {
-            let pos = |names: &[&str]| words.iter().position(|w| names.contains(&w.as_str()));
-            matches!((pos(&["vom", "from"]), pos(&["bis", "until", "to"])), (Some(a), Some(b)) if a < b)
-        };
+        // `vom/von/from ... bis/to/until <date>`: this date ends an open range.
+        // The end word must sit right before the date.
+        let open_range = words.last().is_some_and(|last| {
+            ["bis", "to", "until"].contains(&last.as_str())
+                && seg.trim_end().to_lowercase().ends_with(last.as_str())
+                && words[..words.len() - 1]
+                    .iter()
+                    .any(|w| ["vom", "von", "from"].contains(&w.as_str()))
+        });
         prev_end = f.end;
         if period_seen || before || after || open_range || kind == Some(Kind::Excluded) {
             continue;
@@ -190,10 +213,14 @@ fn line_candidates(
 /// The gap between two dates is only dashes and range words.
 fn joiner(between: &[u8]) -> bool {
     let s = String::from_utf8_lossy(between).to_lowercase();
+    let dash = s.contains(['–', '—', '-']);
     let s = s.replace(['–', '—', '-'], " ");
     let mut words = s.split_whitespace().peekable();
-    between.iter().any(|b| !b.is_ascii_whitespace())
-        && (words.peek().is_none() || words.all(|w| JOINER_WORDS.contains(&w)))
+    // No words: only a dash joins (whitespace such as NBSP does not).
+    if words.peek().is_none() {
+        return dash;
+    }
+    words.all(|w| JOINER_WORDS.contains(&w))
 }
 
 /// `Hamburg, 12.09.2026`, `Frankfurt am Main, den 12.09.2026`: the whole
@@ -691,6 +718,34 @@ mod tests {
             d("Brief 01.01.2025\nBriefdatum 02.02.2025"),
             Some(date!(2025 - 2 - 2))
         );
+    }
+
+    #[test]
+    fn pending_label_is_narrow() {
+        assert_eq!(
+            d("Datum Text Betrag\n01.03.2025 Miete\nRechnungsdatum 05.10.2026"),
+            Some(date!(2026 - 10 - 5))
+        );
+        assert_eq!(
+            d(
+                "Zahlbar innerhalb 14 Tagen ab Rechnungsdatum\n01.03.2025 Abschlag\nDatum: 05.10.2025"
+            ),
+            Some(date!(2025 - 10 - 5))
+        );
+    }
+
+    #[test]
+    fn open_range_is_narrow_and_dash_edges() {
+        assert_eq!(
+            d("Sent from my phone to you 05.10.2025"),
+            Some(date!(2025 - 10 - 5))
+        );
+        assert_eq!(d("von 01.10. bis 31.10.2026"), None);
+        assert_eq!(d("01.10.2026 – 31.10.2026"), None);
+        assert_eq!(d("Datum 17.11.2026\u{202f}"), Some(date!(2026 - 11 - 17)));
+        assert_eq!(d("17.\u{202f}November 2026"), Some(date!(2026 - 11 - 17)));
+        // Whitespace alone (NBSP) between two dates is no range.
+        assert_eq!(d("01.10.2026\u{a0}31.10.2026"), Some(date!(2026 - 10 - 1)));
     }
 
     #[test]
