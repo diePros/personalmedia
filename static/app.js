@@ -165,6 +165,93 @@
     });
   }
 
+  // Install hint: a dismissible banner on the Documents page. Shown only where
+  // installing is possible and the app is not already running standalone.
+  var HINT_KEY = "pms.installHint.dismissed";
+
+  function hintDismissed() {
+    try {
+      return window.localStorage.getItem(HINT_KEY) === "1";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function dismissHint(hint) {
+    hint.hidden = true;
+    try {
+      window.localStorage.setItem(HINT_KEY, "1");
+    } catch (e) {}
+  }
+
+  function isStandalone() {
+    return (
+      navigator.standalone === true ||
+      (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches)
+    );
+  }
+
+  function isIosSafari() {
+    var ua = navigator.userAgent || "";
+    var iphoneOrIpad = /iPhone|iPad|iPod/.test(ua);
+    // iPadOS 13+ reports a Mac UA; tell it apart by touch support.
+    var ipadAsMac = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+    return (iphoneOrIpad || ipadAsMac) && navigator.standalone === false;
+  }
+
+  function initInstallHint() {
+    if (isStandalone()) {
+      document.documentElement.classList.add("standalone");
+    }
+    var hint = document.getElementById("install-hint");
+    if (!hint) {
+      return;
+    }
+    if (isStandalone() || hintDismissed()) {
+      return;
+    }
+    function show(kind) {
+      Array.prototype.forEach.call(
+        hint.querySelectorAll(".install-hint-" + kind),
+        function (el) {
+          el.hidden = false;
+        },
+      );
+      hint.hidden = false;
+    }
+    var dismiss = document.getElementById("install-hint-dismiss");
+    if (dismiss) {
+      dismiss.addEventListener("click", function () {
+        dismissHint(hint);
+      });
+    }
+    if (isIosSafari()) {
+      show("ios");
+      return;
+    }
+    var installBtn = document.getElementById("install-hint-install");
+    var deferred = null;
+    window.addEventListener("beforeinstallprompt", function (event) {
+      event.preventDefault();
+      deferred = event;
+      show("android");
+    });
+    window.addEventListener("appinstalled", function () {
+      hint.hidden = true;
+    });
+    if (installBtn) {
+      installBtn.addEventListener("click", function () {
+        if (!deferred) {
+          return;
+        }
+        var prompt = deferred;
+        deferred = null;
+        hint.hidden = true;
+        prompt.prompt();
+      });
+    }
+  }
+
   // Installable app: the worker caches only the static app shell.
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", function () {
@@ -176,7 +263,9 @@
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initUpload);
+    document.addEventListener("DOMContentLoaded", initInstallHint);
   } else {
     initUpload();
+    initInstallHint();
   }
 })();

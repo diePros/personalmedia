@@ -36,7 +36,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use futures_util::stream;
 use serde::Deserialize;
@@ -65,7 +65,7 @@ const CHUNK: usize = 64 * 1024;
 pub const MANIFEST: &str = r##"{
   "name": "Personal Media System",
   "short_name": "PMS",
-  "start_url": "/documents",
+  "start_url": "/scan",
   "scope": "/",
   "display": "standalone",
   "theme_color": "#1d4ed8",
@@ -73,7 +73,8 @@ pub const MANIFEST: &str = r##"{
   "icons": [
     {"src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
     {"src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
-    {"src": "/static/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+    {"src": "/static/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+    {"src": "/static/icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}
   ],
   "share_target": {
     "action": "/share",
@@ -96,6 +97,9 @@ pub fn routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/manifest.webmanifest", get(manifest))
         .route("/sw.js", get(service_worker))
+        // Task 30 replaces this: the manifest start_url is /scan, so until the
+        // scan page exists it leads to the documents page (which handles login).
+        .route("/scan", get(|| async { Redirect::to("/documents") }))
         .route(
             SHARE_PATH,
             post(stage_share).layer(DefaultBodyLimit::max(limit)),

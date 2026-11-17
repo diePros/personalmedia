@@ -605,6 +605,7 @@ async fn access_log(req: Request, next: Next) -> Response {
 
 const JS: &str = "text/javascript; charset=utf-8";
 const PNG: &str = "image/png";
+const SVG: &str = "image/svg+xml";
 
 /// `(file name, content type, bytes)`. Add new assets here.
 const STATIC_FILES: &[(&str, &str, &[u8])] = &[
@@ -623,6 +624,31 @@ const STATIC_FILES: &[(&str, &str, &[u8])] = &[
         "offline.html",
         "text/html; charset=utf-8",
         include_bytes!("../../static/offline.html"),
+    ),
+    (
+        "icons/icon.svg",
+        SVG,
+        include_bytes!("../../static/icons/icon.svg"),
+    ),
+    (
+        "icons/favicon.svg",
+        SVG,
+        include_bytes!("../../static/icons/favicon.svg"),
+    ),
+    (
+        "icons/favicon-32.png",
+        PNG,
+        include_bytes!("../../static/icons/favicon-32.png"),
+    ),
+    (
+        "icons/favicon-16.png",
+        PNG,
+        include_bytes!("../../static/icons/favicon-16.png"),
+    ),
+    (
+        "icons/apple-touch-icon.png",
+        PNG,
+        include_bytes!("../../static/icons/apple-touch-icon.png"),
     ),
     (
         "icons/icon-192.png",

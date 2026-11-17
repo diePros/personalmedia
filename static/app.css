@@ -361,3 +361,52 @@ fieldset.mode legend {
   border-radius: 0.75rem;
   padding: 0 0.5rem;
 }
+
+/* Install hint (Documents page): shown by app.js only where installing works. */
+.install-hint {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem var(--gap);
+  margin: 0 0 var(--gap);
+  padding: 0.25rem 0.25rem 0.25rem var(--gap);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.install-hint[hidden],
+.install-hint [hidden] {
+  display: none;
+}
+
+.install-hint p {
+  flex: 1;
+  margin: 0;
+}
+
+.install-hint .share-glyph {
+  vertical-align: -0.2em;
+}
+
+.install-hint button {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+.install-hint button.install-hint-dismiss {
+  background: transparent;
+  color: var(--text);
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+.install-hint button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (display-mode: standalone) {
+  .install-hint {
+    display: none;
+  }
+}
