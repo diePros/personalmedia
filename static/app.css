@@ -533,9 +533,11 @@ fieldset.mode legend {
 }
 
 /* Hidden username next to "Your password" fields so password managers can fill them. */
-.pm-username-hint {
+/* `input.` so it beats the shared `input[type="text"]` rule above. */
+input.pm-username-hint {
   position: absolute;
   width: 1px;
+  min-width: 0;
   height: 1px;
   margin: -1px;
   padding: 0;
