@@ -28,6 +28,9 @@ pub struct Config {
     /// Extra hosts (lowercase) whose `https://` redirect URIs OAuth clients may
     /// register (`PM_OAUTH_EXTRA_REDIRECT_HOSTS`, comma separated).
     pub oauth_extra_redirect_hosts: Vec<String>,
+    /// The owner's shared iCloud link to the PMS iOS Shortcut
+    /// (`PM_IOS_SHORTCUT_URL`); `None` when unset or not a valid link.
+    pub ios_shortcut_url: Option<String>,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -83,6 +86,16 @@ pub fn validate_public_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Accepts only `https://www.icloud.com/shortcuts/<32 hex chars>`, with an
+/// optional trailing `/`.
+pub fn validate_ios_shortcut_url(url: &str) -> bool {
+    let Some(id) = url.strip_prefix("https://www.icloud.com/shortcuts/") else {
+        return false;
+    };
+    let id = id.strip_suffix('/').unwrap_or(id);
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 impl Config {
     /// Build the configuration from `PM_*` environment variables.
     /// `PM_PUBLIC_URL` is not required here; commands that need it use
@@ -114,6 +127,18 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
+            ios_shortcut_url: var("PM_IOS_SHORTCUT_URL").and_then(|u| {
+                let u = u.trim().to_owned();
+                if validate_ios_shortcut_url(&u) {
+                    Some(u)
+                } else {
+                    tracing::warn!(
+                        "ignoring PM_IOS_SHORTCUT_URL: expected \
+                         https://www.icloud.com/shortcuts/<32 hex characters>"
+                    );
+                    None
+                }
+            }),
         })
     }
 
@@ -143,6 +168,7 @@ impl Config {
                 p: 1,
             },
             oauth_extra_redirect_hosts: Vec::new(),
+            ios_shortcut_url: None,
         }
     }
 }

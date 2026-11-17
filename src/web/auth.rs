@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use askama::Template;
 use axum::Router;
 use axum::extract::{ConnectInfo, Form, Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
@@ -338,6 +338,8 @@ struct LoginPage {
     page: Page,
     username: String,
     error: Option<String>,
+    /// Return to `/scan` after logging in (`?next=scan`).
+    next_scan: bool,
 }
 
 #[derive(Deserialize)]
@@ -346,13 +348,23 @@ struct LoginForm {
     password: String,
     #[serde(default)]
     code: String,
+    /// The only accepted value is `scan`; anything else is ignored.
+    #[serde(default)]
+    next: String,
 }
 
-fn login_error(status: StatusCode, username: String, msg: &str) -> Response {
+#[derive(Deserialize)]
+struct LoginQuery {
+    #[serde(default)]
+    next: String,
+}
+
+fn login_error(status: StatusCode, username: String, msg: &str, next_scan: bool) -> Response {
     let mut resp = render(&LoginPage {
         page: Page::anonymous(),
         username,
         error: Some(msg.to_owned()),
+        next_scan,
     });
     if resp.status() == StatusCode::OK {
         *resp.status_mut() = status;
@@ -367,6 +379,7 @@ fn login_error(status: StatusCode, username: String, msg: &str) -> Response {
 async fn login_page(
     State(state): State<AppState>,
     headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<LoginQuery>,
     session: Option<axum::Extension<super::session::Session>>,
 ) -> Response {
     if let Some(axum::Extension(s)) = &session
@@ -386,6 +399,7 @@ async fn login_page(
         page: Page::anonymous(),
         username: String::new(),
         error: None,
+        next_scan: q.next == "scan",
     })
 }
 
@@ -405,6 +419,7 @@ async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    let next_scan = form.next == "scan";
     let keys = limiter_keys(&state, peer, &headers, &form.username);
     let attempt = match state.limiter.begin(&keys) {
         Ok(a) => a,
@@ -427,28 +442,50 @@ async fn login(
     };
     match result {
         Ok((unlocked, user)) => match finish_login(&state, &headers, &user.id, unlocked, None) {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 attempt.success();
+                // Back to the scanner, but only where the login would have
+                // gone to the documents page (not the recovery key, a share
+                // or an OAuth consent that is waiting).
+                if next_scan
+                    && resp
+                        .headers()
+                        .get(header::LOCATION)
+                        .is_some_and(|l| l == "/documents")
+                {
+                    resp.headers_mut()
+                        .insert(header::LOCATION, HeaderValue::from_static("/scan"));
+                }
                 resp
             }
             Err(AccountError::Disabled) => {
                 attempt.failure();
-                login_error(StatusCode::FORBIDDEN, form.username, DISABLED)
+                login_error(StatusCode::FORBIDDEN, form.username, DISABLED, next_scan)
             }
             Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
             Err(_) => {
                 attempt.failure();
-                login_error(StatusCode::UNAUTHORIZED, form.username, INVALID_LOGIN)
+                login_error(
+                    StatusCode::UNAUTHORIZED,
+                    form.username,
+                    INVALID_LOGIN,
+                    next_scan,
+                )
             }
         },
         Err(AccountError::Disabled) => {
             attempt.failure();
-            login_error(StatusCode::FORBIDDEN, form.username, DISABLED)
+            login_error(StatusCode::FORBIDDEN, form.username, DISABLED, next_scan)
         }
         Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
         Err(_) => {
             attempt.failure();
-            login_error(StatusCode::UNAUTHORIZED, form.username, INVALID_LOGIN)
+            login_error(
+                StatusCode::UNAUTHORIZED,
+                form.username,
+                INVALID_LOGIN,
+                next_scan,
+            )
         }
     }
 }

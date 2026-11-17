@@ -12,12 +12,14 @@
 //! through `Principal::filter` (channel `Mcp`, cap from the token, tag
 //! allow-list); a document the token may not see is reported as not found.
 //!
-//! Logging: only the tool name and the outcome. Never arguments, queries or
-//! document content.
+//! Logging: the tool name and the outcome, plus the document id and page
+//! number of `get_page_image`. Never queries, text or document content.
 
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -32,6 +34,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
@@ -293,19 +296,42 @@ impl From<String> for ToolError {
     }
 }
 
-fn tool_result(outcome: Result<Value, String>) -> Value {
-    let (text, is_error) = match outcome {
-        Ok(v) => (v.to_string(), false),
-        Err(msg) => (msg, true),
-    };
-    json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+/// What a successful tool call returns: JSON (sent as one text item) or
+/// ready-made MCP content items (images).
+enum Reply {
+    Json(Value),
+    Content(Vec<Value>),
+}
+
+impl From<Value> for Reply {
+    fn from(v: Value) -> Self {
+        Reply::Json(v)
+    }
+}
+
+fn tool_result(outcome: Result<Reply, String>) -> Value {
+    match outcome {
+        Ok(Reply::Content(items)) => json!({"content": items, "isError": false}),
+        Ok(Reply::Json(v)) => {
+            json!({"content": [{"type": "text", "text": v.to_string()}], "isError": false})
+        }
+        Err(msg) => json!({"content": [{"type": "text", "text": msg}], "isError": true}),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
-const WRITE_TOOLS: &[&str] = &["upload_document", "update_document"];
+const WRITE_TOOLS: &[&str] = &[
+    "upload_document",
+    "update_document",
+    "set_transcription",
+    "set_notes",
+];
+
+/// Tools that only make sense for tokens that may read full text.
+const FULL_TEXT_TOOLS: &[&str] = &["semantic_search", "get_page_image", "set_transcription"];
 
 const TOOL_NAMES: &[&str] = &[
     "search_documents",
@@ -315,10 +341,13 @@ const TOOL_NAMES: &[&str] = &[
     "upload_document",
     "update_document",
     "semantic_search",
+    "get_page_image",
+    "set_transcription",
+    "set_notes",
 ];
 
-/// The tool list; write tools only for tokens that may write, semantic search
-/// only for full-text tokens.
+/// The tool list; write tools only for tokens that may write, semantic search,
+/// page images and transcription only for full-text tokens.
 fn tool_definitions(can_write: bool, full_text: bool) -> Value {
     let tags = json!({"type": "array", "items": {"type": "string"}});
     let date = json!({"type": "string", "description": "YYYY-MM-DD"});
@@ -379,6 +408,31 @@ fn tool_definitions(can_write: bool, full_text: bool) -> Value {
                 "tags": tags,
                 "date": {"type": "string", "description": "YYYY-MM-DD; empty string clears the date"}
             }, "required": ["id"]}
+        },
+        {
+            "name": "get_page_image",
+            "description": "Returns one page of a document as an image (JPEG, PNG or WebP) so you can read handwriting or layouts that text extraction misses. full_text tokens only, and only for documents the owner allows at the full MCP level. At most 20 page images per minute.",
+            "inputSchema": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "page": {"type": "integer", "minimum": 1, "description": "1-based page number, default 1"}
+            }, "required": ["id"]}
+        },
+        {
+            "name": "set_transcription",
+            "description": "Stores a transcription of a document's handwriting as its searchable text (read_write + full_text tokens only). It replaces the extracted text unless mode is append.",
+            "inputSchema": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "text": {"type": "string", "maxLength": 500000},
+                "mode": {"type": "string", "enum": ["replace", "append"], "description": "default replace"}
+            }, "required": ["id", "text"]}
+        },
+        {
+            "name": "set_notes",
+            "description": "Sets the free-form notes of a document (keywords, searchable like title and tags; at most 2000 characters; read_write tokens only).",
+            "inputSchema": {"type": "object", "properties": {
+                "id": {"type": "string"},
+                "notes": {"type": "string", "maxLength": 2000}
+            }, "required": ["id", "notes"]}
         }
     ]);
     let Value::Array(mut all) = all else {
@@ -388,7 +442,11 @@ fn tool_definitions(can_write: bool, full_text: bool) -> Value {
         all.retain(|t| !t["name"].as_str().is_some_and(|n| WRITE_TOOLS.contains(&n)));
     }
     if !full_text {
-        all.retain(|t| t["name"] != "semantic_search");
+        all.retain(|t| {
+            !t["name"]
+                .as_str()
+                .is_some_and(|n| FULL_TEXT_TOOLS.contains(&n))
+        });
     }
     Value::Array(all)
 }
@@ -466,15 +524,24 @@ async fn call_tool(
     p: &Principal,
     name: &str,
     args: Option<&RawValue>,
-) -> Result<Value, ToolError> {
+) -> Result<Reply, ToolError> {
     match name {
-        "search_documents" => Ok(search_documents(p, parse(args)?).await?),
-        "list_documents" => Ok(list_docs(p, parse(args)?).await?),
-        "get_document" => Ok(get_doc(p, parse(args)?).await?),
-        "list_tags" => Ok(list_tag_names(p).await?),
-        "semantic_search" => semantic_search(state, p, parse(args)?).await,
-        "upload_document" => upload_document(state, p, parse(args)?).await,
-        "update_document" => update_document(p, parse(args)?).await,
+        "search_documents" => Ok(search_documents(p, parse(args)?).await?.into()),
+        "list_documents" => Ok(list_docs(p, parse(args)?).await?.into()),
+        "get_document" => Ok(get_doc(p, parse(args)?).await?.into()),
+        "list_tags" => Ok(list_tag_names(p).await?.into()),
+        "semantic_search" => semantic_search(state, p, parse(args)?)
+            .await
+            .map(Reply::Json),
+        "upload_document" => upload_document(state, p, parse(args)?)
+            .await
+            .map(Reply::Json),
+        "update_document" => update_document(p, parse(args)?).await.map(Reply::Json),
+        "get_page_image" => get_page_image(state, p, parse(args)?).await,
+        "set_transcription" => set_transcription(state, p, parse(args)?)
+            .await
+            .map(Reply::Json),
+        "set_notes" => set_notes(p, parse(args)?).await.map(Reply::Json),
         _ => Err(ToolError::Tool("unknown tool".into())),
     }
 }
@@ -486,6 +553,8 @@ fn doc_json(d: &Document) -> serde_json::Map<String, Value> {
     m.insert("document_date".into(), json!(d.document_date));
     m.insert("tags".into(), json!(d.tags));
     m.insert("filename".into(), json!(d.original_filename));
+    // Notes are user-typed keywords: metadata, like the title and tags.
+    m.insert("notes".into(), json!(d.notes));
     m
 }
 
@@ -723,6 +792,7 @@ async fn get_doc(p: &Principal, a: IdArgs) -> Result<Value, String> {
     m.insert("mime".into(), json!(doc.mime));
     m.insert("size".into(), json!(doc.size));
     m.insert("text_status".into(), json!(doc.text_status.as_str()));
+    m.insert("text_source".into(), json!(doc.text_source.as_str()));
     if let Some(text) = text {
         let truncated = text.chars().count() > TEXT_MAX_CHARS;
         let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
@@ -856,5 +926,244 @@ async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, ToolErro
     .await
     .map_err(ToolError::Tool)?;
     verdict?;
+    Ok(json!({"id": a.id, "updated": true}))
+}
+
+// ---------------------------------------------------------------------------
+// Handwriting: page images, transcription, notes
+// ---------------------------------------------------------------------------
+
+/// Page images a token may fetch per window.
+const PAGE_IMAGES_PER_WINDOW: usize = 20;
+const PAGE_IMAGE_WINDOW: Duration = Duration::from_secs(60);
+/// Largest image sent to the client (raw bytes, before base64).
+/// 3.5 MiB raw is about 4.7 MiB as base64, inside the 5 MiB response budget.
+const PAGE_IMAGE_MAX_BYTES: u64 = 3584 * 1024;
+/// Longest transcription, in characters.
+const TRANSCRIPTION_MAX_CHARS: usize = 500_000;
+const RATE_LIMITED: &str = "rate limit: try again in a minute";
+
+/// Sliding-window limit on `get_page_image`, per token (or OAuth grant), in
+/// memory only.
+#[derive(Default)]
+pub struct PageImageLimiter {
+    hits: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl PageImageLimiter {
+    /// Records a call for `key`; `false` when the window is already full.
+    fn allow(&self, key: &str, now: Instant) -> bool {
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        hits.retain(|_, q| {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) >= PAGE_IMAGE_WINDOW)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+        let q = hits.entry(key.to_owned()).or_default();
+        if q.len() >= PAGE_IMAGES_PER_WINDOW {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+}
+
+#[derive(Deserialize)]
+struct PageImageArgs {
+    id: String,
+    page: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct TranscriptionArgs {
+    id: String,
+    text: String,
+    mode: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NotesArgs {
+    id: String,
+    notes: String,
+}
+
+/// The document, if this token may read it at the full level (and may use
+/// `what` at all). Off or tag-hidden documents are "not found".
+async fn full_doc(p: &Principal, id: &str, denied: &'static str) -> Result<Document, String> {
+    if p.cap() != Level::Full {
+        return Err(denied.into());
+    }
+    let (p2, id) = (p.clone(), id.to_owned());
+    let found = blocking(&p.unlocked, move |c| visible_doc(c, &p2, &id)).await?;
+    match found {
+        None => Err(NOT_FOUND.into()),
+        Some((_, level)) if level != Level::Full => Err(denied.into()),
+        Some((doc, _)) => Ok(doc),
+    }
+}
+
+fn image_mime(mime: &str) -> Option<&'static str> {
+    match mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/png" => Some("image/png"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+async fn get_page_image(
+    state: &AppState,
+    p: &Principal,
+    a: PageImageArgs,
+) -> Result<Reply, ToolError> {
+    const DENIED: &str = "token cannot read page images";
+    let doc = full_doc(p, &a.id, DENIED).await?;
+    let page = a.page.unwrap_or(1);
+    if page == 0 {
+        return Err(ToolError::Tool("page must be at least 1".into()));
+    }
+    if !state.page_images.allow(&p.meta_id, Instant::now()) {
+        return Err(ToolError::Tool(RATE_LIMITED.into()));
+    }
+    tracing::info!(doc_id = %doc.id, page, "mcp page image");
+    let (docs, u) = (state.docs.clone(), p.unlocked.clone());
+    let tmp = state.cfg.data_dir.join("tmp");
+    let id = doc.id.clone();
+    let mime = doc.mime.clone();
+    let rendered = tokio::task::spawn_blocking(
+        move || -> Result<(Zeroizing<Vec<u8>>, &'static str, u32), String> {
+            if let Some(mime) = image_mime(&mime) {
+                if page != 1 {
+                    return Err("page out of range (document has 1 page)".into());
+                }
+                let (d, reader) = docs.open_plaintext(&u, &id).map_err(internal)?;
+                if d.size > PAGE_IMAGE_MAX_BYTES {
+                    return Err(TOO_LARGE.into());
+                }
+                let mut bytes = Zeroizing::new(Vec::new());
+                reader
+                    .take(PAGE_IMAGE_MAX_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(internal)?;
+                if bytes.len() as u64 > PAGE_IMAGE_MAX_BYTES {
+                    return Err(TOO_LARGE.into());
+                }
+                return Ok((bytes, mime, 1));
+            }
+            if !mime
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("application/pdf")
+            {
+                return Err("page images are not available for this file type".into());
+            }
+            let limits = crate::extract::ChildLimits::default();
+            let job = crate::extract::JobDir::new(&tmp).map_err(internal)?;
+            let input = job.path().join("input");
+            docs.decrypt_to_path(&u, &id, &input).map_err(internal)?;
+            let pages =
+                crate::extract::pdf_page_count(&input, job.path(), &limits).map_err(internal)?;
+            if page > pages {
+                return Err(format!("page out of range (document has {pages} pages)"));
+            }
+            let jpeg = crate::extract::render_pdf_page_jpeg(&input, job.path(), page, &limits)
+                .map_err(internal)?;
+            if jpeg.len() as u64 > PAGE_IMAGE_MAX_BYTES {
+                return Err(TOO_LARGE.into());
+            }
+            Ok((Zeroizing::new(jpeg), "image/jpeg", pages))
+        },
+    )
+    .await
+    .map_err(|e| ToolError::Tool(internal(e)))?
+    .map_err(ToolError::Tool)?;
+    let (bytes, mime, pages) = rendered;
+    Ok(Reply::Content(vec![
+        json!({"type": "image", "data": BASE64.encode(&bytes), "mimeType": mime}),
+        json!({"type": "text", "text": format!("page {page} of {pages}")}),
+    ]))
+}
+
+const TOO_LARGE: &str = "page too large for preview";
+
+async fn set_transcription(
+    state: &AppState,
+    p: &Principal,
+    a: TranscriptionArgs,
+) -> Result<Value, ToolError> {
+    const DENIED: &str = "token cannot transcribe this document";
+    let append = match a.mode.as_deref() {
+        None | Some("replace") => false,
+        Some("append") => true,
+        Some(_) => return Err(ToolError::Params("mode must be replace or append")),
+    };
+    if a.text.trim().is_empty() {
+        return Err(ToolError::Tool("text must not be empty".into()));
+    }
+    if a.text.chars().count() > TRANSCRIPTION_MAX_CHARS {
+        return Err(ToolError::Tool(format!(
+            "text too long (at most {TRANSCRIPTION_MAX_CHARS} characters)"
+        )));
+    }
+    let doc = full_doc(p, &a.id, DENIED).await?;
+    let id = doc.id.clone();
+    let text = a.text;
+    let chars = blocking(&p.unlocked, move |c| {
+        let full = match (append, get_document_text(c, &id)?) {
+            (true, Some(old)) if !old.trim().is_empty() => format!("{old}\n\n{text}"),
+            _ => text,
+        };
+        let chars = full.chars().count();
+        if chars <= TRANSCRIPTION_MAX_CHARS {
+            crate::user_db::set_transcription(c, &id, &full, now())?;
+        }
+        Ok(chars)
+    })
+    .await?;
+    if chars > TRANSCRIPTION_MAX_CHARS {
+        return Err(ToolError::Tool(format!(
+            "text too long (at most {TRANSCRIPTION_MAX_CHARS} characters)"
+        )));
+    }
+    // The old text's vectors are gone; queue the new text (when semantic
+    // indexing is allowed for this document).
+    let (queue, u, id) = (state.queue.clone(), p.unlocked.clone(), doc.id.clone());
+    let _ = tokio::task::spawn_blocking(move || queue.enqueue_embed_if_needed(&u, &id)).await;
+    Ok(json!({"id": doc.id, "text_source": "transcription", "characters": chars}))
+}
+
+async fn set_notes(p: &Principal, a: NotesArgs) -> Result<Value, ToolError> {
+    let notes = a.notes.trim().to_owned();
+    if notes.chars().count() > crate::user_db::NOTES_MAX_CHARS {
+        return Err(ToolError::Tool(format!(
+            "notes too long (at most {} characters)",
+            crate::user_db::NOTES_MAX_CHARS
+        )));
+    }
+    let (p2, id) = (p.clone(), a.id.clone());
+    let done = blocking(&p.unlocked, move |c| {
+        if visible_doc(c, &p2, &id)?.is_none() {
+            return Ok(false);
+        }
+        crate::user_db::set_notes(c, &id, &notes, now())?;
+        Ok(true)
+    })
+    .await?;
+    if !done {
+        return Err(ToolError::Tool(NOT_FOUND.into()));
+    }
     Ok(json!({"id": a.id, "updated": true}))
 }

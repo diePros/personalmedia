@@ -19,10 +19,11 @@ pub use access::{
     get_access_defaults, set_access_defaults, set_document_access,
 };
 pub use documents::{
-    Document, ListFilter, NewDocument, SearchHit, TextStatus, delete_document, find_by_sha256,
-    find_by_sha256_visible, get_document, get_document_text, hidden_from, insert_document,
-    list_documents, list_tags, list_tags_visible, pending_document_ids, search, set_text, tag_ids,
-    update_document_meta,
+    Document, ListFilter, NOTES_MAX_CHARS, NewDocument, SearchHit, TextSource, TextStatus,
+    delete_document, find_by_sha256, find_by_sha256_visible, get_document, get_document_text,
+    hidden_from, insert_document, list_documents, list_tags, list_tags_visible,
+    pending_document_ids, search, set_extracted_text, set_notes, set_text, set_transcription,
+    tag_ids, update_document_meta, update_document_meta_notes,
 };
 pub use meta::{
     Access, Content, GrantInfo, TokenMeta, TokenScope, delete_token_meta, get_setting,
@@ -79,7 +80,8 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
 /// v2 (v1.2): encrypted chunk vectors for semantic search.
-const MIGRATION_V2: &str = "
+#[doc(hidden)]
+pub const MIGRATION_V2: &str = "
 CREATE TABLE chunk_vectors (
     document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     chunk_no INTEGER NOT NULL,
@@ -91,6 +93,31 @@ CREATE TABLE chunk_vectors (
 );
 ALTER TABLE documents ADD COLUMN embed_status TEXT NOT NULL DEFAULT 'none';
 PRAGMA user_version = 2;
+";
+
+/// v3 (v1.5): per-document notes, the source of the text, and `documents_fts`
+/// with a `notes` column (rebuilt once, from the tables, in this transaction).
+const MIGRATION_V3: &str = "
+ALTER TABLE documents ADD COLUMN notes TEXT NOT NULL DEFAULT '';
+ALTER TABLE documents ADD COLUMN text_source TEXT NOT NULL DEFAULT 'ocr'
+    CHECK (text_source IN ('ocr','transcription','none'));
+UPDATE documents SET text_source = 'none'
+    WHERE NOT EXISTS (SELECT 1 FROM document_text t WHERE t.document_id = documents.id);
+CREATE VIRTUAL TABLE documents_fts_new USING fts5(
+    doc_id UNINDEXED, title, filename, tags, notes, content,
+    tokenize='unicode61 remove_diacritics 2'
+);
+INSERT INTO documents_fts_new(doc_id, title, filename, tags, notes, content)
+    SELECT d.id, d.title, d.original_filename,
+           COALESCE((SELECT group_concat(name, ' ') FROM
+               (SELECT t.name FROM document_tags dt JOIN tags t ON t.id = dt.tag_id
+                WHERE dt.document_id = d.id ORDER BY t.name)), ''),
+           d.notes,
+           COALESCE((SELECT content FROM document_text WHERE document_id = d.id), '')
+    FROM documents d;
+DROP TABLE documents_fts;
+ALTER TABLE documents_fts_new RENAME TO documents_fts;
+PRAGMA user_version = 3;
 ";
 
 /// Open (creating if needed) the user's SQLCipher index with a raw key, and migrate.
@@ -111,14 +138,17 @@ pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
             "BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"
         ))?;
     }
-    if version < 2 {
+    for (target, sql) in [(2, MIGRATION_V2), (3, MIGRATION_V3)] {
+        if version >= target {
+            continue;
+        }
         // Re-checked inside the write transaction so a concurrent opener
         // cannot apply the migration twice.
         conn.execute_batch("BEGIN IMMEDIATE;")?;
         let res = (|| -> Result<()> {
             let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if v < 2 {
-                conn.execute_batch(MIGRATION_V2)?;
+            if v < target {
+                conn.execute_batch(sql)?;
             }
             Ok(())
         })();
@@ -126,7 +156,7 @@ pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
             Ok(()) => conn.execute_batch("COMMIT;")?,
             Err(e) => {
                 let _ = conn.execute_batch("ROLLBACK;");
-                return Err(e.context("migrating user db to v2"));
+                return Err(e.context(format!("migrating user db to v{target}")));
             }
         }
     }

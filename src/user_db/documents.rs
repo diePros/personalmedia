@@ -37,6 +37,40 @@ impl TextStatus {
     }
 }
 
+/// Where a document's searchable text came from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextSource {
+    /// pdftotext / OCR.
+    Ocr,
+    /// Written by the user's own AI assistant over MCP (handwriting).
+    Transcription,
+    /// No text.
+    None,
+}
+
+impl TextSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TextSource::Ocr => "ocr",
+            TextSource::Transcription => "transcription",
+            TextSource::None => "none",
+        }
+    }
+
+    fn parse(s: &str) -> Option<TextSource> {
+        match s {
+            "ocr" => Some(TextSource::Ocr),
+            "transcription" => Some(TextSource::Transcription),
+            "none" => Some(TextSource::None),
+            _ => None,
+        }
+    }
+}
+
+/// Longest `notes` value, in characters.
+pub const NOTES_MAX_CHARS: usize = 2000;
+
 pub struct NewDocument {
     pub id: String,
     pub wrapped_dek: Vec<u8>,
@@ -65,6 +99,9 @@ pub struct Document {
     pub updated_at: i64,
     pub text_status: TextStatus,
     pub page_count: Option<u32>,
+    /// User-typed keywords; metadata (searchable at the metadata level).
+    pub notes: String,
+    pub text_source: TextSource,
     pub tags: Vec<String>,
 }
 
@@ -99,11 +136,30 @@ pub struct SearchHit {
 }
 
 const DOC_COLS: &str = "d.id, d.wrapped_dek, d.original_filename, d.title, d.mime, d.size, \
-     d.sha256, d.document_date, d.created_at, d.updated_at, d.text_status, d.page_count";
+     d.sha256, d.document_date, d.created_at, d.updated_at, d.text_status, d.page_count, \
+     d.notes, d.text_source";
+
+/// [`DOC_COLS`] for an index DB older than v3 (opened read-only for recovery
+/// and never migrated): the missing columns read as their defaults.
+const DOC_COLS_PRE_V3: &str = "d.id, d.wrapped_dek, d.original_filename, d.title, d.mime, d.size, \
+     d.sha256, d.document_date, d.created_at, d.updated_at, d.text_status, d.page_count, \
+     '' AS notes, 'ocr' AS text_source";
+
+/// The document column list that matches the schema version of `conn`.
+fn doc_cols(conn: &Connection) -> &'static str {
+    match conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)) {
+        Ok(v) if v < 3 => DOC_COLS_PRE_V3,
+        _ => DOC_COLS,
+    }
+}
+
+/// Index of the first column after the document columns.
+const AFTER_DOC_COLS: usize = 14;
 
 fn map_doc(r: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
     let sha: Vec<u8> = r.get(6)?;
     let status: String = r.get(10)?;
+    let source: String = r.get(13)?;
     let bad = |what: &str| {
         rusqlite::Error::FromSqlConversionFailure(
             0,
@@ -124,6 +180,8 @@ fn map_doc(r: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         updated_at: r.get(9)?,
         text_status: TextStatus::parse(&status).ok_or_else(|| bad("bad text_status"))?,
         page_count: r.get::<_, Option<i64>>(11)?.map(|p| p as u32),
+        notes: r.get(12)?,
+        text_source: TextSource::parse(&source).ok_or_else(|| bad("bad text_source"))?,
         tags: Vec::new(),
     })
 }
@@ -154,11 +212,12 @@ fn normalize_tags(tags: &[String]) -> Vec<String> {
 fn reindex(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM documents_fts WHERE doc_id = ?1", [id])?;
     conn.execute(
-        "INSERT INTO documents_fts(doc_id, title, filename, tags, content)
+        "INSERT INTO documents_fts(doc_id, title, filename, tags, notes, content)
          SELECT d.id, d.title, d.original_filename,
                 COALESCE((SELECT group_concat(name, ' ') FROM
                     (SELECT t.name FROM document_tags dt JOIN tags t ON t.id = dt.tag_id
                      WHERE dt.document_id = d.id ORDER BY t.name)), ''),
+                d.notes,
                 COALESCE((SELECT content FROM document_text WHERE document_id = d.id), '')
          FROM documents d WHERE d.id = ?1",
         [id],
@@ -247,7 +306,7 @@ pub fn insert_document(conn: &Connection, d: &NewDocument) -> Result<()> {
 pub fn get_document(conn: &Connection, id: &str) -> Result<Option<Document>> {
     let doc = conn
         .query_row(
-            &format!("SELECT {DOC_COLS} FROM documents d WHERE d.id = ?1"),
+            &format!("SELECT {} FROM documents d WHERE d.id = ?1", doc_cols(conn)),
             [id],
             map_doc,
         )
@@ -259,7 +318,8 @@ pub fn find_by_sha256(conn: &Connection, sha: &[u8; 32]) -> Result<Option<Docume
     let doc = conn
         .query_row(
             &format!(
-                "SELECT {DOC_COLS} FROM documents d WHERE d.sha256 = ?1 ORDER BY d.created_at LIMIT 1"
+                "SELECT {} FROM documents d WHERE d.sha256 = ?1 ORDER BY d.created_at LIMIT 1",
+                doc_cols(conn)
             ),
             [sha.as_slice()],
             map_doc,
@@ -275,7 +335,7 @@ pub fn find_by_sha256_visible(
     f: &ListFilter,
 ) -> Result<Option<Document>> {
     let mut params: Vec<Value> = Vec::new();
-    let mut sql = format!("SELECT {DOC_COLS} FROM documents d");
+    let mut sql = format!("SELECT {} FROM documents d", doc_cols(conn));
     access_clause(conn, f, &mut sql, &mut params)?;
     tag_allow_condition(f, &mut sql, &mut params);
     sql.push_str(" AND d.sha256 = ? ORDER BY d.created_at, d.id LIMIT 1");
@@ -367,7 +427,7 @@ fn raw_levels_for(target: Level, cap: Level) -> Vec<&'static str> {
 
 pub fn list_documents(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>> {
     let mut params: Vec<Value> = Vec::new();
-    let mut sql = format!("SELECT {DOC_COLS} FROM documents d");
+    let mut sql = format!("SELECT {} FROM documents d", doc_cols(conn));
     access_clause(conn, f, &mut sql, &mut params)?;
     filter_conditions(f, &mut sql, &mut params);
     sql.push_str(" ORDER BY d.created_at DESC, d.id LIMIT ? OFFSET ?");
@@ -398,8 +458,9 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
     }
     let mut params: Vec<Value> = vec![Value::Text(Channel::SemanticIndex.as_str().into())];
     let mut sql = format!(
-        "SELECT {DOC_COLS} FROM documents d \
-         LEFT JOIN document_access s ON s.document_id = d.id AND s.channel = ?"
+        "SELECT {} FROM documents d \
+         LEFT JOIN document_access s ON s.document_id = d.id AND s.channel = ?",
+        doc_cols(conn)
     );
     access_clause(conn, f, &mut sql, &mut params)?;
     sql.push_str(" AND COALESCE(a.level, ?) = 'full'");
@@ -422,10 +483,11 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
 pub fn hidden_from(conn: &Connection, channel: Channel) -> Result<Vec<Document>> {
     let default = base_default(conn, channel)?;
     let sql = format!(
-        "SELECT {DOC_COLS} FROM documents d \
+        "SELECT {} FROM documents d \
          LEFT JOIN document_access a ON a.document_id = d.id AND a.channel = ?1 \
          WHERE COALESCE(a.level, ?2) = 'off' \
-         ORDER BY d.created_at DESC, d.id"
+         ORDER BY d.created_at DESC, d.id",
+        doc_cols(conn)
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut docs: Vec<Document> = stmt
@@ -445,7 +507,26 @@ pub fn update_document_meta(
     tags: Option<&[String]>,
     now: i64,
 ) -> Result<()> {
+    update_document_meta_notes(conn, id, title, document_date, tags, None, now)
+}
+
+/// [`update_document_meta`] plus the notes, all in one transaction.
+pub fn update_document_meta_notes(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    document_date: Option<Option<&str>>,
+    tags: Option<&[String]>,
+    notes: Option<&str>,
+    now: i64,
+) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    if let Some(n) = notes {
+        tx.execute(
+            "UPDATE documents SET notes = ?2 WHERE id = ?1",
+            params![id, n],
+        )?;
+    }
     if let Some(t) = title {
         tx.execute(
             "UPDATE documents SET title = ?2 WHERE id = ?1",
@@ -486,10 +567,126 @@ pub fn set_text(
     page_count: Option<u32>,
     now: i64,
 ) -> Result<()> {
+    let source = if text.is_some() {
+        TextSource::Ocr
+    } else {
+        TextSource::None
+    };
+    set_text_from(conn, id, status, text, page_count, source, now)
+}
+
+/// Stores a background extraction result, unless the user's AI transcribed
+/// the document meanwhile (the check and the write are one transaction, so a
+/// transcription can never be overwritten by a late OCR result). `false`
+/// means the transcription was kept and nothing changed.
+pub fn set_extracted_text(
+    conn: &Connection,
+    id: &str,
+    status: TextStatus,
+    text: Option<&str>,
+    page_count: Option<u32>,
+    now: i64,
+) -> Result<bool> {
+    let source = if text.is_some() {
+        TextSource::Ocr
+    } else {
+        TextSource::None
+    };
+    set_text_from_unless_transcribed(conn, id, status, text, page_count, source, now)
+}
+
+/// Store handwriting transcribed by the user's AI: `text_source` becomes
+/// `transcription`, status `done`; vectors are dropped (the caller
+/// re-enqueues embedding) and the FTS row is rebuilt.
+pub fn set_transcription(conn: &Connection, id: &str, text: &str, now: i64) -> Result<()> {
+    // The page count is a property of the file, not of the text: keep it.
+    let pages = get_document(conn, id)?
+        .ok_or_else(|| anyhow!("document not found"))?
+        .page_count;
+    set_text_from(
+        conn,
+        id,
+        TextStatus::Done,
+        Some(text),
+        pages,
+        TextSource::Transcription,
+        now,
+    )
+}
+
+/// Set the free-form notes (metadata, searchable at the metadata level).
+pub fn set_notes(conn: &Connection, id: &str, notes: &str, now: i64) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     let n = tx.execute(
-        "UPDATE documents SET text_status = ?2, page_count = ?3, updated_at = ?4 WHERE id = ?1",
-        params![id, status.as_str(), page_count.map(|p| p as i64), now],
+        "UPDATE documents SET notes = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, notes, now],
+    )?;
+    if n == 0 {
+        return Err(anyhow!("document not found"));
+    }
+    reindex(&tx, id)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn set_text_from(
+    conn: &Connection,
+    id: &str,
+    status: TextStatus,
+    text: Option<&str>,
+    page_count: Option<u32>,
+    source: TextSource,
+    now: i64,
+) -> Result<()> {
+    write_text(conn, id, status, text, page_count, source, now, false).map(|_| ())
+}
+
+fn set_text_from_unless_transcribed(
+    conn: &Connection,
+    id: &str,
+    status: TextStatus,
+    text: Option<&str>,
+    page_count: Option<u32>,
+    source: TextSource,
+    now: i64,
+) -> Result<bool> {
+    write_text(conn, id, status, text, page_count, source, now, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_text(
+    conn: &Connection,
+    id: &str,
+    status: TextStatus,
+    text: Option<&str>,
+    page_count: Option<u32>,
+    source: TextSource,
+    now: i64,
+    keep_transcription: bool,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    if keep_transcription {
+        let kept: Option<String> = tx
+            .query_row(
+                "SELECT text_source FROM documents WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if kept.as_deref() == Some(TextSource::Transcription.as_str()) {
+            return Ok(false);
+        }
+    }
+    let n = tx.execute(
+        "UPDATE documents SET text_status = ?2, page_count = ?3,
+            text_source = ?5, updated_at = ?4 WHERE id = ?1",
+        params![
+            id,
+            status.as_str(),
+            page_count.map(|p| p as i64),
+            now,
+            source.as_str()
+        ],
     )?;
     if n == 0 {
         return Err(anyhow!("document not found"));
@@ -514,7 +711,7 @@ pub fn set_text(
     )?;
     reindex(&tx, id)?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// The extracted text of a document, if extraction produced any.
@@ -566,9 +763,9 @@ fn build_match(text: &str, metadata_only: bool, hide_tags: bool) -> Option<Strin
         .collect::<Vec<_>>()
         .join(" ");
     Some(match (metadata_only, hide_tags) {
-        (true, false) => format!("{{title filename tags}} : ({joined})"),
-        (true, true) => format!("{{title filename}} : ({joined})"),
-        (false, true) => format!("{{title filename content}} : ({joined})"),
+        (true, false) => format!("{{title filename tags notes}} : ({joined})"),
+        (true, true) => format!("{{title filename notes}} : ({joined})"),
+        (false, true) => format!("{{title filename notes content}} : ({joined})"),
         (false, false) => joined,
     })
 }
@@ -600,16 +797,17 @@ pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<Searc
     let mut hits: Vec<(f64, SearchHit)> = Vec::new();
     for (level, raw, expr) in passes {
         let mut params: Vec<Value> = Vec::new();
-        // Column 4 is `content`; a restricted token must never get a snippet
+        // Column 5 is `content`; a restricted token must never get a snippet
         // taken from the `tags` column.
         let snippet_col = match (level == Level::Full, hide_tags) {
             (true, false) => "snippet(documents_fts, -1, char(2), char(3), '…', 12)",
-            (true, true) => "snippet(documents_fts, 4, char(2), char(3), '…', 12)",
+            (true, true) => "snippet(documents_fts, 5, char(2), char(3), '…', 12)",
             (false, _) => "NULL",
         };
         let mut sql = format!(
-            "SELECT {DOC_COLS}, bm25(documents_fts), {snippet_col} FROM documents_fts \
-             JOIN documents d ON d.id = documents_fts.doc_id"
+            "SELECT {}, bm25(documents_fts), {snippet_col} FROM documents_fts \
+             JOIN documents d ON d.id = documents_fts.doc_id",
+            doc_cols(conn)
         );
         if let (Some(a), Some(raw)) = (f.access, &raw) {
             let default = base_default(conn, a.channel)?;
@@ -632,8 +830,8 @@ pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<Searc
         let rows = stmt.query_map(params_from_iter(params), |r| {
             Ok((
                 map_doc(r)?,
-                r.get::<_, f64>(12)?,
-                r.get::<_, Option<String>>(13)?,
+                r.get::<_, f64>(AFTER_DOC_COLS)?,
+                r.get::<_, Option<String>>(AFTER_DOC_COLS + 1)?,
             ))
         })?;
         for row in rows {

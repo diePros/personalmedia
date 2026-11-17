@@ -15,6 +15,7 @@ pub mod auth;
 pub mod docs;
 pub mod pwa;
 pub mod ratelimit;
+pub mod scan;
 pub mod session;
 pub mod settings;
 
@@ -79,10 +80,15 @@ pub struct AppState {
     /// Bounds concurrent MCP `upload_document` calls (each holds the base64
     /// text and the decoded bytes in memory).
     pub mcp_write_permits: Arc<Semaphore>,
+    /// MCP `get_page_image` calls per token (memory only).
+    pub page_images: Arc<crate::mcp::PageImageLimiter>,
     /// OAuth registration counters (memory only).
     pub oauth: Arc<crate::oauth::OAuthState>,
     /// Bodies of `POST /share` being read at once (try-acquire, 503 when full).
     pub share_permits: Arc<Semaphore>,
+    /// One `POST /api/scan` PDF build at a time (the pages and the PDF are
+    /// held in memory); try-acquire, 503 when taken.
+    pub scan_permits: Arc<Semaphore>,
 }
 
 /// The embedding model is unloaded after this long without use.
@@ -183,7 +189,9 @@ impl AppState {
             oauth,
             kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
             mcp_write_permits: Arc::new(Semaphore::new(MCP_WRITE_PERMITS)),
+            page_images: Arc::new(crate::mcp::PageImageLimiter::default()),
             share_permits: Arc::new(Semaphore::new(SHARE_PERMITS)),
+            scan_permits: Arc::new(Semaphore::new(1)),
         })
     }
 }
@@ -283,6 +291,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(docs::routes(&state))
         .merge(settings::routes())
         .merge(pwa::routes(&state))
+        .merge(scan::routes(&state))
         .merge(crate::mcp::routes(&state))
         .merge(crate::oauth::routes())
         .route("/static/{file}", get(static_file))
@@ -371,6 +380,11 @@ pub struct Page {
 }
 
 impl Page {
+    /// Cache-busting token for `/static` URLs (`?v=...`).
+    pub fn v(&self) -> &'static str {
+        ASSET_VERSION.as_str()
+    }
+
     /// A page for visitors without a session (login, signup, recover).
     pub fn anonymous() -> Page {
         Page {
@@ -605,6 +619,7 @@ async fn access_log(req: Request, next: Next) -> Response {
 
 const JS: &str = "text/javascript; charset=utf-8";
 const PNG: &str = "image/png";
+const SVG: &str = "image/svg+xml";
 
 /// `(file name, content type, bytes)`. Add new assets here.
 const STATIC_FILES: &[(&str, &str, &[u8])] = &[
@@ -615,6 +630,12 @@ const STATIC_FILES: &[(&str, &str, &[u8])] = &[
     ),
     ("app.js", JS, include_bytes!("../../static/app.js")),
     (
+        "scan.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../../static/scan.css"),
+    ),
+    ("scan.js", JS, include_bytes!("../../static/scan.js")),
+    (
         "htmx.min.js",
         JS,
         include_bytes!("../../static/htmx.min.js"),
@@ -623,6 +644,31 @@ const STATIC_FILES: &[(&str, &str, &[u8])] = &[
         "offline.html",
         "text/html; charset=utf-8",
         include_bytes!("../../static/offline.html"),
+    ),
+    (
+        "icons/icon.svg",
+        SVG,
+        include_bytes!("../../static/icons/icon.svg"),
+    ),
+    (
+        "icons/favicon.svg",
+        SVG,
+        include_bytes!("../../static/icons/favicon.svg"),
+    ),
+    (
+        "icons/favicon-32.png",
+        PNG,
+        include_bytes!("../../static/icons/favicon-32.png"),
+    ),
+    (
+        "icons/favicon-16.png",
+        PNG,
+        include_bytes!("../../static/icons/favicon-16.png"),
+    ),
+    (
+        "icons/apple-touch-icon.png",
+        PNG,
+        include_bytes!("../../static/icons/apple-touch-icon.png"),
     ),
     (
         "icons/icon-192.png",

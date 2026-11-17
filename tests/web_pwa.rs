@@ -24,20 +24,23 @@ async fn manifest_valid_json_with_required_fields() {
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(v["name"], "Personal Media System");
     assert_eq!(v["short_name"], "PMS");
-    assert_eq!(v["start_url"], "/documents");
+    assert_eq!(v["start_url"], "/scan");
     assert_eq!(v["scope"], "/");
     assert_eq!(v["display"], "standalone");
     assert!(v["theme_color"].as_str().unwrap().starts_with('#'));
     assert!(v["background_color"].as_str().unwrap().starts_with('#'));
     let icons = v["icons"].as_array().unwrap();
-    assert_eq!(icons.len(), 3);
     assert!(icons.iter().any(|i| i["purpose"] == "maskable"));
     for icon in icons {
         let src = icon["src"].as_str().unwrap();
         assert!(src.starts_with("/static/icons/"));
         let resp = t.get(src, &Client::anon()).await;
         assert_eq!(resp.status(), 200, "{src}");
-        assert_eq!(header_str(&resp, "content-type"), "image/png");
+        assert_eq!(
+            header_str(&resp, "content-type"),
+            icon["type"].as_str().unwrap(),
+            "{src}"
+        );
     }
 }
 
@@ -156,7 +159,14 @@ async fn sw_cache_name_tracks_asset_version() {
     let body = body_string(t.get("/sw.js", &Client::anon()).await).await;
     let version = &*personal_media::web::ASSET_VERSION;
     assert!(!version.is_empty());
-    assert!(body.contains(&format!("\"pm-shell-{version}\"")), "{body}");
+    assert!(
+        body.contains(&format!("const VERSION = \"{version}\";")),
+        "{body}"
+    );
+    assert!(
+        body.contains("const CACHE = \"pm-shell-\" + VERSION;"),
+        "{body}"
+    );
     assert!(!body.contains("__ASSET_VERSION__"));
     assert!(body.contains("cache: \"reload\""));
 }
@@ -241,4 +251,102 @@ async fn manifest_declares_share_target() {
             }
         })
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn favicon_and_icons_served_with_correct_types() {
+    let t = TestApp::new();
+    for (name, ty) in [
+        ("icon.svg", "image/svg+xml"),
+        ("favicon.svg", "image/svg+xml"),
+        ("favicon-32.png", "image/png"),
+        ("favicon-16.png", "image/png"),
+        ("apple-touch-icon.png", "image/png"),
+        ("icon-192.png", "image/png"),
+        ("icon-512.png", "image/png"),
+        ("icon-maskable-512.png", "image/png"),
+    ] {
+        let path = format!("/static/icons/{name}");
+        let resp = t.get(&path, &Client::anon()).await;
+        assert_eq!(resp.status(), 200, "{path}");
+        assert_eq!(header_str(&resp, "content-type"), ty, "{path}");
+        let body = body_bytes(resp).await;
+        if ty == "image/png" {
+            assert!(body.starts_with(b"\x89PNG"), "{path}");
+        } else {
+            assert!(body.starts_with(b"<svg"), "{path}");
+        }
+    }
+    // The pages link them.
+    let html = body_string(t.get("/login", &Client::anon()).await).await;
+    for needle in [
+        r#"rel="icon" type="image/svg+xml" href="/static/icons/favicon.svg?v="#,
+        r#"href="/static/icons/favicon-32.png?v="#,
+        r#"href="/static/icons/favicon-16.png?v="#,
+        r#"rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png?v="#,
+    ] {
+        assert!(html.contains(needle), "{needle}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn manifest_lists_new_icons_and_start_url_scan() {
+    let t = TestApp::new();
+    let resp = t.get("/manifest.webmanifest", &Client::anon()).await;
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(v["start_url"], "/scan");
+    let icons = v["icons"].as_array().unwrap();
+    let has = |src: &str, purpose: &str| {
+        icons
+            .iter()
+            .any(|i| i["src"] == src && i["purpose"] == purpose)
+    };
+    assert!(has("/static/icons/icon-192.png", "any"));
+    assert!(has("/static/icons/icon-512.png", "any"));
+    assert!(has("/static/icons/icon-maskable-512.png", "maskable"));
+    assert!(has("/static/icons/icon.svg", "any"));
+    // New icons are precached too.
+    let pre = precache_entries();
+    for e in [
+        "/static/icons/apple-touch-icon.png",
+        "/static/icons/favicon.svg",
+    ] {
+        assert!(pre.contains(&e.to_owned()), "{e}");
+    }
+    // /scan leads to login (and back) without a session.
+    let resp = t.get("/scan", &Client::anon()).await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(header_str(&resp, "location"), "/login?next=scan");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn install_hint_markup_present_and_scripts_external() {
+    let t = TestApp::new();
+    let c = t.admin_session_for("alice");
+    let html = body_string(t.get("/documents", &c).await).await;
+    assert!(html.contains(r#"id="install-hint""#));
+    assert!(html.contains("Install PMS for quick scanning"));
+    assert!(html.contains("Add to Home Screen"));
+    assert!(html.contains(r#"id="install-hint-dismiss""#));
+    // The hint starts hidden; app.js reveals it.
+    let tag = &html[html.find(r#"id="install-hint""#).unwrap()..];
+    assert!(tag[..tag.find('>').unwrap()].contains("hidden"));
+    // No inline script or handler.
+    assert!(!html.contains("onclick="));
+    for chunk in html.split("<script").skip(1) {
+        let open = &chunk[..chunk.find('>').unwrap()];
+        assert!(open.contains("src=\"/static/"), "inline script: {open}");
+    }
+    let js = include_str!("../static/app.js");
+    assert!(js.contains("pms.installHint.dismissed"));
+    assert!(js.contains("beforeinstallprompt"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sw_ignores_versioned_urls_of_other_builds() {
+    let t = TestApp::new();
+    let body = body_string(t.get("/sw.js", &Client::anon()).await).await;
+    let version = &*personal_media::web::ASSET_VERSION;
+    assert!(body.contains(&format!("const VERSION = \"{version}\";")));
+    assert!(body.contains("wanted === null || wanted === VERSION"));
 }

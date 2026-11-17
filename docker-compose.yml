@@ -27,6 +27,7 @@ services:
       PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
       PM_TRUSTED_PROXY: 127.0.0.1
       PM_MAX_UPLOAD_MB: "100"
+      # PM_IOS_SHORTCUT_URL: https://www.icloud.com/shortcuts/<32 hex chars>   # optional: iCloud link of the PMS Shortcut
     volumes:
       - /DATA/AppData/personal-media:/data
     tmpfs:

@@ -1,6 +1,12 @@
 {% extends "base.html" %}
 {% block title %}Documents · PMS{% endblock %}
 {% block content %}
+<aside id="install-hint" class="install-hint" aria-label="Install the app" hidden>
+<p class="install-hint-android" hidden>Install PMS for quick scanning</p>
+<p class="install-hint-ios" hidden>Install PMS: tap <strong>Share</strong> <svg class="share-glyph" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"><path d="M12 3v12M8 7l4-4 4 4M6 11H5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-8a1 1 0 0 0-1-1h-1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> then <strong>Add to Home Screen</strong></p>
+<button type="button" id="install-hint-install" class="install-hint-android" hidden>Install</button>
+<button type="button" id="install-hint-dismiss" class="install-hint-dismiss" aria-label="Dismiss install hint">&times;</button>
+</aside>
 <h1>Documents</h1>
 
 <section class="upload" aria-label="Upload">

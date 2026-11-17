@@ -1,4 +1,4 @@
-//! MCP endpoint over HTTP: auth, scope enforcement and the six tools.
+//! MCP endpoint over HTTP: auth, scope enforcement and the tools.
 
 mod common;
 
@@ -276,8 +276,8 @@ async fn client_handshake_with_mcp_headers() {
         .await;
     assert_eq!(resp.status(), 200);
     let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    // A read-only full-text token is not offered the two write tools.
-    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
+    // A read-only full-text token is not offered the write tools.
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 6);
 
     // An unsupported version is answered with ours.
     let resp = f
@@ -298,7 +298,7 @@ async fn client_handshake_with_mcp_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tools_list_has_six_tools() {
+async fn tools_list_has_seven_tools_for_metadata_writers() {
     let f = Fx::new();
     let tok = f.token(Access::ReadWrite, Content::MetadataOnly, None);
     let (status, v) = f
@@ -322,6 +322,7 @@ async fn tools_list_has_six_tools() {
             "list_documents",
             "list_tags",
             "search_documents",
+            "set_notes",
             "update_document",
             "upload_document"
         ]
@@ -1012,6 +1013,7 @@ async fn tools_list_hides_write_tools_from_read_only_tokens() {
         names,
         [
             "get_document",
+            "get_page_image",
             "list_documents",
             "list_tags",
             "search_documents",
@@ -1059,4 +1061,68 @@ async fn search_with_control_characters_is_not_an_error() {
         .await;
     assert!(!err);
     assert_eq!(hits.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_upload_errors_are_json() {
+    let t = TestApp::with_config(|c| c.max_upload_bytes = 4096);
+    let cl = t.session_for("alice");
+    let u = t.state.sessions.get(&cl.cookie).unwrap().unlocked;
+    let f = Fx { t, u };
+    let rw = f.token(Access::ReadWrite, Content::MetadataOnly, None);
+    let ro = f.token(Access::Read, Content::FullText, None);
+    let err = |status: u16, v: &Value, want: u16| {
+        assert_eq!(status, want, "{v}");
+        assert_eq!(v["status"], "error", "{v}");
+        assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()), "{v}");
+    };
+
+    // 401: a revoked or unknown token.
+    let (s, v) = api_upload(&f, Some("pm_bad"), &[], "x.dat", b"p").await;
+    err(s, &v, 401);
+    // 403: read-only.
+    let (s, v) = api_upload(&f, Some(&ro), &[], "x.dat", b"p").await;
+    err(s, &v, 403);
+    // 413: over the body limit (limit + 1 MiB of slack).
+    let big = vec![7u8; 2 * 1024 * 1024];
+    let (s, v) = api_upload(&f, Some(&rw), &[], "big.dat", &big).await;
+    err(s, &v, 413);
+    // 400: no file field.
+    let (s, v) = api_upload_no_file(&f, &rw).await;
+    err(s, &v, 400);
+    // 429: repeated bad tokens lock the address.
+    let bad = format!("pm_{}_{}", "a".repeat(32), "b".repeat(64));
+    let mut last = (0, Value::Null);
+    for _ in 0..40 {
+        last = api_upload(&f, Some(&bad), &[], "x.dat", b"p").await;
+        if last.0 == 429 {
+            break;
+        }
+    }
+    err(last.0, &last.1, 429);
+}
+
+async fn api_upload_no_file(f: &Fx, token: &str) -> (u16, Value) {
+    let b = "pm-nofile";
+    let body =
+        format!("--{b}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nx\r\n--{b}--\r\n");
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/upload")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={b}"),
+        )
+        .body(Body::from(body))
+        .unwrap();
+    req.extensions_mut()
+        .insert(ConnectInfo::<std::net::SocketAddr>(PEER.parse().unwrap()));
+    let resp = f.t.request(req).await;
+    let status = resp.status().as_u16();
+    let bytes = body_bytes(resp).await;
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }

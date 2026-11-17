@@ -361,3 +361,173 @@ fieldset.mode legend {
   border-radius: 0.75rem;
   padding: 0 0.5rem;
 }
+
+/* Install hint (Documents page): shown by app.js only where installing works. */
+.install-hint {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem var(--gap);
+  margin: 0 0 var(--gap);
+  padding: 0.25rem 0.25rem 0.25rem var(--gap);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.install-hint[hidden],
+.install-hint [hidden] {
+  display: none;
+}
+
+.install-hint p {
+  flex: 1;
+  margin: 0;
+}
+
+.install-hint .share-glyph {
+  vertical-align: -0.2em;
+}
+
+.install-hint button {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+.install-hint button.install-hint-dismiss {
+  background: transparent;
+  color: var(--text);
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+.install-hint button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (display-mode: standalone) {
+  .install-hint {
+    display: none;
+  }
+}
+
+/* App shell. The bottom tab bar exists in the markup of every signed-in page
+   but is hidden; it only shows (and the site header goes away) when the app is
+   installed and running standalone. `app.js` adds the `standalone` class for
+   iOS, which has no display-mode media query. */
+.tabbar {
+  display: none;
+}
+
+/* Account actions on the Settings page: the site header carries them in a
+   browser, so they show only in the installed app. */
+.account-standalone {
+  display: none;
+}
+
+.standalone .account-standalone {
+  display: block;
+}
+
+@media (display-mode: standalone) {
+  .account-standalone {
+    display: block;
+  }
+}
+
+.standalone {
+  --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+}
+
+.standalone .site-header {
+  display: none;
+}
+
+.standalone .tabbar {
+  display: flex;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  height: var(--tabbar-h);
+  padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
+    env(safe-area-inset-left, 0px);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+.standalone .tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.125rem;
+  min-width: 44px;
+  min-height: 44px;
+  color: var(--muted);
+  font-size: 0.6875rem;
+  line-height: 1.2;
+  text-decoration: none;
+}
+
+.standalone .tab[aria-current="page"] {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.standalone .tab:focus-visible {
+  outline-offset: -4px;
+}
+
+.standalone main {
+  padding-top: calc(var(--gap) + env(safe-area-inset-top, 0px));
+  padding-bottom: calc(var(--gap) + var(--tabbar-h));
+}
+
+/* Same rules before the script has run (Android Chrome and others that
+   support the media query): no flash of the header. */
+@media (display-mode: standalone) {
+  :root {
+    --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  .site-header {
+    display: none;
+  }
+
+  .tabbar {
+    display: flex;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 20;
+    height: var(--tabbar-h);
+    padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px);
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+  }
+
+  .tab {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.125rem;
+    min-width: 44px;
+    min-height: 44px;
+    color: var(--muted);
+    font-size: 0.6875rem;
+    line-height: 1.2;
+    text-decoration: none;
+  }
+
+  main {
+    padding-top: calc(var(--gap) + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(var(--gap) + var(--tabbar-h));
+  }
+}

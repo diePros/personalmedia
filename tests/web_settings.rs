@@ -1268,3 +1268,111 @@ async fn settings_shows_mcp_explanation_not_default_row() {
     assert!(html.contains("id=\"default-web\""));
     assert!(html.contains("id=\"default-semantic_index\""));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ios_setup_token_scope_and_password() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+
+    // The section is on the settings page.
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(html.contains("Set up iPhone sharing"));
+
+    // A wrong password mints nothing.
+    let bad = t
+        .post_form("/settings/ios", &[("password", "wrong")], &c)
+        .await;
+    assert_eq!(bad.status(), 401);
+    assert!(u.with_db(|conn| list_token_meta(conn).unwrap()).is_empty());
+
+    let resp = t
+        .post_form("/settings/ios", &[("password", PASSWORD)], &c)
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header_str(&resp, "cache-control"), "no-store");
+    let page = body_string(resp).await;
+    assert!(page.contains("Ask the admin for the Shortcut link"));
+    assert!(page.contains("When the Shortcut asks for the setup code, paste it."));
+    assert!(page.contains("data-copy-target"));
+
+    let tags = u.with_db(|conn| personal_media::user_db::list_tags(conn).unwrap());
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].1, "inbox");
+    let metas = u.with_db(|conn| list_token_meta(conn).unwrap());
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].name, "iPhone Shortcut");
+    assert_eq!(
+        metas[0].scope,
+        TokenScope {
+            access: Access::ReadWrite,
+            content: Content::MetadataOnly,
+            tags: Some(vec![tags[0].0]),
+        }
+    );
+
+    // Listed in the normal token list, no secret.
+    let settings = body_string(t.get("/settings", &c).await).await;
+    assert!(settings.contains("iPhone Shortcut"));
+    assert!(settings.contains("tags: inbox"));
+
+    // Setting up again reuses the existing tag.
+    let again = t
+        .post_form("/settings/ios", &[("password", PASSWORD)], &c)
+        .await;
+    assert_eq!(again.status(), 200);
+    assert_eq!(
+        u.with_db(|conn| personal_media::user_db::list_tags(conn).unwrap())
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ios_setup_code_format() {
+    let t = TestApp::with_config(|cfg| {
+        cfg.ios_shortcut_url =
+            Some("https://www.icloud.com/shortcuts/0123456789abcdef0123456789abcdef".into());
+    });
+    let c = t.session_for("alice");
+    let resp = t
+        .post_form("/settings/ios", &[("password", PASSWORD)], &c)
+        .await;
+    assert_eq!(resp.status(), 200);
+    let html = body_string(resp).await;
+    assert!(
+        html.contains("href=\"https://www.icloud.com/shortcuts/0123456789abcdef0123456789abcdef\"")
+    );
+    let code = html
+        .split("value=\"")
+        .map(|s| s.split('"').next().unwrap())
+        .find(|v| v.starts_with("https://test.example|"))
+        .expect("setup code shown");
+    let (url, token) = code.split_once('|').unwrap();
+    assert_eq!(url, "https://test.example");
+    assert!(token.starts_with("pm_"));
+    let u = unlocked(&t, &c);
+    let ids = t.state.sys.token_ids_for_user(&u.user_id).unwrap();
+    assert_eq!(ids.len(), 1);
+    assert!(token.starts_with(&format!("pm_{}_", ids[0])));
+}
+
+#[test]
+fn ios_shortcut_url_validated() {
+    use personal_media::config::validate_ios_shortcut_url as ok;
+    let id = "0123456789abcdef0123456789ABCDEF";
+    assert!(ok(&format!("https://www.icloud.com/shortcuts/{id}")));
+    assert!(ok(&format!("https://www.icloud.com/shortcuts/{id}/")));
+    assert!(!ok("https://www.icloud.com/shortcuts/"));
+    assert!(!ok("https://www.icloud.com/shortcuts/abc"));
+    assert!(!ok(&format!("http://www.icloud.com/shortcuts/{id}")));
+    assert!(!ok(&format!("https://evil.example/shortcuts/{id}")));
+    assert!(!ok(&format!(
+        "https://www.icloud.com.evil.example/shortcuts/{id}"
+    )));
+    assert!(!ok(&format!("https://www.icloud.com/shortcuts/{id}/x")));
+    assert!(!ok(&format!(
+        "https://www.icloud.com/shortcuts/{}z",
+        &id[..31]
+    )));
+}

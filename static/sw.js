@@ -3,12 +3,20 @@
 // authenticated response always go to the network (and are `no-store`).
 "use strict";
 
-const CACHE = "pm-shell-__ASSET_VERSION__";
+const VERSION = "__ASSET_VERSION__";
+const CACHE = "pm-shell-" + VERSION;
 const OFFLINE = "/static/offline.html";
 const PRECACHE = [
   "/static/app.css",
   "/static/app.js",
+  "/static/scan.css",
+  "/static/scan.js",
   "/static/htmx.min.js",
+  "/static/icons/icon.svg",
+  "/static/icons/favicon.svg",
+  "/static/icons/favicon-32.png",
+  "/static/icons/favicon-16.png",
+  "/static/icons/apple-touch-icon.png",
   "/static/icons/icon-192.png",
   "/static/icons/icon-512.png",
   "/static/icons/icon-maskable-512.png",
@@ -61,10 +69,14 @@ self.addEventListener("fetch", function (event) {
     return;
   }
 
-  // Shell assets: cache-first, same origin, GET only.
+  // Shell assets: cache-first, same origin, GET only. A versioned URL for
+  // another build (a page from a newer deploy, before this worker is replaced)
+  // is not ours to answer: it goes to the network, never to stale files.
+  const wanted = url.searchParams.get("v");
   if (
     url.origin === self.location.origin &&
-    PRECACHE.indexOf(url.pathname) !== -1
+    PRECACHE.indexOf(url.pathname) !== -1 &&
+    (wanted === null || wanted === VERSION)
   ) {
     event.respondWith(
       caches.match(url.pathname).then(function (hit) {

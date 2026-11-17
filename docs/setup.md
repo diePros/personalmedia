@@ -78,6 +78,7 @@ services:
       PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
       PM_TRUSTED_PROXY: 127.0.0.1
       PM_MAX_UPLOAD_MB: "100"
+      # PM_IOS_SHORTCUT_URL: https://www.icloud.com/shortcuts/<32 hex chars>   # optional: iCloud link of the PMS Shortcut
     volumes:
       - /DATA/AppData/personal-media:/data
     tmpfs:
@@ -229,7 +230,7 @@ Treat the token like a key: it can unlock your documents within its scope. If it
 ## 7b. Share to Personal Media from a phone
 
 - **Android (Chrome):** install the app (menu → *Install app*). Personal Media then appears in the share sheet for PDFs, images and text files. Shared files go to a review page where you can set a title and tags and press **Save**; nothing is stored before that. They wait in the server's memory only (never on disk), for 15 minutes at most, and a share is limited to `PM_MAX_UPLOAD_MB`. If your session has expired you log in first and land on the review page with the files still waiting.
-- **iPhone/iPad:** iOS has no share target for web apps. Use the Shortcut in [`docs/ios-shortcut.md`](ios-shortcut.md), which uploads through `/api/upload` with a restricted token.
+- **iPhone/iPad:** iOS has no share target for web apps. The owner builds one Shortcut from [`docs/ios-shortcut.md`](ios-shortcut.md) and sets `PM_IOS_SHORTCUT_URL` to its iCloud link (`https://www.icloud.com/shortcuts/<32 hex chars>`; anything else is ignored with a warning). Each user then presses **Set up iPhone sharing** in Settings, taps **Get the Shortcut** and pastes their setup code.
 
 **SameSite note.** The Android share is a cross-site `POST` navigation into the app. Whether Chrome sends the `SameSite=Strict` session cookie with it is not guaranteed, so the flow does not depend on it. If the share arrives **without a session**, the server stages the files anonymously (at most 25 MiB, one share per client address), sets a short-lived `__Host-pm_continue` cookie (`SameSite=Lax`) holding only the staging id, and sends you through login; after login you land on the review page. If you are already logged in and the browser opens `/login` with that cookie, you are forwarded straight to the review page. Only the browser that holds the continue cookie can claim an anonymous share, and its review page warns that the files were sent before you logged in. The session cookie `__Host-pm_session` stays `Strict`: a `Lax` cookie is not sent on a cross-site `POST` either, so relaxing it would not help the share, and it would only expose pages to cross-site navigations. Do not relax it. Having to log in on each share is the accepted cost.
 
@@ -284,6 +285,26 @@ Then run `hermes mcp login pms`, or simply use the server once. The browser open
 - claude.ai connects from Anthropic's servers through Funnel and they give up after about 10 seconds. If Funnel is slow the connection can fail; simply retry.
 - Revoke an app under **Settings → Connected apps**. It stops working at once.
 - Static `pm_` tokens still work and are managed under **Settings → Tokens**.
+
+## 7e. Handwritten notes (v1.5)
+
+PMS cannot read handwriting itself yet. Instead your own AI assistant (claude.ai, Hermes) reads the pages through MCP and saves a transcription that PMS then searches like any other text.
+
+1. Connect the assistant with a **read and write** token or app with **full text** access (section 7 or 7d). Add a tag allow-list such as `handwritten` if it should only see those documents.
+2. Scan or upload the handwritten pages and tag them (for example `handwritten`). The document's own MCP setting must not be limited below `full`.
+3. Ask the assistant, for example in claude.ai:
+
+   > Find my documents tagged handwritten, read each page with get_page_image, and save a faithful transcription with set_transcription.
+
+Tools involved:
+
+- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute.
+- `set_transcription { id, text, mode? }` stores the text (`replace`, the default, or `append`). It becomes the searchable text, is marked "transcribed by an AI assistant" on the document page and is indexed for semantic search again if that is enabled for the document.
+- `set_notes { id, notes }` sets the document's notes (see below).
+
+**Privacy:** page images leave your server and go to the AI provider of the assistant you connected, but only for documents that your token or app may read in full and whose MCP setting is `full`. Documents set to `metadata` or `off` for MCP, and tokens without full text access, never get page images. Images are rendered on demand in memory-backed scratch space, never cached and deleted right after.
+
+**Notes:** every document has an optional **Notes** field (up to 2000 characters), editable on the document page and in the Scan save sheet. Notes count as metadata, like title and tags: they are searchable even for assistants that only get metadata, so keep secrets out of them. They are included in the ZIP export.
 
 ## 8. Backups
 

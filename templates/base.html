@@ -9,13 +9,17 @@
 <meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"historyCacheSize":0,"allowScriptTags":false}'>
 <meta name="theme-color" content="#fafaf9" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1c1917" media="(prefers-color-scheme: dark)">
-<link rel="manifest" href="/manifest.webmanifest">
-<link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+<link rel="manifest" href="/manifest.webmanifest?v={{ page.v() }}">
+<link rel="icon" type="image/svg+xml" href="/static/icons/favicon.svg?v={{ page.v() }}">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png?v={{ page.v() }}">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/icons/favicon-16.png?v={{ page.v() }}">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png?v={{ page.v() }}">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <title>{% block title %}PMS{% endblock %}</title>
-<link rel="stylesheet" href="/static/app.css">
-<script src="/static/htmx.min.js" defer></script>
-<script src="/static/app.js" defer></script>
+<link rel="stylesheet" href="/static/app.css?v={{ page.v() }}">
+{% block head %}{% endblock %}
+<script src="/static/htmx.min.js?v={{ page.v() }}" defer></script>
+<script src="/static/app.js?v={{ page.v() }}" defer></script>
 </head>
 <body>
 <header class="site-header">
@@ -39,5 +43,13 @@
 <main>
 {% block content %}{% endblock %}
 </main>
+{% if page.username.is_some() -%}
+<nav class="tabbar" aria-label="App">
+<a class="tab" href="/documents"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" focusable="false"><path d="M7 3h7l5 5v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Documents</span></a>
+<a class="tab" href="/scan"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" focusable="false"><path d="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2M4 12h16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Scan</span></a>
+<a class="tab" href="/documents#q"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" focusable="false"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg><span>Search</span></a>
+<a class="tab" href="/settings"><svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true" focusable="false"><path d="M4 7h10M18 7h2M4 17h2M10 17h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="16" cy="7" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="8" cy="17" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg><span>Settings</span></a>
+</nav>
+{% endif -%}
 </body>
 </html>

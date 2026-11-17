@@ -9,6 +9,17 @@
 <p class="error" role="alert">{{ error }}</p>
 {% endif -%}
 
+<section id="account" class="account-standalone">
+<h2>Account</h2>
+<form method="post" action="/logout">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit">Log out</button>
+</form>
+{% if page.is_admin -%}
+<p><a href="/admin">Admin</a></p>
+{% endif -%}
+</section>
+
 <section id="access">
 <h2>Access defaults</h2>
 <p class="muted">Choose how much each channel may see of your documents. Per-document settings on a document's page override these defaults.</p>
@@ -117,6 +128,19 @@
 <p class="muted">Creates the tag and adds it to the allow-list above. A token with no tag selected can reach every document.</p>
 </div>
 <button type="submit">Create token</button>
+</form>
+</section>
+
+<section id="ios-sharing">
+<h2>iPhone &amp; iPad sharing</h2>
+<p class="muted">iOS cannot share to web apps directly. A Shortcut adds a "PMS" entry to the share sheet that saves photos, PDFs and files into your vault, tagged <code>inbox</code>. This creates a token named "iPhone Shortcut" that can add documents and reach only the <code>inbox</code> tag (metadata and notes, no document content); revoke it below if the phone is lost.</p>
+<form method="post" action="/settings/ios" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="ios-password">Your password</label>
+<input type="password" id="ios-password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit">Set up iPhone sharing</button>
 </form>
 </section>
 

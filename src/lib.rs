@@ -9,6 +9,7 @@ pub mod harden;
 pub mod keyring;
 pub mod mcp;
 pub mod oauth;
+pub mod pdf;
 pub mod quota;
 pub mod recover;
 pub mod system_db;
