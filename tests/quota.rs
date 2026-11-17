@@ -595,3 +595,50 @@ async fn admin_quota_forms_roundtrip() {
         403
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quota_413_body_has_message_and_is_early() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = uid(&t, "alice");
+    let base = t.state.quotas.usage(&id).await;
+    t.state
+        .sys
+        .set_user_quota(&id, QuotaSetting::Custom(base + 10 * 1024))
+        .unwrap();
+    // The declared length does not fit; the body must never be read.
+    let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = polled.clone();
+    let body = Body::from_stream(stream::once(async move {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::io::Error>(Bytes::from(vec![0u8; 64]))
+    }));
+    let b = builder(Method::POST, "/api/upload", &c)
+        .header("sec-fetch-site", "same-origin")
+        .header("origin", "null")
+        .header("x-csrf-token", &c.csrf)
+        .header(
+            header::CONTENT_TYPE,
+            "multipart/form-data; boundary=pm-test-boundary-7f3a9c",
+        )
+        .header(header::CONTENT_LENGTH, 64 * 1024);
+    let resp = t.request(b.body(body).unwrap()).await;
+    assert_eq!(resp.status(), 413);
+    let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["status"], "quota_exceeded");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Storage quota reached ("),
+        "{v}"
+    );
+    assert!(
+        !polled.load(std::sync::atomic::Ordering::SeqCst),
+        "the body was read before the refusal"
+    );
+    // The page script shows the message, not just the status.
+    let js =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/static/app.js")).unwrap();
+    assert!(js.contains("data.message || data.error || resp.status"));
+}

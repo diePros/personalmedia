@@ -92,7 +92,11 @@
             })
             .then(function (data) {
               if (!resp.ok) {
-                setState(row, "error: " + (data.error || resp.status), true);
+                setState(
+                  row,
+                  "error: " + (data.message || data.error || resp.status),
+                  true
+                );
               } else if (data.status === "duplicate") {
                 setState(row, "duplicate of " + data.existing_title + " ", false);
                 var btn = document.createElement("button");

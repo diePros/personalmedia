@@ -247,6 +247,7 @@ impl TestApp {
         if !client.csrf.is_empty() {
             b = b.header("x-csrf-token", &client.csrf);
         }
+        let b = b.header(header::CONTENT_LENGTH, body.len());
         self.request(b.body(Body::from(body)).unwrap()).await
     }
 }

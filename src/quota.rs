@@ -132,6 +132,18 @@ impl Quotas {
         }
     }
 
+    /// [`Quotas::limit_for`] without blocking the async worker thread.
+    pub async fn limit_for_async(self: &Arc<Self>, user_id: &str) -> Option<u64> {
+        self.sys.as_ref()?;
+        let (q, id) = (self.clone(), user_id.to_owned());
+        tokio::task::spawn_blocking(move || q.limit_for(&id))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "quota limit lookup failed");
+                Some(crate::system_db::DEFAULT_QUOTA_BYTES)
+            })
+    }
+
     fn is_fresh(&self, user_id: &str) -> bool {
         self.lock()
             .get(user_id)
@@ -191,6 +203,19 @@ impl Quotas {
         };
         r.grow(bytes)?;
         Ok(r)
+    }
+
+    /// Fail at once when `bytes` cannot fit into what is left of the user's
+    /// quota (an early check, nothing is reserved).
+    pub async fn check_room(self: &Arc<Self>, user_id: &str, bytes: u64) -> Result<(), QuotaError> {
+        let Some(limit) = self.limit_for_async(user_id).await else {
+            return Ok(());
+        };
+        let used = self.usage(user_id).await;
+        if used.saturating_add(bytes) > limit {
+            return Err(QuotaError { used, limit });
+        }
+        Ok(())
     }
 
     /// A document of `bytes` (its blob size on disk) was deleted.

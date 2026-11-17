@@ -302,6 +302,16 @@ async fn upload(
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
+    // Answer a quota refusal before the body is read: a browser that is still
+    // sending gets the message instead of a connection reset.
+    if let Some(n) = size_hint
+        && let Err(e) = state.quotas.check_room(&unlocked.user_id, n).await
+    {
+        return doc_error(DocError::QuotaExceeded {
+            used: e.used,
+            limit: e.limit,
+        });
+    }
     let multipart = match Multipart::from_request(Request::from_parts(parts, body), &state).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
