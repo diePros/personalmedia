@@ -535,3 +535,37 @@ async fn parallel_scans_limited_and_quota_reserved() {
     assert_eq!(status, 413);
     assert_eq!(blob_count(&t, "alice"), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn standalone_settings_has_logout_and_admin_for_admins() {
+    let t = TestApp::new();
+    let admin = t.admin_session_for("boss");
+    let user = t.session_for("alice");
+    let html = body_string(t.get("/settings", &user).await).await;
+    let block = html
+        .split("id=\"account\"")
+        .nth(1)
+        .expect("account block in settings")
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(block.contains("action=\"/logout\""));
+    assert!(block.contains("name=\"csrf\""));
+    assert!(!block.contains("href=\"/admin\""));
+    let html = body_string(t.get("/settings", &admin).await).await;
+    let block = html
+        .split("id=\"account\"")
+        .nth(1)
+        .unwrap()
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(block.contains("action=\"/logout\""));
+    assert!(block.contains("href=\"/admin\""));
+    // Only the installed app shows it; the header already has these links.
+    let css = include_str!("../static/app.css");
+    assert!(css.contains(".account-standalone {\n  display: none;"));
+    assert!(css.contains(".standalone .account-standalone"));
+    // Signed-out: the browser header is unchanged.
+    assert!(html.contains("class=\"site-header\""));
+}

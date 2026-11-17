@@ -16,7 +16,9 @@ use bytes::Bytes;
 use futures_util::stream;
 use zeroize::Zeroizing;
 
-use super::docs::{db, doc_error, json_error, now, parse_tags, read_text_field, web_filter};
+use super::docs::{
+    db, doc_error, json_error, multipart_error, now, parse_tags, read_text_field, web_filter,
+};
 use super::session::{AuthRejection, CurrentUser};
 use super::{AppState, CSP, CspOverride, Page, render};
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
@@ -184,7 +186,7 @@ async fn scan_upload(
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(_) => return json_error(StatusCode::BAD_REQUEST, "malformed multipart body"),
+            Err(e) => return multipart_error(&e),
         };
         let name = field.name().unwrap_or_default().to_owned();
         if name != "page" {
@@ -225,9 +227,7 @@ async fn scan_upload(
                     push(&mut buf, &chunk);
                 }
                 Ok(None) => break,
-                Err(_) => {
-                    return json_error(StatusCode::BAD_REQUEST, "malformed multipart body");
-                }
+                Err(e) => return multipart_error(&e),
             }
         }
         pages.push(buf);

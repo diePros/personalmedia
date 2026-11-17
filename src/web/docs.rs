@@ -76,7 +76,9 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         .route("/documents/{id}/access", post(set_access))
         .route(
             "/api/upload",
-            post(upload).layer(DefaultBodyLimit::max(limit)),
+            post(upload)
+                .layer(DefaultBodyLimit::max(limit))
+                .layer(axum::middleware::map_response(json_upload_errors)),
         )
 }
 
@@ -125,6 +127,50 @@ pub(super) fn doc_error(e: DocError) -> Response {
         DocError::InvalidDate => json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid date"),
         DocError::InvalidInput(msg) => json_error(StatusCode::UNPROCESSABLE_ENTITY, msg),
         DocError::Internal(e) => internal(e),
+    }
+}
+
+/// Every error `/api/upload` answers carries the JSON shape of
+/// [`json_error`], including the ones raised before the handler (bearer
+/// `401` with an empty body, the rate limiter's `429` text, body-limit and
+/// multipart rejections), so the iOS Shortcut can read `status` and `message`.
+/// Headers such as `WWW-Authenticate` and `Retry-After` are kept.
+async fn json_upload_errors(resp: Response) -> Response {
+    let status = resp.status();
+    let is_json = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("application/json"));
+    if (!status.is_client_error() && !status.is_server_error()) || is_json {
+        return resp;
+    }
+    let msg = match status {
+        StatusCode::UNAUTHORIZED => "Not signed in or the token was revoked",
+        StatusCode::FORBIDDEN => "Not allowed",
+        StatusCode::PAYLOAD_TOO_LARGE => "Upload too large",
+        StatusCode::TOO_MANY_REQUESTS => "Too many attempts, try again later",
+        StatusCode::SERVICE_UNAVAILABLE => "Server busy, try again",
+        s if s.is_server_error() => "Server error",
+        _ => "Upload failed",
+    };
+    let (mut parts, _) = resp.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::CONTENT_TYPE);
+    (
+        parts,
+        axum::Json(serde_json::json!({ "status": "error", "message": msg, "error": msg })),
+    )
+        .into_response()
+}
+
+/// A multipart read error: `413` when the body limit was hit, else `400`.
+pub(super) fn multipart_error(e: &axum::extract::multipart::MultipartError) -> Response {
+    match e.status() {
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            json_error(StatusCode::PAYLOAD_TOO_LARGE, "upload too large")
+        }
+        _ => json_error(StatusCode::BAD_REQUEST, "malformed multipart body"),
     }
 }
 
@@ -271,12 +317,7 @@ pub(super) async fn read_text_field(
                 buf.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(_) => {
-                return Err(json_error(
-                    StatusCode::BAD_REQUEST,
-                    "malformed multipart body",
-                ));
-            }
+            Err(e) => return Err(multipart_error(&e)),
         }
     }
     String::from_utf8(buf)
@@ -364,7 +405,7 @@ async fn handle_upload_inner(
         let field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => return json_error(StatusCode::BAD_REQUEST, "missing file field"),
-            Err(_) => return json_error(StatusCode::BAD_REQUEST, "malformed multipart body"),
+            Err(e) => return multipart_error(&e),
         };
         let name = field.name().unwrap_or_default().to_owned();
         if name == "file" {

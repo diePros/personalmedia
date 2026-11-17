@@ -17,21 +17,35 @@ Open the **Shortcuts** app, tap **+** to make a new shortcut and add these actio
    - The imported answer replaces the Text on each device, so your own code never travels with the link.
 5. Add **Split Text** on that Text. Choose **Custom** and enter `|` as the separator.
 6. Add **Get Item from List** and choose **First Item** (the URL). Add **Set Variable** `URL`. Add a second **Get Item from List** on the Split Text, with **Item at Index** `2` (the token), and **Set Variable** `Token`.
-7. Add **Count** on **Shortcut Input** with *Items*. Then add **If** *Count* **is greater than** `1`.
-   - Inside the **If**: add **Make PDF** on **Shortcut Input**. The images become one PDF document.
-   - Add **Set Variable** `Upload` to the PDF.
-   - **Otherwise**: **Set Variable** `Upload` to **Shortcut Input**.
-   - **End If**.
-8. Add **Get Contents of URL**:
+7. Decide what to upload (only a batch of **images** becomes one PDF):
+   - Add **Count** on **Shortcut Input** with *Items*, then **Set Variable** `Total`.
+   - Add **Filter Files** on **Shortcut Input** with the filter *Type* **is** *Image*. Add **Count** on the result with *Items*, then **Set Variable** `Images`.
+   - Add **If** `Total` **is greater than** `1`. Inside it add a second **If** `Images` **is** `Total` (the variable). Inside that one: **Make PDF** on **Shortcut Input**, then **Set Variable** `Items` to the PDF. Add **Otherwise** and **Set Variable** `Items` to **Shortcut Input**. **End If**.
+   - The outer **Otherwise**: **Set Variable** `Items` to **Shortcut Input**. **End If**.
+   - Several PDFs or mixed files are therefore uploaded one by one, not merged.
+8. Add **Repeat with Each** on `Items`. Everything up to step 10 goes inside it. First add **Get Contents of URL**:
    - URL: the `URL` variable followed by `/api/upload`.
    - Expand it with the arrow. **Method**: **POST**.
    - **Headers** → **Add new header**: key `Authorization`, text `Bearer ` followed by the `Token` variable (the word Bearer, a space, then the variable).
-   - **Request Body**: **Form**. **Add new field** → **File**: key `file`, value the `Upload` variable.
-9. Add **Get Dictionary Value** for the key `error` from **Contents of URL**.
-10. Add **If** *Dictionary Value* **has any value**. Inside, **Show Notification** with the dictionary value (the error message). **Otherwise**, **Show Notification** with the text `Saved to PMS`. **End If**.
+   - **Request Body**: **Form**. **Add new field** → **File**: key `file`, value **Repeat Item**.
+9. Add **Get Dictionary Value** for the key `status` from **Contents of URL**, and **Set Variable** `Status`.
+10. Branch on the result. Never treat "no error" as success: a revoked token, a rate limit or a Funnel error page has no `status` at all.
+    - **If** `Status` **is** `stored`: **Show Notification** `Saved to PMS`.
+    - **Otherwise If** `Status` **is** `duplicate`: **Show Notification** `Already in PMS`.
+    - **Otherwise**: **Show Notification** `Upload FAILED - keep your original` with **Contents of URL** appended (the response text, which says why). **End If**.
+    - **End Repeat**.
 11. Tap **Done**.
 
 If iOS asks you to allow "untrusted shortcuts" when someone imports it, they need to enable that in Settings → Shortcuts only if prompted. Links from iCloud normally do not need it.
+
+## What the responses mean
+
+Every answer from `/api/upload` is JSON. A success has `"status": "stored"` or `"status": "duplicate"`; every failure has `"status": "error"` (or `"quota_exceeded"`) and a `message`. The HTTP status tells you what to do:
+
+- **401**: the token was revoked or is wrong. Set PMS up again in Settings and paste the new code.
+- **413**: the file is too large (over `PM_MAX_UPLOAD_MB`) or your storage quota is full.
+- **429** or **503**: too many attempts or the server is busy. Try again in a minute.
+- Anything else, or a Funnel error page that is not JSON: the Shortcut shows "Upload FAILED" with the response text. Keep the original.
 
 ## Publish the link
 
@@ -45,7 +59,7 @@ If iOS asks you to allow "untrusted shortcuts" when someone imports it, they nee
 2. Tap **Get the Shortcut** and add it.
 3. When the Shortcut asks for the setup code, paste the one from the page (press **Copy** first). The code is shown only once; you can repeat the setup at any time.
 
-Then share any photo, PDF or file with **PMS** from the share sheet. Several images shared together become one PDF.
+Then share any photo, PDF or file with **PMS** from the share sheet. Several images shared together become one PDF; other files are uploaded one by one.
 
 ## Security notes
 

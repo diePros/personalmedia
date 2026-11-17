@@ -419,6 +419,22 @@ fieldset.mode legend {
   display: none;
 }
 
+/* Account actions on the Settings page: the site header carries them in a
+   browser, so they show only in the installed app. */
+.account-standalone {
+  display: none;
+}
+
+.standalone .account-standalone {
+  display: block;
+}
+
+@media (display-mode: standalone) {
+  .account-standalone {
+    display: block;
+  }
+}
+
 .standalone {
   --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
 }
