@@ -139,7 +139,9 @@ impl AppState {
         let limiter = Arc::new(RateLimiter::new());
         let tokens = Arc::new(TokenCache::default());
         let oauth = Arc::new(crate::oauth::OAuthState::default());
-        spawn_sweeper(&sessions, &shared, &limiter, &tokens, &oauth, &sys);
+        spawn_sweeper(
+            &sessions, &shared, &limiter, &tokens, &oauth, &sys, &keyring,
+        );
 
         Ok(AppState {
             cfg: Arc::new(cfg),
@@ -176,40 +178,62 @@ fn spawn_sweeper(
     tokens: &Arc<TokenCache>,
     oauth: &Arc<crate::oauth::OAuthState>,
     sys: &Arc<SystemDb>,
+    keyring: &Arc<Keyring>,
 ) {
-    let (sessions, shared, limiter, tokens, oauth, sys) = (
+    let (sessions, shared, limiter, tokens, oauth, sys, keyring) = (
         Arc::downgrade(sessions),
         Arc::downgrade(shared),
         Arc::downgrade(limiter),
         Arc::downgrade(tokens),
         Arc::downgrade(oauth),
         Arc::downgrade(sys),
+        Arc::downgrade(keyring),
     );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             tick.tick().await;
-            let (Some(sessions), Some(shared), Some(limiter), Some(tokens), Some(oauth), Some(sys)) = (
+            let (
+                Some(sessions),
+                Some(shared),
+                Some(limiter),
+                Some(tokens),
+                Some(oauth),
+                Some(sys),
+                Some(keyring),
+            ) = (
                 sessions.upgrade(),
                 shared.upgrade(),
                 limiter.upgrade(),
                 tokens.upgrade(),
                 oauth.upgrade(),
                 sys.upgrade(),
-            ) else {
+                keyring.upgrade(),
+            )
+            else {
                 break;
             };
             sessions.sweep();
             shared.sweep();
             limiter.sweep();
             tokens.sweep();
-            oauth.sweep();
+            // Codes that expired unused leave a pre-minted grant behind.
+            let expired = oauth.sweep();
             let cutoff = unix_now() - crate::oauth::UNUSED_CLIENT_TTL_SECS;
             let sys = sys.clone();
+            let keyring = keyring.clone();
             // SQLite is blocking; keep it off the async worker.
             let _ = tokio::task::spawn_blocking(move || {
                 if let Err(e) = sys.prune_oauth_clients(cutoff) {
                     tracing::error!(error = %e, "pruning unused oauth clients failed");
+                }
+                for (user_id, grant_id) in expired {
+                    let u = keyring.get(&user_id);
+                    if let Err(e) =
+                        crate::tokens::revoke_grant(&sys, u.as_deref(), &grant_id, &tokens)
+                    {
+                        tracing::error!(error = %e, "revoking an expired code's grant failed");
+                    }
                 }
             })
             .await;

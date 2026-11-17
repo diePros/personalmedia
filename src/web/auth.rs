@@ -85,11 +85,17 @@ fn start_session(
         .then_some(proof)
         .flatten()
         .filter(|id| state.shared.exists_for(id, &user.id, Some(id)));
+    // An OAuth authorize request that was waiting for this login continues on
+    // the consent page (the same cookie names a pending request instead).
+    let oauth = share.is_none()
+        && recovery.is_none()
+        && proof.is_some_and(|id| state.oauth.request(id).is_some());
     let (cookie, _csrf) = state.sessions.create(user, unlocked, recovery);
-    // The review page needs the cookie as proof, and clears it itself.
-    let followed = share.is_some();
+    // The review and consent pages need the cookie as proof, and clear it themselves.
+    let followed = share.is_some() || oauth;
     let mut resp = match share {
         Some(id) => redirect(headers, &format!("/share/{id}")),
+        None if oauth => redirect(headers, "/oauth/authorize/resume"),
         None => redirect(headers, to),
     };
     resp.headers_mut()
@@ -315,6 +321,9 @@ async fn recovery_key_confirm(
     let proof = continue_id(&headers);
     match proof.filter(|id| state.shared.exists_for(id, &session.user_id, Some(id))) {
         Some(id) => redirect(&headers, &format!("/share/{id}")),
+        None if proof.is_some_and(|id| state.oauth.request(id).is_some()) => {
+            redirect(&headers, "/oauth/authorize/resume")
+        }
         None => redirect(&headers, "/documents"),
     }
 }
@@ -360,12 +369,18 @@ async fn login_page(
     headers: HeaderMap,
     session: Option<axum::Extension<super::session::Session>>,
 ) -> Response {
-    if let Some(axum::Extension(s)) = session
+    if let Some(axum::Extension(s)) = &session
         && s.must_confirm_recovery.is_none()
         && let Some(id) = continue_id(&headers)
         && state.shared.exists_for(id, &s.user_id, Some(id))
     {
         return redirect(&headers, &format!("/share/{id}"));
+    }
+    if let Some(axum::Extension(s)) = &session
+        && s.must_confirm_recovery.is_none()
+        && continue_id(&headers).is_some_and(|id| state.oauth.request(id).is_some())
+    {
+        return redirect(&headers, "/oauth/authorize/resume");
     }
     render(&LoginPage {
         page: Page::anonymous(),

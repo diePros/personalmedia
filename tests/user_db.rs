@@ -349,10 +349,12 @@ fn token_meta_roundtrip() {
         },
         created_at: 5,
         last_used_at: None,
+        grant: None,
     };
     insert_token_meta(&conn, &t).unwrap();
     let got = get_token_meta(&conn, "tok1").unwrap().unwrap();
     assert_eq!(got.scope, t.scope);
+    assert_eq!(got.grant, None);
     assert_eq!(got.name, "claude");
     touch_token(&conn, "tok1", 99).unwrap();
     assert_eq!(list_token_meta(&conn).unwrap()[0].last_used_at, Some(99));

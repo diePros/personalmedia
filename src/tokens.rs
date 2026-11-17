@@ -13,14 +13,26 @@ use anyhow::{Context, bail};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::crypto::{INFO_TOKEN, aad, fill_random, secret_kek, unwrap_key, wrap_key};
+use crate::crypto::{INFO_TOKEN, Key32, aad, fill_random, secret_kek, unwrap_key, wrap_key};
 use crate::keyring::Unlocked;
-use crate::system_db::SystemDb;
+use crate::system_db::{OauthTokenRow, SystemDb};
 use crate::user_db::{
-    Access, AccessFilter, Channel, Content, Level, ListFilter, TokenMeta, TokenScope,
+    Access, AccessFilter, Channel, Content, GrantInfo, Level, ListFilter, TokenMeta, TokenScope,
     delete_token_meta, get_token_meta, insert_token_meta, list_tags, touch_token,
 };
 use crate::web::AppState;
+
+/// `tokens.kind` values.
+const KIND_STATIC: &str = "static";
+const KIND_ACCESS: &str = "oauth_access";
+const KIND_REFRESH: &str = "oauth_refresh";
+/// OAuth access tokens are `pma_{id}_{secret}`, refresh tokens `pmr_{id}_{secret}`.
+const ACCESS_PREFIX: &str = "pma_";
+const REFRESH_PREFIX: &str = "pmr_";
+/// Lifetime of an OAuth access token.
+pub const ACCESS_TTL_SECS: i64 = 3600;
+/// Lifetime of an OAuth refresh token.
+pub const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 
 /// How long an unused cache entry survives.
 pub const CACHE_IDLE: Duration = Duration::from_secs(5 * 60);
@@ -149,13 +161,30 @@ impl Principal {
 #[derive(Debug)]
 pub struct AuthFail;
 
-pub(crate) fn parse_bearer(bearer: &str) -> Option<&str> {
-    let rest = bearer.strip_prefix("pm_")?;
+/// Splits `{prefix}{id: 32 hex}_{secret: 64 hex}` into `(id, secret)`.
+fn split_token<'a>(token: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+    let rest = token.strip_prefix(prefix)?;
     let (id, secret) = rest.split_once('_')?;
     let hex_ok = |s: &str, n: usize| {
         s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     };
-    (hex_ok(id, 32) && hex_ok(secret, 64)).then_some(id)
+    (hex_ok(id, 32) && hex_ok(secret, 64)).then_some((id, secret))
+}
+
+/// The token id of a well-formed bearer: a static `pm_` or an OAuth access
+/// `pma_` token.
+pub(crate) fn parse_bearer(bearer: &str) -> Option<&str> {
+    split_token(bearer, "pm_")
+        .or_else(|| split_token(bearer, ACCESS_PREFIX))
+        .map(|(id, _)| id)
+}
+
+/// Unwraps the UMK of a token row with the secret in `token`.
+fn unwrap_with_secret(token_id: &str, secret_hex: &str, wrapped: &[u8]) -> Option<Key32> {
+    let mut secret = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(secret_hex, secret.as_mut()).ok()?;
+    let kek = secret_kek(&secret, INFO_TOKEN);
+    unwrap_key(&kek, wrapped, aad::umk_token(token_id).as_bytes()).ok()
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -174,16 +203,38 @@ fn now_secs() -> i64 {
 /// so a revoked token, a disabled user or a deleted user fails at once.
 pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFail> {
     let id = parse_bearer(bearer).ok_or(AuthFail)?;
+    let is_access = bearer.starts_with(ACCESS_PREFIX);
     let hash: [u8; 32] = Sha256::digest(bearer.as_bytes()).into();
 
-    let (user_id, wrapped) = state
+    let row = state
         .sys
-        .token(id)
+        .token_full(id)
         .map_err(|e| {
             tracing::error!(error = %e, "token lookup failed");
             AuthFail
         })?
         .ok_or(AuthFail)?;
+    // The prefix must match the row's kind: a refresh token is never a bearer.
+    let kind_ok = if is_access {
+        row.kind == KIND_ACCESS
+    } else {
+        row.kind == KIND_STATIC
+    };
+    if !kind_ok {
+        return Err(AuthFail);
+    }
+    if row.expires_at.is_some_and(|exp| exp <= now_secs()) {
+        // Lazy cleanup of an expired token.
+        state.tokens.evict(id);
+        if let Err(e) = state.sys.delete_token(id) {
+            tracing::warn!(error = %e, "could not delete expired token row");
+        }
+        return Err(AuthFail);
+    }
+    let user_id = row.user_id.clone();
+    // Static tokens keep their metadata under the token id, grants under the
+    // grant id.
+    let meta_id = row.grant_id.clone().unwrap_or_else(|| id.to_owned());
     let user = state
         .sys
         .user_by_id(&user_id)
@@ -220,7 +271,7 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
     };
     if let Some((unlocked, scope, touch)) = hit {
         if touch {
-            touch_meta(&unlocked, id);
+            touch_meta(&unlocked, &meta_id);
         }
         return Ok(Principal {
             unlocked,
@@ -230,11 +281,7 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
     }
 
     // Miss: unwrap the UMK with the secret and unlock.
-    let secret_hex = &bearer[bearer.len() - 64..];
-    let mut secret = Zeroizing::new([0u8; 32]);
-    hex::decode_to_slice(secret_hex, secret.as_mut()).map_err(|_| AuthFail)?;
-    let kek = secret_kek(&secret, INFO_TOKEN);
-    let umk = unwrap_key(&kek, &wrapped, aad::umk_token(id).as_bytes()).map_err(|_| AuthFail)?;
+    let umk = unwrap_with_secret(id, &bearer[bearer.len() - 64..], &row.wrapped).ok_or(AuthFail)?;
     let unlocked = state
         .keyring
         .unlock(&user_id, umk, &user.index_key_wrapped)
@@ -243,13 +290,13 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
             AuthFail
         })?;
     let meta = unlocked
-        .with_db(|c| get_token_meta(c, id))
+        .with_db(|c| get_token_meta(c, &meta_id))
         .map_err(|e| {
             tracing::error!(error = %e, "token meta lookup failed");
             AuthFail
         })?
         .ok_or(AuthFail)?;
-    touch_meta(&unlocked, id);
+    touch_meta(&unlocked, &meta_id);
     let now = Instant::now();
     state.tokens.lock().insert(
         id.to_owned(),
@@ -302,6 +349,7 @@ pub fn create_token(
         scope,
         created_at: now,
         last_used_at: None,
+        grant: None,
     };
     if let Err(e) = u.with_db(|c| insert_token_meta(c, &meta)) {
         if let Err(e2) = sys.delete_token(&id) {
@@ -320,12 +368,295 @@ pub fn revoke_token(
     token_id: &str,
     cache: &TokenCache,
 ) -> anyhow::Result<()> {
-    if u.with_db(|c| get_token_meta(c, token_id))?.is_none() {
+    let Some(meta) = u.with_db(|c| get_token_meta(c, token_id))? else {
         bail!("unknown token");
+    };
+    if meta.grant.is_some() {
+        return revoke_grant(sys, Some(u), token_id, cache);
     }
     // The system row is what grants access, so it goes first.
     sys.delete_token(token_id)?;
     u.with_db(|c| delete_token_meta(c, token_id))?;
     cache.evict(token_id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OAuth grants
+// ---------------------------------------------------------------------------
+
+/// A freshly minted access/refresh pair. The strings exist only here and in
+/// the in-memory authorization-code entry until the client has them.
+pub struct IssuedPair {
+    pub access: Zeroizing<String>,
+    pub refresh: Zeroizing<String>,
+    rows: Vec<OauthTokenRow>,
+}
+
+fn random_hex<const N: usize>() -> Zeroizing<String> {
+    let mut b = Zeroizing::new([0u8; N]);
+    fill_random(b.as_mut());
+    Zeroizing::new(hex::encode(b.as_slice()))
+}
+
+/// Mints one token string and its wrapped row for `umk`.
+fn mint_token(
+    umk: &Key32,
+    user_id: &str,
+    grant_id: &str,
+    prefix: &str,
+    kind: &'static str,
+    expires_at: i64,
+) -> (Zeroizing<String>, OauthTokenRow) {
+    let id = random_hex::<16>();
+    let secret_hex = random_hex::<32>();
+    let mut secret = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(secret_hex.as_str(), secret.as_mut()).expect("hex we just made");
+    let kek = secret_kek(&secret, INFO_TOKEN);
+    let wrapped = wrap_key(&kek, umk, aad::umk_token(&id).as_bytes());
+    let token = Zeroizing::new(format!("{prefix}{}_{}", id.as_str(), secret_hex.as_str()));
+    (
+        token,
+        OauthTokenRow {
+            token_id: id.to_string(),
+            user_id: user_id.to_owned(),
+            wrapped,
+            kind,
+            expires_at,
+            grant_id: grant_id.to_owned(),
+        },
+    )
+}
+
+fn mint_pair(umk: &Key32, user_id: &str, grant_id: &str, now: i64) -> IssuedPair {
+    let (access, a_row) = mint_token(
+        umk,
+        user_id,
+        grant_id,
+        ACCESS_PREFIX,
+        KIND_ACCESS,
+        now + ACCESS_TTL_SECS,
+    );
+    let (refresh, r_row) = mint_token(
+        umk,
+        user_id,
+        grant_id,
+        REFRESH_PREFIX,
+        KIND_REFRESH,
+        now + REFRESH_TTL_SECS,
+    );
+    IssuedPair {
+        access,
+        refresh,
+        rows: vec![a_row, r_row],
+    }
+}
+
+/// The OAuth scope string echoed in token responses.
+pub fn scope_string(scope: &TokenScope) -> String {
+    let mut out = String::from(match scope.access {
+        Access::Read => "mcp:read",
+        Access::ReadWrite => "mcp:write",
+    });
+    if scope.content == Content::FullText {
+        out.push_str(" content:full");
+    }
+    out.push_str(" offline_access");
+    out
+}
+
+/// Creates a grant for `u`: two wrapped system rows (access, refresh) under a
+/// fresh `grant_id` plus the grant metadata in the user's index DB. Returns
+/// the grant id and the plaintext pair. Rows are removed again if the metadata
+/// insert fails.
+pub fn create_grant(
+    sys: &SystemDb,
+    u: &Unlocked,
+    scope: TokenScope,
+    grant: GrantInfo,
+    now: i64,
+) -> anyhow::Result<(String, IssuedPair)> {
+    let grant_id = random_hex::<16>().to_string();
+    let pair = mint_pair(u.umk(), &u.user_id, &grant_id, now);
+    sys.insert_oauth_pair(&pair.rows)
+        .context("storing grant tokens")?;
+    let meta = TokenMeta {
+        id: grant_id.clone(),
+        name: grant.client_name.clone(),
+        scope,
+        created_at: now,
+        last_used_at: None,
+        grant: Some(grant),
+    };
+    if let Err(e) = u.with_db(|c| insert_token_meta(c, &meta)) {
+        if let Err(e2) = sys.delete_grant_tokens(&grant_id) {
+            tracing::error!(error = %e2, "could not roll back grant rows");
+        }
+        return Err(e.context("storing grant metadata"));
+    }
+    Ok((grant_id, pair))
+}
+
+/// Deletes every token row of `grant_id`, evicts their cache entries and, when
+/// `u` is given, the grant metadata. The system rows go first: they are what
+/// grants access.
+pub fn revoke_grant(
+    sys: &SystemDb,
+    u: Option<&Unlocked>,
+    grant_id: &str,
+    cache: &TokenCache,
+) -> anyhow::Result<()> {
+    let ids = sys.delete_grant_tokens(grant_id)?;
+    for id in &ids {
+        cache.evict(id);
+    }
+    if let Some(u) = u {
+        u.with_db(|c| delete_token_meta(c, grant_id))?;
+    }
+    Ok(())
+}
+
+/// Why a refresh failed.
+#[derive(Debug)]
+pub enum RefreshError {
+    /// The token is unknown, expired, consumed, for another client, or wrong.
+    InvalidGrant,
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for RefreshError {
+    fn from(e: anyhow::Error) -> Self {
+        RefreshError::Internal(e)
+    }
+}
+
+/// Result of a successful refresh.
+pub struct Refreshed {
+    pub pair: IssuedPair,
+    pub scope: String,
+}
+
+fn token_hash(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// Exchanges a `pmr_` refresh token for a new pair under the same grant.
+/// Blocking.
+///
+/// The old refresh and access rows are deleted and the new rows inserted in
+/// one system-DB transaction, so a crash cannot leave two live refresh
+/// tokens. The consumed id is remembered (memory only, see
+/// `OAuthState::consumed_refresh`); presenting it again revokes the grant.
+pub fn refresh_grant(
+    state: &AppState,
+    refresh_token: &str,
+    client_id: &str,
+) -> Result<Refreshed, RefreshError> {
+    let (id, secret_hex) =
+        split_token(refresh_token, REFRESH_PREFIX).ok_or(RefreshError::InvalidGrant)?;
+    let hash = token_hash(refresh_token);
+    let now = now_secs();
+
+    let Some(row) = state.sys.token_full(id)? else {
+        // Gone: either never existed or already used. A replay of a consumed
+        // token (same full string) kills the whole grant.
+        if let Some((user_id, grant_id)) = state.oauth.consumed_refresh(id, &hash) {
+            tracing::warn!(grant = %grant_id, "refresh token reuse; revoking grant");
+            let unlocked = state.keyring.get(&user_id);
+            revoke_grant(&state.sys, unlocked.as_deref(), &grant_id, &state.tokens)?;
+        }
+        return Err(RefreshError::InvalidGrant);
+    };
+    if row.kind != KIND_REFRESH {
+        return Err(RefreshError::InvalidGrant);
+    }
+    let grant_id = row.grant_id.clone().ok_or(RefreshError::InvalidGrant)?;
+    if row.expires_at.is_none_or(|exp| exp <= now) {
+        revoke_grant(
+            &state.sys,
+            state.keyring.get(&row.user_id).as_deref(),
+            &grant_id,
+            &state.tokens,
+        )?;
+        return Err(RefreshError::InvalidGrant);
+    }
+    let umk = unwrap_with_secret(id, secret_hex, &row.wrapped).ok_or(RefreshError::InvalidGrant)?;
+    let user = state
+        .sys
+        .user_by_id(&row.user_id)?
+        .ok_or(RefreshError::InvalidGrant)?;
+    if user.disabled {
+        return Err(RefreshError::InvalidGrant);
+    }
+    let unlocked = state
+        .keyring
+        .unlock(&row.user_id, umk, &user.index_key_wrapped)
+        .map_err(|_| RefreshError::InvalidGrant)?;
+    let Some(meta) = unlocked.with_db(|c| get_token_meta(c, &grant_id))? else {
+        // The grant was revoked but rows survived: finish the job.
+        revoke_grant(&state.sys, None, &grant_id, &state.tokens)?;
+        return Err(RefreshError::InvalidGrant);
+    };
+    if meta.grant.as_ref().map(|g| g.client_id.as_str()) != Some(client_id) {
+        return Err(RefreshError::InvalidGrant);
+    }
+
+    let pair = mint_pair(unlocked.umk(), &row.user_id, &grant_id, now);
+    let old_ids = state.sys.token_ids_for_grant(&grant_id)?;
+    if !state.sys.rotate_grant_tokens(id, &grant_id, &pair.rows)? {
+        // A concurrent use of the same refresh token won the race.
+        return Err(RefreshError::InvalidGrant);
+    }
+    state
+        .oauth
+        .note_consumed_refresh(id, hash, &row.user_id, &grant_id);
+    for t in old_ids {
+        state.tokens.evict(&t);
+    }
+    Ok(Refreshed {
+        scope: scope_string(&meta.scope),
+        pair,
+    })
+}
+
+/// RFC 7009 revocation of `token` (`pma_` or `pmr_`). Only a holder of the
+/// full token (secret included) can revoke it. A refresh token takes its
+/// whole grant with it; an access token only itself. Anything else is
+/// ignored. Blocking.
+pub fn revoke_presented(state: &AppState, token: &str) -> anyhow::Result<()> {
+    let refresh = split_token(token, REFRESH_PREFIX);
+    let Some((id, secret_hex)) = refresh.or_else(|| split_token(token, ACCESS_PREFIX)) else {
+        return Ok(());
+    };
+    let Some(row) = state.sys.token_full(id)? else {
+        return Ok(());
+    };
+    let expected = if refresh.is_some() {
+        KIND_REFRESH
+    } else {
+        KIND_ACCESS
+    };
+    if row.kind != expected {
+        return Ok(());
+    }
+    let Some(umk) = unwrap_with_secret(id, secret_hex, &row.wrapped) else {
+        return Ok(());
+    };
+    match (refresh.is_some(), row.grant_id) {
+        (true, Some(grant_id)) => {
+            // Unlock with the UMK we just proved we hold, so the metadata can go too.
+            let unlocked = state.sys.user_by_id(&row.user_id)?.and_then(|u| {
+                state
+                    .keyring
+                    .unlock(&row.user_id, umk, &u.index_key_wrapped)
+                    .ok()
+            });
+            revoke_grant(&state.sys, unlocked.as_deref(), &grant_id, &state.tokens)?;
+        }
+        _ => {
+            state.sys.delete_token(id)?;
+            state.tokens.evict(id);
+        }
+    }
     Ok(())
 }

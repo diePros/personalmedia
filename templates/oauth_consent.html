@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Authorize access · PMS{% endblock %}
+{% block content %}
+<h1>{{ client_name }} wants access to your documents</h1>
+<p>It will send you back to: <strong>{{ redirect_host }}</strong></p>
+<p class="muted">Choose what it may do. You can revoke access later in Settings.</p>
+<form method="post" action="/oauth/authorize" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<input type="hidden" name="req" value="{{ req_id }}">
+<div>
+<label for="consent-access">Access</label>
+<select id="consent-access" name="access">
+<option value="read"{% if !read_write %} selected{% endif %}>Read only</option>
+<option value="read_write"{% if read_write %} selected{% endif %}>Read and write</option>
+</select>
+</div>
+<div>
+<label for="consent-content">Content</label>
+<select id="consent-content" name="content">
+<option value="metadata_only"{% if !full_text %} selected{% endif %}>Metadata only</option>
+<option value="full_text"{% if full_text %} selected{% endif %}>Full text</option>
+</select>
+</div>
+{% if !tags.is_empty() -%}
+<fieldset>
+<legend>Only these tags (none selected means all documents)</legend>
+{% for tag in tags -%}
+<div class="check">
+<input type="checkbox" id="consent-tag-{{ tag.id }}" name="tags[]" value="{{ tag.id }}">
+<label for="consent-tag-{{ tag.id }}">{{ tag.name }}</label>
+</div>
+{% endfor -%}
+</fieldset>
+{% endif -%}
+<div>
+<label for="consent-new-tag">Restrict to a new tag (optional)</label>
+<input type="text" id="consent-new-tag" name="new_tag" maxlength="64" autocomplete="off">
+<p class="muted">Creates the tag and adds it to the allow-list above. With no tag selected it can reach every document.</p>
+</div>
+<div class="actions">
+<button type="submit" name="decision" value="approve">Approve</button>
+<button type="submit" name="decision" value="deny">Deny</button>
+</div>
+</form>
+{% endblock %}

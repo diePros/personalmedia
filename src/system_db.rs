@@ -660,6 +660,99 @@ impl SystemDb {
         Ok(())
     }
 
+    /// Inserts an OAuth token row (`kind` `oauth_access` or `oauth_refresh`).
+    pub fn insert_oauth_token(&self, t: &OauthTokenRow) -> anyhow::Result<()> {
+        insert_oauth_token_row(&self.lock(), t)?;
+        Ok(())
+    }
+
+    /// Inserts both rows of a grant's first token pair in one transaction.
+    pub fn insert_oauth_pair(&self, rows: &[OauthTokenRow]) -> anyhow::Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for r in rows {
+            insert_oauth_token_row(&tx, r)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The full row of a token, any kind.
+    pub fn token_full(&self, token_id: &str) -> anyhow::Result<Option<TokenFull>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT user_id, umk_wrapped, kind, expires_at, grant_id FROM tokens \
+                 WHERE token_id=?1",
+                [token_id],
+                |r| {
+                    Ok(TokenFull {
+                        user_id: r.get(0)?,
+                        wrapped: r.get(1)?,
+                        kind: r.get(2)?,
+                        expires_at: r.get(3)?,
+                        grant_id: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Ids of every token row of a grant.
+    pub fn token_ids_for_grant(&self, grant_id: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.lock();
+        let mut st =
+            conn.prepare("SELECT token_id FROM tokens WHERE grant_id=?1 ORDER BY token_id")?;
+        let rows = st.query_map([grant_id], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Deletes every token row of a grant; returns their ids.
+    pub fn delete_grant_tokens(&self, grant_id: &str) -> anyhow::Result<Vec<String>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let ids: Vec<String> = {
+            let mut st = tx.prepare("SELECT token_id FROM tokens WHERE grant_id=?1")?;
+            let rows = st.query_map([grant_id], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        tx.execute("DELETE FROM tokens WHERE grant_id=?1", [grant_id])?;
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Rotates a grant's tokens atomically: removes `old_refresh_id` and the
+    /// grant's other rows, then inserts `new_rows`. `Ok(false)` (nothing
+    /// changed) when `old_refresh_id` is already gone, i.e. a concurrent or
+    /// replayed use of the same refresh token.
+    pub fn rotate_grant_tokens(
+        &self,
+        old_refresh_id: &str,
+        grant_id: &str,
+        new_rows: &[OauthTokenRow],
+    ) -> anyhow::Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        if tx.execute("DELETE FROM tokens WHERE token_id=?1", [old_refresh_id])? != 1 {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM tokens WHERE grant_id=?1", [grant_id])?;
+        for r in new_rows {
+            insert_oauth_token_row(&tx, r)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Records that `client_id` just received a grant (keeps it from pruning).
+    pub fn touch_oauth_client_grant(&self, client_id: &str, now: i64) -> anyhow::Result<()> {
+        self.lock().execute(
+            "UPDATE oauth_clients SET last_grant_at=?2 WHERE client_id=?1",
+            params![client_id, now],
+        )?;
+        Ok(())
+    }
+
     pub fn token_ids_for_user(&self, user_id: &str) -> anyhow::Result<Vec<String>> {
         let conn = self.lock();
         let mut st =
@@ -667,6 +760,43 @@ impl SystemDb {
         let rows = st.query_map([user_id], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
+}
+
+/// A token row of an OAuth grant.
+#[derive(Clone, Debug)]
+pub struct OauthTokenRow {
+    pub token_id: String,
+    pub user_id: String,
+    pub wrapped: Vec<u8>,
+    /// `oauth_access` or `oauth_refresh`.
+    pub kind: &'static str,
+    pub expires_at: i64,
+    pub grant_id: String,
+}
+
+/// Every column of a token row. `kind` is `static`, `oauth_access` or `oauth_refresh`.
+#[derive(Clone, Debug)]
+pub struct TokenFull {
+    pub user_id: String,
+    pub wrapped: Vec<u8>,
+    pub kind: String,
+    pub expires_at: Option<i64>,
+    pub grant_id: Option<String>,
+}
+
+fn insert_oauth_token_row(conn: &Connection, t: &OauthTokenRow) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO tokens (token_id, user_id, umk_wrapped, kind, expires_at, grant_id) \
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            t.token_id,
+            t.user_id,
+            t.wrapped,
+            t.kind,
+            t.expires_at,
+            t.grant_id
+        ],
+    )
 }
 
 #[cfg(test)]

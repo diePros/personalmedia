@@ -25,8 +25,8 @@ pub use documents::{
     update_document_meta,
 };
 pub use meta::{
-    Access, Content, TokenMeta, TokenScope, delete_token_meta, get_setting, get_token_meta,
-    insert_token_meta, list_token_meta, set_setting, touch_token,
+    Access, Content, GrantInfo, TokenMeta, TokenScope, delete_token_meta, get_setting,
+    get_token_meta, insert_token_meta, list_token_meta, set_setting, touch_token,
 };
 
 #[doc(hidden)]

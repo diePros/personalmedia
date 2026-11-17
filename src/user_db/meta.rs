@@ -25,6 +25,15 @@ pub struct TokenScope {
     pub tags: Option<Vec<i64>>,
 }
 
+/// Who an OAuth grant was given to. Present on grant metadata only; the
+/// metadata `id` of a grant is its `grant_id`.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+pub struct GrantInfo {
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_host: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct TokenMeta {
     pub id: String,
@@ -32,6 +41,18 @@ pub struct TokenMeta {
     pub scope: TokenScope,
     pub created_at: i64,
     pub last_used_at: Option<i64>,
+    /// `Some` for an OAuth grant, `None` for a static `pm_` token.
+    pub grant: Option<GrantInfo>,
+}
+
+/// What `scope_json` holds: the scope plus, for grants, `grant` (rows written
+/// before v1.4 simply lack the field).
+#[derive(Serialize, Deserialize)]
+struct StoredScope {
+    #[serde(flatten)]
+    scope: TokenScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant: Option<GrantInfo>,
 }
 
 pub fn insert_token_meta(conn: &Connection, t: &TokenMeta) -> Result<()> {
@@ -41,7 +62,10 @@ pub fn insert_token_meta(conn: &Connection, t: &TokenMeta) -> Result<()> {
         params![
             t.id,
             t.name,
-            serde_json::to_string(&t.scope)?,
+            serde_json::to_string(&StoredScope {
+                scope: t.scope.clone(),
+                grant: t.grant.clone(),
+            })?,
             t.created_at,
             t.last_used_at
         ],
@@ -56,12 +80,14 @@ fn row_to_meta(
 }
 
 fn build(raw: (String, String, String, i64, Option<i64>)) -> Result<TokenMeta> {
+    let stored: StoredScope = serde_json::from_str(&raw.2)?;
     Ok(TokenMeta {
         id: raw.0,
         name: raw.1,
-        scope: serde_json::from_str(&raw.2)?,
+        scope: stored.scope,
         created_at: raw.3,
         last_used_at: raw.4,
+        grant: stored.grant,
     })
 }
 

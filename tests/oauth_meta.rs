@@ -358,11 +358,13 @@ async fn unused_clients_pruned_after_24h() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn token_and_revoke_stubs_skip_origin_guard_for_post_only() {
+async fn token_and_revoke_skip_origin_guard_for_post_only() {
     let app = TestApp::new();
-    for path in ["/oauth/token", "/oauth/revoke"] {
+    // Cross-site requests reach the handlers (400 for a non-form body, 200
+    // for revoke) instead of the origin guard's 403.
+    for (path, status) in [("/oauth/token", 400), ("/oauth/revoke", 200)] {
         let resp = app.request(post_json(path, &json!({}))).await;
-        assert_eq!(resp.status(), 501, "{path}");
+        assert_eq!(resp.status(), status, "{path}");
     }
     // The consent endpoint is not exempt.
     let req = Request::builder()
