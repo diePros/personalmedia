@@ -303,7 +303,7 @@ async fn standalone_shell_markup_present() {
     for path in ["/documents", "/scan", "/settings"] {
         let html = body_string(t.get(path, &c).await).await;
         assert!(html.contains("class=\"tabbar\""), "{path}");
-        for href in ["/documents", "/scan", "/documents#q", "/settings"] {
+        for href in ["/documents", "/scan", "/search", "/settings"] {
             assert!(html.contains(&format!("href=\"{href}\"")), "{path} {href}");
         }
         assert!(html.contains("<svg"), "{path}");
@@ -324,7 +324,7 @@ async fn non_standalone_layout_unchanged() {
     let c = t.session_for("alice");
     let html = body_string(t.get("/documents", &c).await).await;
     // The header markup is exactly what it was.
-    let header = "<header class=\"site-header\">\n<a class=\"brand\" href=\"/documents\">PMS</a>\n<nav class=\"site-nav\" aria-label=\"Main\">\n<a href=\"/documents\">Documents</a>\n<a href=\"/settings\">Settings</a>\n";
+    let header = "<header class=\"site-header\">\n<a class=\"brand\" href=\"/documents\">PMS</a>\n<nav class=\"site-nav\" aria-label=\"Main\">\n<a href=\"/documents\">Documents</a>\n<a href=\"/search\">Search</a>\n<a href=\"/settings\">Settings</a>\n";
     assert!(html.contains(header), "{html}");
     // The tab bar sits after <main>, so it cannot move the header or content.
     assert!(html.find("</main>").unwrap() < html.find("class=\"tabbar\"").unwrap());
@@ -403,7 +403,7 @@ async fn scan_end_to_end_ocr_search() {
     for word in ["versicherungsnummer", "kuendigungsfrist"] {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
         loop {
-            let html = body_string(t.hx_get(&format!("/documents?q={word}"), &c).await).await;
+            let html = body_string(t.hx_get(&format!("/search?q={word}"), &c).await).await;
             if html.contains("doc-item") {
                 break;
             }

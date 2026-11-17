@@ -322,6 +322,16 @@ mark {
   margin: var(--gap) 0;
 }
 
+.filters-box {
+  margin: var(--gap) 0;
+}
+.filters-box summary {
+  cursor: pointer;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}
+
 .pager {
   display: flex;
   align-items: center;

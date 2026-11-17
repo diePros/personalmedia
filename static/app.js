@@ -242,7 +242,7 @@
   }
 
   // Bottom tab bar (shown when standalone or at phone width, see app.css): highlights the
-  // current tab and makes Search focus the documents search field.
+  // current tab and makes Search focus the search field.
   function initTabbar() {
     var bar = document.querySelector(".tabbar");
     if (!bar) {
@@ -251,10 +251,7 @@
     var tabs = bar.querySelectorAll(".tab");
     function current() {
       var path = window.location.pathname;
-      if (path === "/documents" && window.location.hash === "#q") {
-        return "/documents#q";
-      }
-      if (path === "/scan" || path === "/settings") {
+      if (path === "/scan" || path === "/settings" || path === "/search") {
         return path;
       }
       return path.indexOf("/documents") === 0 ? "/documents" : "";
@@ -280,20 +277,19 @@
       return !!q;
     }
     Array.prototype.forEach.call(tabs, function (tab) {
-      if (tab.getAttribute("href") !== "/documents#q") {
+      if (tab.getAttribute("href") !== "/search") {
         return;
       }
       tab.addEventListener("click", function (e) {
-        // Already on the documents page: no reload, just focus the field.
-        if (window.location.pathname === "/documents" && focusSearch()) {
+        // Already on the search page: no reload, just focus the field.
+        if (window.location.pathname === "/search" && focusSearch()) {
           e.preventDefault();
-          window.history.replaceState(null, "", "/documents#q");
-          mark();
         }
       });
     });
     mark();
-    if (window.location.pathname === "/documents" && window.location.hash === "#q") {
+    var box = document.getElementById("q");
+    if (window.location.pathname === "/search" && box && !box.value) {
       focusSearch();
     }
   }

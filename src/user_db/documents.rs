@@ -117,6 +117,8 @@ pub struct ListFilter {
     pub needs_transcription: bool,
     /// `None` = no switchboard restrictions (export/recovery only).
     pub access: Option<AccessFilter>,
+    /// `search` only: order matches by `created_at DESC, id` instead of by relevance.
+    pub sort_newest: bool,
     /// 0 means 50.
     pub limit: u32,
     pub offset: u32,
@@ -837,7 +839,11 @@ pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<Searc
             params.push(Value::Text(expr));
         }
         filter_conditions(conn, f, &mut sql, &mut params);
-        sql.push_str(" ORDER BY bm25(documents_fts), d.id LIMIT ?");
+        sql.push_str(if f.sort_newest {
+            " ORDER BY d.created_at DESC, d.id LIMIT ?"
+        } else {
+            " ORDER BY bm25(documents_fts), d.id LIMIT ?"
+        });
         params.push(Value::Integer(want));
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params), |r| {
@@ -860,8 +866,15 @@ pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<Searc
         }
     }
     hits.sort_by(|a, b| {
-        a.0.total_cmp(&b.0)
-            .then_with(|| a.1.doc.id.cmp(&b.1.doc.id))
+        if f.sort_newest {
+            b.1.doc
+                .created_at
+                .cmp(&a.1.doc.created_at)
+                .then_with(|| a.1.doc.id.cmp(&b.1.doc.id))
+        } else {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.1.doc.id.cmp(&b.1.doc.id))
+        }
     });
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<SearchHit> = Vec::new();
