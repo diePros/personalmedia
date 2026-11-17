@@ -265,7 +265,7 @@ OAuth lets an assistant connect without you copying a token. The app registers i
 
 1. In claude.ai: **Settings → Connectors → Add custom connector**.
 2. URL: `{PM_PUBLIC_URL}/mcp` (for example `https://<node>.<tailnet>.ts.net/mcp`). Leave the client ID and client secret empty; dynamic registration is used.
-3. Press **Connect**. Log in on the PMS consent page, read the callback host it shows, and choose the access (read or read and write, metadata or full text, optional tag allow-list, or a new restricted tag).
+3. Press **Connect**. Log in on the PMS consent page, read the callback host it shows, and choose the access (read or read and write, metadata or full text, optional tag allow-list, or a new restricted tag; the form starts on the least access), then enter your password to approve. Only approve if you just pressed Connect yourself.
 
 **Hermes**
 

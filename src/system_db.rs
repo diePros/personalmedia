@@ -515,11 +515,18 @@ impl SystemDb {
     }
 
     /// Deletes clients that never received a grant and were created before
-    /// `created_before`. Returns how many went.
-    pub fn prune_oauth_clients(&self, created_before: i64) -> anyhow::Result<usize> {
+    /// `created_before`, and clients whose last grant or refresh (they both
+    /// set `last_grant_at`) is older than `idle_before`: with a 30-day refresh
+    /// lifetime such a client has no live grant left. Returns how many went.
+    pub fn prune_oauth_clients(
+        &self,
+        created_before: i64,
+        idle_before: i64,
+    ) -> anyhow::Result<usize> {
         Ok(self.lock().execute(
-            "DELETE FROM oauth_clients WHERE last_grant_at IS NULL AND created_at < ?1",
-            [created_before],
+            "DELETE FROM oauth_clients WHERE (last_grant_at IS NULL AND created_at < ?1) \
+             OR last_grant_at < ?2",
+            params![created_before, idle_before],
         )?)
     }
 

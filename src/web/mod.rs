@@ -248,7 +248,9 @@ fn spawn_sweeper(
             let keyring = keyring.clone();
             // SQLite is blocking; keep it off the async worker.
             let _ = tokio::task::spawn_blocking(move || {
-                if let Err(e) = sys.prune_oauth_clients(cutoff) {
+                if let Err(e) =
+                    sys.prune_oauth_clients(cutoff, unix_now() - crate::oauth::IDLE_CLIENT_TTL_SECS)
+                {
                     tracing::error!(error = %e, "pruning unused oauth clients failed");
                 }
                 if let Err(e) = sys.delete_expired_tokens(unix_now()) {

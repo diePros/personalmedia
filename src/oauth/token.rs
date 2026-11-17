@@ -176,6 +176,11 @@ async fn handle_token(
     }
 }
 
+/// The plaintext pair is copied into a `serde_json::Value` and the response
+/// body (and the form strings that carried a code or refresh token in are not
+/// zeroized either). That is inherent to handing a token to the client, as
+/// with static-token creation, so the "zeroized" guarantee covers the copies
+/// held in `CodeEntry` and `IssuedPair`, not these transient ones.
 fn token_response(access: &str, refresh: &str, scope: &str) -> Response {
     json_response(
         StatusCode::OK,
@@ -189,17 +194,17 @@ fn token_response(access: &str, refresh: &str, scope: &str) -> Response {
     )
 }
 
+/// Deletes a grant that will not be used (or that a replayed code revokes).
+fn revoke_for(state: &AppState, user_id: &str, grant_id: &str) {
+    let unlocked = state.keyring.get(user_id);
+    if let Err(e) = revoke_grant(&state.sys, unlocked.as_deref(), grant_id, &state.tokens) {
+        tracing::error!(error = %e, grant = %grant_id, "could not revoke grant");
+    }
+}
+
 /// Deletes the grant of a code that will not be exchanged.
 fn discard(state: &AppState, entry: &CodeEntry) {
-    let unlocked = state.keyring.get(&entry.user_id);
-    if let Err(e) = revoke_grant(
-        &state.sys,
-        unlocked.as_deref(),
-        &entry.grant_id,
-        &state.tokens,
-    ) {
-        tracing::error!(error = %e, grant = %entry.grant_id, "could not discard unused grant");
-    }
+    revoke_for(state, &entry.user_id, &entry.grant_id);
 }
 
 async fn code_grant(state: &AppState, form: TokenForm, client_id: String) -> Response {
@@ -215,7 +220,15 @@ async fn code_grant(state: &AppState, form: TokenForm, client_id: String) -> Res
     let st = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         let entry = match st.oauth.take_code(&code) {
-            None => return guess_failure(invalid_grant()),
+            None => {
+                // A code that was already exchanged: whatever was issued from
+                // it goes (RFC 6749 section 4.1.2).
+                if let Some((user_id, grant_id)) = st.oauth.spent_code(&code) {
+                    tracing::warn!(grant = %grant_id, "authorization code replay; revoking grant");
+                    revoke_for(&st, &user_id, &grant_id);
+                }
+                return guess_failure(invalid_grant());
+            }
             Some(Err(expired)) => {
                 discard(&st, &expired);
                 return guess_failure(invalid_grant());
@@ -231,6 +244,8 @@ async fn code_grant(state: &AppState, form: TokenForm, client_id: String) -> Res
             discard(&st, &entry);
             return guess_failure(invalid_grant());
         }
+        st.oauth
+            .note_spent_code(&code, &entry.user_id, &entry.grant_id);
         token_response(&entry.access, &entry.refresh, &entry.scope)
     })
     .await;

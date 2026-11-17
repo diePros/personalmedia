@@ -275,14 +275,18 @@ async fn full_flow_register_authorize_token_mcp_refresh() {
 async fn auth_code_single_use_and_bound() {
     let f = Flow::new().await;
 
-    // Used twice: the second exchange fails and so does everything minted.
+    // Used twice: the second exchange fails and revokes everything minted
+    // from the code (RFC 6749 section 4.1.2).
     let code = f.code(&[]).await;
     let (s, v) = f.exchange(&code, VERIFIER).await;
     assert_eq!(s, 200);
     let access = v["access_token"].as_str().unwrap().to_owned();
+    let refresh = v["refresh_token"].as_str().unwrap().to_owned();
+    assert_eq!(f.tools_list(&access).await.0, 200);
     let (s, v) = f.exchange(&code, VERIFIER).await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
-    let _ = access;
+    assert_eq!(f.tools_list(&access).await.0, 401);
+    assert_eq!(f.refresh(&refresh).await.0, 400);
 
     // Wrong verifier.
     let code = f.code(&[]).await;
@@ -349,8 +353,8 @@ async fn auth_code_single_use_and_bound() {
             |r| r.get(0),
         )
         .unwrap();
-    // Only the first (successful) exchange's pair remains.
-    assert_eq!(n, 2);
+    // The only successful exchange was revoked by its replay.
+    assert_eq!(n, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -478,6 +482,42 @@ async fn expired_access_token_401_with_metadata_pointer() {
         .unwrap();
     let (s, v) = f.refresh(&rid).await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_keeps_client_from_being_pruned_and_authorize_is_rate_limited() {
+    let f = Flow::new().await;
+    // Pretend the client's last activity was long ago, then refresh.
+    let (_, refresh) = f.tokens(&[]).await;
+    sys_conn(&f)
+        .execute("UPDATE oauth_clients SET last_grant_at = 5", [])
+        .unwrap();
+    assert_eq!(f.refresh(&refresh).await.0, 200);
+    let sys = &f.t.state.sys;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(
+        sys.prune_oauth_clients(0, now - personal_media::oauth::IDLE_CLIENT_TTL_SECS)
+            .unwrap(),
+        0
+    );
+    assert!(sys.oauth_client(&f.client_id).unwrap().is_some());
+
+    // Validated authorize requests are limited per address.
+    let mut last = 0;
+    for _ in 0..70 {
+        last =
+            f.t.get(&f.authorize_uri(""), &f.alice)
+                .await
+                .status()
+                .as_u16();
+        if last == 429 {
+            break;
+        }
+    }
+    assert_eq!(last, 429);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -18,7 +18,10 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use super::register::clean_client_name;
-use super::{AuthRequest, CodeEntry, REQUEST_TTL, SCOPES, mcp_url, redirect_uri_allowed};
+use super::{
+    AUTHORIZE_PER_IP_PER_HOUR, AuthRequest, CodeEntry, REQUEST_TTL, SCOPES, mcp_url,
+    redirect_uri_allowed,
+};
 use crate::accounts::AccountError;
 use crate::documents::{DocError, validate_meta};
 use crate::tokens::{create_grant, scope_string};
@@ -183,6 +186,8 @@ fn challenge_ok(c: &str) -> bool {
 
 pub async fn authorize_get(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     OriginalUri(uri): OriginalUri,
     session: Option<axum::Extension<Session>>,
 ) -> Response {
@@ -261,6 +266,16 @@ pub async fn authorize_get(
         .into_iter()
         .filter(|s| SCOPES.contains(&s.as_str()))
         .collect();
+
+    // Anyone may park requests here without a session; keep one address from
+    // flushing the pending-request map (and a victim's request with it).
+    let ip = client_ip(peer, &headers, state.cfg.trusted_proxy);
+    if let Err(retry) = state.oauth.hit(
+        &format!("authorize:{}", ip_key(ip)),
+        AUTHORIZE_PER_IP_PER_HOUR,
+    ) {
+        return too_many_requests(retry);
+    }
 
     let req = AuthRequest::new(
         client_id,

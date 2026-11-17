@@ -39,6 +39,10 @@ const CLAUDE_REDIRECTS: &[&str] = &[
     "https://claude.com/api/mcp/auth_callback",
 ];
 
+/// Authorize requests (validated ones that park a pending request) allowed
+/// per IP per hour.
+pub const AUTHORIZE_PER_IP_PER_HOUR: usize = 60;
+
 /// Registrations allowed per IP per hour.
 pub const DCR_PER_IP_PER_HOUR: usize = 10;
 const DCR_WINDOW: Duration = Duration::from_secs(3600);
@@ -46,6 +50,9 @@ const DCR_WINDOW: Duration = Duration::from_secs(3600);
 pub const MAX_CLIENTS: usize = 200;
 /// Clients that never got a grant are dropped after this long.
 pub const UNUSED_CLIENT_TTL_SECS: i64 = 24 * 3600;
+/// Clients with no grant or refresh for this long are dropped (the refresh
+/// token lifetime, so they have no live grant left).
+pub const IDLE_CLIENT_TTL_SECS: i64 = 30 * 24 * 3600;
 /// Longest stored client name, in characters.
 pub const CLIENT_NAME_MAX_CHARS: usize = 64;
 
@@ -134,6 +141,10 @@ pub struct OAuthState {
     /// grant; the grant then ends when its newest refresh token expires, or
     /// when the user revokes it in Settings.
     consumed: Mutex<Consumed>,
+    /// Codes that were exchanged successfully, kept until their TTL ends:
+    /// code -> (user id, grant id, spent at). A replay revokes the grant
+    /// (RFC 6749 section 4.1.2).
+    spent: Mutex<HashMap<String, (String, String, Instant)>>,
     code_ttl_ms: AtomicU64,
     refresh_grace_ms: AtomicU64,
 }
@@ -145,6 +156,7 @@ impl Default for OAuthState {
             requests: Mutex::default(),
             codes: Mutex::default(),
             consumed: Mutex::default(),
+            spent: Mutex::default(),
             code_ttl_ms: AtomicU64::new(CODE_TTL.as_millis() as u64),
             refresh_grace_ms: AtomicU64::new(REFRESH_GRACE.as_millis() as u64),
         }
@@ -241,6 +253,22 @@ impl OAuthState {
         }
     }
 
+    /// Remembers that `code` was exchanged for the grant of `user_id`.
+    pub fn note_spent_code(&self, code: &str, user_id: &str, grant_id: &str) {
+        self.spent.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            code.to_owned(),
+            (user_id.to_owned(), grant_id.to_owned(), Instant::now()),
+        );
+    }
+
+    /// `(user id, grant id)` when `code` was exchanged within the code TTL.
+    pub fn spent_code(&self, code: &str) -> Option<(String, String)> {
+        let ttl = self.code_ttl();
+        let spent = self.spent.lock().unwrap_or_else(|e| e.into_inner());
+        let (user, grant, at) = spent.get(code)?;
+        (at.elapsed() < ttl).then(|| (user.clone(), grant.clone()))
+    }
+
     /// Remembers a refresh token that was just exchanged.
     pub fn note_consumed_refresh(
         &self,
@@ -284,11 +312,17 @@ impl OAuthState {
     /// Counts one registration attempt for `key`; `Err(retry_after)` when the
     /// hourly allowance is used up.
     pub fn dcr_hit(&self, key: &str) -> Result<(), Duration> {
+        self.hit(key, DCR_PER_IP_PER_HOUR)
+    }
+
+    /// Counts one request for `key` against `limit` per hour; `Err(retry_after)`
+    /// when used up. The counters of every kind share one map and sweep.
+    pub fn hit(&self, key: &str, limit: usize) -> Result<(), Duration> {
         let now = Instant::now();
         let mut map = self.dcr_hits.lock().unwrap_or_else(|e| e.into_inner());
         let hits = map.entry(key.to_owned()).or_default();
         hits.retain(|t| now.duration_since(*t) < DCR_WINDOW);
-        if hits.len() >= DCR_PER_IP_PER_HOUR {
+        if hits.len() >= limit {
             let oldest = hits[0];
             return Err(DCR_WINDOW.saturating_sub(now.duration_since(oldest)));
         }
@@ -319,6 +353,10 @@ impl OAuthState {
                 }
             }
         }
+        self.spent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, (_, _, at)| at.elapsed() < ttl);
         let now = Instant::now();
         let mut map = self.dcr_hits.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, hits| {

@@ -369,10 +369,20 @@ async fn unused_clients_pruned_after_24h() {
     sys.insert_oauth_client(&mk("pmc_old_used", 1000, Some(2000)), 200)
         .unwrap();
     let now = 1000 + 24 * 3600 + 1;
-    assert_eq!(sys.prune_oauth_clients(now - 24 * 3600).unwrap(), 1);
+    assert_eq!(sys.prune_oauth_clients(now - 24 * 3600, 0).unwrap(), 1);
     assert!(sys.oauth_client("pmc_old_unused").unwrap().is_none());
     assert!(sys.oauth_client("pmc_new_unused").unwrap().is_some());
     assert!(sys.oauth_client("pmc_old_used").unwrap().is_some());
+
+    // A client with no grant or refresh for 30 days goes, one still active stays.
+    sys.insert_oauth_client(&mk("pmc_idle", 1000, Some(3000)), 200)
+        .unwrap();
+    sys.insert_oauth_client(&mk("pmc_active", 1000, Some(900_000)), 200)
+        .unwrap();
+    assert_eq!(sys.prune_oauth_clients(0, 5000).unwrap(), 2);
+    assert!(sys.oauth_client("pmc_idle").unwrap().is_none());
+    assert!(sys.oauth_client("pmc_old_used").unwrap().is_none());
+    assert!(sys.oauth_client("pmc_active").unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]

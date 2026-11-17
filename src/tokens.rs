@@ -645,6 +645,10 @@ pub fn refresh_grant(
     for t in old_ids {
         state.tokens.evict(&t);
     }
+    // A refresh counts as activity, so a client in use is never pruned.
+    if let Err(e) = state.sys.touch_oauth_client_grant(client_id, now) {
+        tracing::warn!(error = %e, "could not record oauth client activity");
+    }
     Ok(Refreshed {
         scope: scope_string(&meta.scope),
         pair,
