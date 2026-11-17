@@ -783,16 +783,16 @@ async fn stale_entry_is_rewalked_after_the_refresh_interval() {
     use personal_media::quota::Quotas;
     use std::time::Duration;
     let (dir, u) = quota_dir(&[("blobs/a", 300)]);
-    let q = Quotas::unlimited_with_refresh(dir.path().to_path_buf(), Duration::from_millis(50));
+    let q = Quotas::unlimited_with_refresh(dir.path().to_path_buf(), Duration::from_millis(600));
     assert_eq!(q.usage("u1").await, 300);
     std::fs::write(u.join("blobs/a"), vec![0u8; 900]).unwrap();
     assert_eq!(q.usage("u1").await, 300, "still fresh");
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(q.usage("u1").await, 900, "refreshed");
     // Never while an upload is in flight.
     let r = q.reserve("u1", 10).await.unwrap();
     std::fs::write(u.join("blobs/a"), vec![0u8; 1200]).unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(q.usage("u1").await, 910);
     drop(r);
 }
