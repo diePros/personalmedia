@@ -20,7 +20,8 @@ use crate::user_db::vectors::{
     replace_vectors_guarded, set_embed_status,
 };
 use crate::user_db::{
-    TextStatus, apply_detected_date, backfill_batch, pending_document_ids, set_extracted_text,
+    TextStatus, backfill_mark_done, backfill_read_batch, backfill_write_batch, detect_date_iso,
+    pending_document_ids, set_detected_date, set_extracted_text,
 };
 
 /// Chunks embedded per `embed_passages` call.
@@ -740,7 +741,7 @@ impl OnUnlock for ExtractQueue {
             Err(e) => tracing::warn!(error = %e, "could not list pending documents"),
         }
         self.enqueue_embeds_needed(u);
-        spawn_date_backfill(u.clone());
+        spawn_date_backfill(u);
     }
 }
 
@@ -748,21 +749,48 @@ impl OnUnlock for ExtractQueue {
 const BACKFILL_BATCH: usize = 25;
 
 /// The one-time date backfill, on its own thread so login never waits for it.
-/// The database lock is taken per batch, so other requests interleave.
-fn spawn_date_backfill(u: Arc<Unlocked>) {
+/// Each batch is read under the database lock, detected without it, and
+/// written under it again. The thread holds only a `Weak`: once the user is
+/// locked out it stops (without the done marker, so it resumes at the next
+/// unlock) instead of keeping the keys alive.
+fn spawn_date_backfill(u: &Arc<Unlocked>) {
+    let weak = Arc::downgrade(u);
     let spawned = std::thread::Builder::new()
         .name("date-backfill".into())
         .spawn(move || {
             let today = time::OffsetDateTime::now_utc().date();
             let mut after = String::new();
             loop {
-                match u.with_db(|c| backfill_batch(c, &after, BACKFILL_BATCH, today, now_secs())) {
-                    Ok((_, Some(next))) => after = next,
-                    Ok((_, None)) => return,
+                let Some(u) = weak.upgrade() else { return };
+                let read = u.with_db(|c| backfill_read_batch(c, &after, BACKFILL_BATCH));
+                drop(u);
+                let (rows, next) = match read {
+                    Ok(x) => x,
                     Err(e) => {
                         tracing::warn!(error = %e, "date backfill failed");
                         return;
                     }
+                };
+                let dates: Vec<(String, String)> = rows
+                    .iter()
+                    .filter_map(|(id, text)| Some((id.clone(), detect_date_iso(text, today)?)))
+                    .collect();
+                let Some(u) = weak.upgrade() else { return };
+                let wrote = u.with_db(|c| {
+                    backfill_write_batch(c, &dates, now_secs())?;
+                    if next.is_none() {
+                        backfill_mark_done(c)?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                });
+                drop(u);
+                if let Err(e) = wrote {
+                    tracing::warn!(error = %e, "date backfill failed");
+                    return;
+                }
+                match next {
+                    Some(id) => after = id,
+                    None => return,
                 }
             }
         });
@@ -839,12 +867,15 @@ async fn run_job(docs: &Arc<Documents>, cfg: &ExtractConfig, u: Arc<Unlocked>, i
     }
     tracing::info!(doc_id = %id, outcome, "extraction finished");
     if let (TextStatus::Done, Some(text)) = (status, text) {
-        // A failure here is only logged: the extraction itself succeeded.
+        // Detection runs without the database lock; only the conditional
+        // write takes it. A failure here is only logged.
         let today = time::OffsetDateTime::now_utc().date();
-        match u.with_db(|c| apply_detected_date(c, &id, text, today, now_secs())) {
-            Ok(true) => tracing::info!(doc_id = %id, "document date found in text"),
-            Ok(false) => {}
-            Err(e) => tracing::warn!(doc_id = %id, error = %e, "date detection failed"),
+        if let Some(iso) = detect_date_iso(text, today) {
+            match u.with_db(|c| set_detected_date(c, &id, &iso, now_secs())) {
+                Ok(true) => tracing::info!(doc_id = %id, "document date found in text"),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(doc_id = %id, error = %e, "date detection failed"),
+            }
         }
     }
     status == TextStatus::Done

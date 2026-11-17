@@ -106,6 +106,18 @@ fn detection_never_overwrites_user_or_ai_date() {
         [],
     )
     .unwrap();
+    // A real clear: the document had a date, the user removes it.
+    update_document_meta_sourced(
+        &conn,
+        "cleared",
+        None,
+        Some(Some("2018-01-01")),
+        None,
+        None,
+        DateSource::Detected,
+        1,
+    )
+    .unwrap();
     update_document_meta_sourced(
         &conn,
         "cleared",
@@ -166,4 +178,54 @@ fn backfill_runs_once() {
     doc(&conn, "d", Some(TEXT));
     assert_eq!(backfill_detected_dates(&conn, today(), 10).unwrap(), 0);
     assert_eq!(get("d").document_date, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unlock_runs_the_backfill_once_in_the_background() {
+    use personal_media::accounts::Accounts;
+    use personal_media::config::Config;
+    use personal_media::extract::ExtractQueue;
+    use personal_media::keyring::Keyring;
+    use personal_media::system_db::{Role, SYSTEM_DB_FILE, SystemDb};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config::for_tests(dir.path().to_path_buf());
+    let sys = Arc::new(SystemDb::open(&dir.path().join(SYSTEM_DB_FILE)).unwrap());
+    let (queue, _rx) = ExtractQueue::channel();
+    let keyring = Arc::new(Keyring::new(dir.path().to_path_buf(), Arc::new(queue)));
+    let accounts = Accounts::new(&cfg, sys, keyring);
+    let url = accounts.create_invite(Role::User, 1_000).unwrap();
+    let token = url.rsplit('/').next().unwrap().to_string();
+    let (u, _, _) = accounts
+        .signup(&token, "sebi", "correct horse battery", 1_000)
+        .unwrap();
+    let marker = |u: &personal_media::keyring::Unlocked| {
+        u.with_db(|c| get_setting(c, "date_backfill")).unwrap()
+    };
+    let wait = |u: std::sync::Arc<personal_media::keyring::Unlocked>| async move {
+        for _ in 0..200 {
+            if marker(&u).as_deref() == Some("v1") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("backfill did not finish");
+    };
+    // The signup unlock backfilled the empty index; reset it and add data.
+    wait(u.clone()).await;
+    u.with_db(|c| {
+        c.execute("DELETE FROM settings WHERE key = 'date_backfill'", [])?;
+        doc(c, "a", Some(TEXT));
+        Ok::<_, anyhow::Error>(())
+    })
+    .unwrap();
+    drop(u);
+    let (u, _) = accounts
+        .login("sebi", "correct horse battery", None)
+        .unwrap();
+    wait(u.clone()).await;
+    let d = u.with_db(|c| get_document(c, "a")).unwrap().unwrap();
+    assert_eq!(d.document_date.as_deref(), Some("2026-10-05"));
+    assert_eq!(d.date_source, Some(DateSource::Detected));
 }

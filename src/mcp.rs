@@ -41,7 +41,7 @@ use crate::keyring::Unlocked;
 use crate::tokens::{AuthFail, Principal, authenticate, parse_bearer};
 use crate::user_db::{
     DateSource, Document, Level, effective_level, get_document, get_document_text, list_documents,
-    list_tags_visible, search, set_date_source, update_document_meta_sourced,
+    list_tags_visible, search, update_document_meta_sourced,
 };
 use crate::web::AppState;
 use crate::web::ratelimit::{client_ip, mcp_ip_key, too_many_requests};
@@ -854,8 +854,8 @@ async fn upload_document(
         title: clean(a.title),
         tags,
         document_date: clean(a.date),
+        date_source: Some(DateSource::Ai),
     };
-    let has_date = meta.document_date.is_some();
     let filter = p.filter();
     let size = bytes.len() as u64;
     let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
@@ -874,18 +874,7 @@ async fn upload_document(
         )
         .await
     {
-        Ok(outcome) => {
-            // A date given through MCP is the AI's, not the user's.
-            if has_date && let crate::documents::StoreOutcome::Stored { id } = &outcome {
-                let id = id.clone();
-                blocking(&p.unlocked, move |c| {
-                    set_date_source(c, &id, DateSource::Ai)
-                })
-                .await
-                .map_err(ToolError::Tool)?;
-            }
-            serde_json::to_value(outcome).map_err(|e| ToolError::Tool(internal(e)))
-        }
+        Ok(outcome) => serde_json::to_value(outcome).map_err(|e| ToolError::Tool(internal(e))),
         Err(e) => Err(doc_err(e)),
     }
 }

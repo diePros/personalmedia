@@ -437,6 +437,7 @@ async fn handle_upload_inner(
                 title: title.take(),
                 tags,
                 document_date: date.take(),
+                date_source: None,
             };
             let filter = principal.map_or_else(web_filter, |p| p.filter());
             // A body error while the file streams in means the client went away.

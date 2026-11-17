@@ -62,6 +62,7 @@ fn meta(name: &str) -> UploadMeta {
         title: None,
         tags: vec![],
         document_date: None,
+        date_source: None,
     }
 }
 

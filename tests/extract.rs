@@ -153,6 +153,7 @@ impl Env {
             title: None,
             tags: vec![],
             document_date: None,
+            date_source: None,
         };
         let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(bytes))]);
         match self

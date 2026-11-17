@@ -25,10 +25,11 @@ pub use devices::{
 };
 pub use documents::{
     DateSource, Document, ListFilter, NOTES_MAX_CHARS, NewDocument, SearchHit, TextSource,
-    TextStatus, apply_detected_date, backfill_batch, backfill_detected_dates, delete_document,
-    find_by_sha256, find_by_sha256_visible, get_document, get_document_text, hidden_from,
-    insert_document, list_documents, list_tags, list_tags_visible, pending_document_ids, search,
-    set_date_source, set_extracted_text, set_notes, set_text, set_transcription, tag_ids,
+    TextStatus, apply_detected_date, backfill_detected_dates, backfill_mark_done,
+    backfill_read_batch, backfill_write_batch, delete_document, detect_date_iso, find_by_sha256,
+    find_by_sha256_visible, get_document, get_document_text, hidden_from, insert_document,
+    insert_document_sourced, list_documents, list_tags, list_tags_visible, pending_document_ids,
+    search, set_detected_date, set_extracted_text, set_notes, set_text, set_transcription, tag_ids,
     update_document_meta, update_document_meta_notes, update_document_meta_sourced,
 };
 pub use meta::{

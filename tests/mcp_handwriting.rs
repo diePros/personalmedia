@@ -66,6 +66,7 @@ impl Fx {
             title: Some(format!("title of {name}")),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             document_date: None,
+            date_source: None,
         };
         let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
             bytes.to_vec(),

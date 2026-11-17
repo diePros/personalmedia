@@ -328,13 +328,26 @@ fn set_doc_tags(conn: &Connection, id: &str, tags: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// [`insert_document_sourced`] with the default source: a given date is the
+/// user's.
 pub fn insert_document(conn: &Connection, d: &NewDocument) -> Result<()> {
+    insert_document_sourced(conn, d, None)
+}
+
+/// Insert a document; a given date is recorded with `source` (`None` = user)
+/// in the same statement.
+pub fn insert_document_sourced(
+    conn: &Connection,
+    d: &NewDocument,
+    source: Option<DateSource>,
+) -> Result<()> {
+    let source = source.unwrap_or(DateSource::User).as_str();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO documents(id, wrapped_dek, original_filename, title, mime, size, sha256,
             document_date, date_source, created_at, updated_at, text_status)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                 CASE WHEN ?8 IS NULL THEN NULL ELSE 'user' END, ?9, ?9, 'pending')",
+                 CASE WHEN ?8 IS NULL THEN NULL ELSE ?10 END, ?9, ?9, 'pending')",
         params![
             d.id,
             d.wrapped_dek,
@@ -344,7 +357,8 @@ pub fn insert_document(conn: &Connection, d: &NewDocument) -> Result<()> {
             d.size as i64,
             d.sha256.as_slice(),
             d.document_date,
-            d.created_at
+            d.created_at,
+            source
         ],
     )?;
     set_doc_tags(&tx, &d.id, &d.tags)?;
@@ -594,8 +608,11 @@ pub fn update_document_meta_notes(
 }
 
 /// [`update_document_meta_notes`] where a date change is recorded with
-/// `source`. Clearing the date keeps the source, so detection never refills a
-/// date somebody removed.
+/// `source`, but only when the date actually differs from the stored one: an
+/// edit that leaves the date alone (a rename, or the form posting the same or
+/// an empty date) keeps its source, so it neither blocks detection nor turns a
+/// detected date into the user's. A real clear records `source` with a NULL
+/// date, so detection never refills a date somebody removed.
 #[allow(clippy::too_many_arguments)]
 pub fn update_document_meta_sourced(
     conn: &Connection,
@@ -622,7 +639,8 @@ pub fn update_document_meta_sourced(
     }
     if let Some(date) = document_date {
         tx.execute(
-            "UPDATE documents SET document_date = ?2, date_source = ?3 WHERE id = ?1",
+            "UPDATE documents SET document_date = ?2, date_source = ?3
+             WHERE id = ?1 AND document_date IS NOT ?2",
             params![id, date, source.as_str()],
         )?;
     }
@@ -638,36 +656,24 @@ pub fn update_document_meta_sourced(
     Ok(())
 }
 
-/// Record who set the date of `id` (used right after an AI upload with a date).
-pub fn set_date_source(conn: &Connection, id: &str, source: DateSource) -> Result<()> {
-    conn.execute(
-        "UPDATE documents SET date_source = ?2 WHERE id = ?1",
-        params![id, source.as_str()],
-    )?;
-    Ok(())
-}
-
-/// Fill an empty date from `text`. Writes only when the document has no date
-/// and nobody set or cleared one (`date_source` is NULL or `detected`); the
-/// check and the write are one statement, so a user's or AI's date set
-/// meanwhile is never overwritten. Returns whether a date was set. The date
-/// is metadata: the search index needs no rebuild.
-pub fn apply_detected_date(
-    conn: &Connection,
-    id: &str,
-    text: &str,
-    today: time::Date,
-    now: i64,
-) -> Result<bool> {
-    let Some(date) = crate::dates::detect_date(text, today) else {
-        return Ok(false);
-    };
-    let iso = format!(
+/// The ISO date the finder picks from `text`, if any. Pure: call it before
+/// taking the database lock.
+pub fn detect_date_iso(text: &str, today: time::Date) -> Option<String> {
+    let date = crate::dates::detect_date(text, today)?;
+    Some(format!(
         "{:04}-{:02}-{:02}",
         date.year(),
         u8::from(date.month()),
         date.day()
-    );
+    ))
+}
+
+/// Write a detected date. Only when the document has no date and nobody set
+/// or cleared one (`date_source` is NULL or `detected`); the check and the
+/// write are one statement, so a user's or AI's date set meanwhile is never
+/// overwritten. Returns whether it was set. The date is metadata: the search
+/// index needs no rebuild.
+pub fn set_detected_date(conn: &Connection, id: &str, iso: &str, now: i64) -> Result<bool> {
     let n = conn.execute(
         "UPDATE documents SET document_date = ?2, date_source = 'detected', updated_at = ?3
          WHERE id = ?1 AND document_date IS NULL
@@ -677,48 +683,76 @@ pub fn apply_detected_date(
     Ok(n > 0)
 }
 
+/// [`detect_date_iso`] then [`set_detected_date`] (detection runs under the
+/// caller's connection; the background paths split the two).
+pub fn apply_detected_date(
+    conn: &Connection,
+    id: &str,
+    text: &str,
+    today: time::Date,
+    now: i64,
+) -> Result<bool> {
+    match detect_date_iso(text, today) {
+        Some(iso) => set_detected_date(conn, id, &iso, now),
+        None => Ok(false),
+    }
+}
+
 /// Settings key and value that mark the one-time backfill as done.
 const BACKFILL_KEY: &str = "date_backfill";
 const BACKFILL_VALUE: &str = "v1";
 
-/// One batch of the one-time backfill: up to `limit` dateless documents with
-/// text and `id > after`, in id order. Returns how many got a date and the
-/// last id looked at (`None` when the end was reached, in which case the
-/// `date_backfill = v1` marker has been written; also `None` straight away when
-/// the backfill already ran). Callers loop with the returned id, taking the
-/// connection lock only per batch.
-pub fn backfill_batch(
+/// Read one batch of the one-time backfill: up to `limit` dateless documents
+/// with OCR text and `id > after`, in id order (transcriptions are left to the
+/// AI, as in the live pipeline). Returns the `(id, text)` rows and the id to
+/// continue after, or `None` when this was the last batch (or the backfill
+/// already ran). Only reads: detect with the lock released, then
+/// [`backfill_write_batch`].
+#[allow(clippy::type_complexity)]
+pub fn backfill_read_batch(
     conn: &Connection,
     after: &str,
     limit: usize,
-    today: time::Date,
-    now: i64,
-) -> Result<(usize, Option<String>)> {
+) -> Result<(Vec<(String, String)>, Option<String>)> {
     if super::get_setting(conn, BACKFILL_KEY)?.as_deref() == Some(BACKFILL_VALUE) {
-        return Ok((0, None));
+        return Ok((Vec::new(), None));
     }
-    let rows: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT d.id, t.content FROM documents d
-             JOIN document_text t ON t.document_id = d.id
-             WHERE d.id > ?1 AND d.document_date IS NULL
-               AND (d.date_source IS NULL OR d.date_source = 'detected')
-             ORDER BY d.id LIMIT ?2",
-        )?;
-        stmt.query_map(params![after, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?
-    };
+    let mut stmt = conn.prepare(
+        "SELECT d.id, t.content FROM documents d
+         JOIN document_text t ON t.document_id = d.id
+         WHERE d.id > ?1 AND d.document_date IS NULL
+           AND (d.date_source IS NULL OR d.date_source = 'detected')
+           AND d.text_source != 'transcription'
+         ORDER BY d.id LIMIT ?2",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![after, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let next = (rows.len() >= limit)
+        .then(|| rows.last().map(|(id, _)| id.clone()))
+        .flatten();
+    Ok((rows, next))
+}
+
+/// Write the detected `(id, iso date)` pairs of a batch; returns how many
+/// were set.
+pub fn backfill_write_batch(
+    conn: &Connection,
+    dates: &[(String, String)],
+    now: i64,
+) -> Result<usize> {
     let mut set = 0;
-    for (id, text) in &rows {
-        if apply_detected_date(conn, id, text, today, now)? {
+    for (id, iso) in dates {
+        if set_detected_date(conn, id, iso, now)? {
             set += 1;
         }
     }
-    if rows.len() < limit {
-        super::set_setting(conn, BACKFILL_KEY, BACKFILL_VALUE)?;
-        return Ok((set, None));
-    }
-    Ok((set, rows.last().map(|(id, _)| id.clone())))
+    Ok(set)
+}
+
+/// Mark the backfill as done (`date_backfill = v1`).
+pub fn backfill_mark_done(conn: &Connection) -> Result<()> {
+    super::set_setting(conn, BACKFILL_KEY, BACKFILL_VALUE)
 }
 
 /// The one-time backfill in one go: dates every dateless document that has
@@ -727,11 +761,18 @@ pub fn backfill_batch(
 pub fn backfill_detected_dates(conn: &Connection, today: time::Date, now: i64) -> Result<usize> {
     let (mut total, mut after) = (0, String::new());
     loop {
-        let (n, next) = backfill_batch(conn, &after, 100, today, now)?;
-        total += n;
+        let (rows, next) = backfill_read_batch(conn, &after, 100)?;
+        let dates: Vec<(String, String)> = rows
+            .iter()
+            .filter_map(|(id, text)| Some((id.clone(), detect_date_iso(text, today)?)))
+            .collect();
+        total += backfill_write_batch(conn, &dates, now)?;
         match next {
             Some(id) => after = id,
-            None => return Ok(total),
+            None => {
+                backfill_mark_done(conn)?;
+                return Ok(total);
+            }
         }
     }
 }

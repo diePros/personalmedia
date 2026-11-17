@@ -67,6 +67,7 @@ impl Fx {
             title: Some(format!("title of {name}")),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             document_date: date.map(str::to_owned),
+            date_source: None,
         };
         let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
             format!("bytes of {name}"),
