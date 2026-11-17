@@ -22,8 +22,8 @@ async fn manifest_valid_json_with_required_fields() {
         "strong ETag: {etag}"
     );
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(v["name"], "Personal Media");
-    assert_eq!(v["short_name"], "Media");
+    assert_eq!(v["name"], "Personal Media System");
+    assert_eq!(v["short_name"], "PMS");
     assert_eq!(v["start_url"], "/documents");
     assert_eq!(v["scope"], "/");
     assert_eq!(v["display"], "standalone");

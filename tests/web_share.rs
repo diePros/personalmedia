@@ -393,7 +393,7 @@ async fn anon_review_warns_and_does_not_prefill() {
     let page = get_with_continue(&t, &c, &format!("/share/{id}"), &id).await;
     let html = body_string(page).await;
     assert!(
-        html.contains("These files were sent to Personal Media before you logged in. Only save them if you just shared them yourself."),
+        html.contains("These files were sent to PMS before you logged in. Only save them if you just shared them yourself."),
         "{html}"
     );
     assert!(

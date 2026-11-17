@@ -1,9 +1,9 @@
 {% extends "base.html" %}
-{% block title %}Review shared files · Personal Media{% endblock %}
+{% block title %}Review shared files · PMS{% endblock %}
 {% block content %}
 <h1>Review shared files</h1>
 {% if anonymous -%}
-<p class="error" role="alert"><strong>These files were sent to Personal Media before you logged in. Only save them if you just shared them yourself.</strong></p>
+<p class="error" role="alert"><strong>These files were sent to PMS before you logged in. Only save them if you just shared them yourself.</strong></p>
 {% endif -%}
 <p class="muted">These files are held in memory only and nothing is saved yet. They are dropped after a few minutes.</p>
 {% if let Some(error) = error -%}

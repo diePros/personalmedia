@@ -371,7 +371,7 @@ fn totp_setup_shape() {
     let setup = env.accounts.totp_begin("sebi");
     assert_eq!(setup.secret_b32.len(), 32); // 20 bytes
     assert!(setup.otpauth_url.starts_with("otpauth://totp/"));
-    assert!(setup.otpauth_url.contains("Personal%20Media"));
+    assert!(setup.otpauth_url.contains("PMS"));
     assert!(setup.otpauth_url.contains("sebi"));
     assert!(setup.otpauth_url.contains(&setup.secret_b32));
     // Base64 of the PNG magic bytes.

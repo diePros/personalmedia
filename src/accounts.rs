@@ -23,7 +23,8 @@ use crate::user_db::open_user_db;
 
 const INVITE_TTL_SECS: i64 = 7 * 86400;
 const MIN_PASSWORD_CHARS: usize = 10;
-const TOTP_ISSUER: &str = "Personal Media";
+// Label only: TOTP codes do not depend on the issuer, so existing enrolments keep working.
+const TOTP_ISSUER: &str = "PMS";
 const TOTP_SECRET_LEN: usize = 20;
 
 #[derive(thiserror::Error, Debug)]
