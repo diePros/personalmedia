@@ -26,6 +26,7 @@
 {% endfor -%}
 <button type="submit">Save defaults</button>
 </form>
+<p id="mcp-explanation" class="muted">AI assistants (MCP) see what each token or connected app is allowed to see. Use a document's own setting to limit a specific document for every app.</p>
 <p id="semantic-status">Semantic index: {{ semantic.indexed }} of {{ semantic.eligible }} documents indexed{% if semantic.partial > 0 %} ({{ semantic.partial }} only partially: very long texts are indexed up to roughly their first 600 pages){% endif %}{% if semantic.pending > 0 %}, {{ semantic.pending }} waiting{% endif %}{% if semantic.failed > 0 %}, {{ semantic.failed }} failed{% endif %}</p>
 <p class="muted">Semantic index lets your AI assistant (via MCP, full-text tokens only) search by meaning. Vectors are stored encrypted like your text.</p>
 </section>

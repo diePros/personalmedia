@@ -54,7 +54,10 @@ host allow-list. There is no SSE stream: `GET /mcp` is 405.
 ## Features
 
 - Per-user encryption, OCR (German and English), full-text search, tags, sharing from phones.
-- Scoped MCP tokens with a per-channel access switchboard (web, MCP, semantic index).
+- Scoped MCP tokens with a per-channel access switchboard (web, MCP, semantic index). Since
+  2026-11-17 (owner ruling AJ) a token's or app's own scope governs what MCP sees (`full_text`
+  sees content); only a document's own MCP setting limits it further. Web and semantic index
+  still use your Settings defaults.
 - OAuth for MCP (v1.4): claude.ai custom connectors and Hermes connect with authorization code +
   PKCE and dynamic client registration; grants are listed and revocable under Settings →
   Connected apps. Static `pm_` tokens still work. See [docs/setup.md](docs/setup.md) section 7d.
@@ -71,6 +74,11 @@ host allow-list. There is no SSE stream: `GET /mcp` is 405.
   requests for OAuth: client metadata documents (CIMD) are not supported, only dynamic
   registration.
 
+- MCP access (2026-11-17, owner ruling AJ): a document without a per-document `mcp` setting is
+  visible at the token's or app's own scope (`full_text` = content, `metadata_only` = metadata).
+  A per-document `mcp` setting still limits every token (`min(setting, scope)`), so use it for
+  documents no assistant should read. The user-wide MCP default no longer exists; Web and
+  semantic index defaults are unchanged. Tag allow-lists are unchanged.
 - Semantic vectors are encrypted like the text (SQLCipher index database) and are only created for
   documents whose `semantic_index` level is `full`. `semantic_search` is only available to
   `full_text` tokens and only returns fully MCP-visible documents, within the token's tag allow-list.

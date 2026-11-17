@@ -854,9 +854,14 @@ fn switch_rows(c: &rusqlite::Connection, id: &str) -> anyhow::Result<Vec<SwitchR
         .iter()
         .map(|(ch, label)| {
             let current = overrides.get(ch).copied();
+            let default_label = if *ch == Channel::Mcp {
+                "follow app permission".to_owned()
+            } else {
+                format!("default ({})", defaults.level(*ch).as_str())
+            };
             let mut options = vec![Opt {
                 value: "default",
-                label: format!("default ({})", defaults.level(*ch).as_str()),
+                label: default_label,
                 selected: current.is_none(),
             }];
             for l in [Level::Off, Level::Metadata, Level::Full] {
