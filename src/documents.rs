@@ -262,7 +262,7 @@ impl Documents {
         &self,
         u: &Arc<Unlocked>,
         meta: UploadMeta,
-        mut body: S,
+        body: S,
         on_dup: OnDuplicate,
         visibility: Option<&ListFilter>,
         now: i64,
@@ -279,6 +279,31 @@ impl Documents {
         // past the hint (or per chunk without one).
         let initial = size_hint.map_or(UPLOAD_OVERHEAD, upload_reservation);
         let reservation = self.quotas.reserve(&u.user_id, initial).await?;
+        self.store_reserved(u, meta, body, on_dup, visibility, now, reservation)
+            .await
+    }
+
+    /// [`Documents::store_sized`] with a quota reservation the caller already
+    /// holds (made before the request body was read). The writer grows it
+    /// when the stored size needs more.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_reserved<S, E>(
+        &self,
+        u: &Arc<Unlocked>,
+        meta: UploadMeta,
+        mut body: S,
+        on_dup: OnDuplicate,
+        visibility: Option<&ListFilter>,
+        now: i64,
+        reservation: Reservation,
+    ) -> Result<StoreOutcome, DocError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Into<anyhow::Error>,
+    {
+        if let Some(d) = &meta.document_date {
+            validate_date(d)?;
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let final_path = blob_path(&self.data_dir, &u.user_id, &id);
         let part_path = final_path.with_file_name(format!("{id}.part"));

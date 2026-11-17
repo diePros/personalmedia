@@ -3,7 +3,7 @@
 //! encrypted store.
 //!
 //! Page images stay in memory (`Zeroizing` buffers) until the PDF is built and
-//! handed to [`crate::documents::Documents::store_sized`] as a one-chunk
+//! handed to [`crate::documents::Documents::store_reserved`] as a chunked
 //! stream; nothing is written to disk unencrypted.
 
 use askama::Template;
@@ -21,6 +21,7 @@ use super::session::{AuthRejection, CurrentUser};
 use super::{AppState, CSP, CspOverride, Page, render};
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::pdf::jpegs_to_pdf;
+use crate::quota::{UPLOAD_OVERHEAD, upload_reservation};
 use crate::user_db::documents::list_documents;
 
 /// Most pages in one scan.
@@ -33,6 +34,8 @@ const BODY_SLACK: usize = 1024 * 1024;
 const RECENT_TAGS: usize = 8;
 /// First buffer size for a page; grows by doubling.
 const PAGE_START_CAP: usize = 256 * 1024;
+/// Piece size when the PDF is handed to the store.
+const STORE_CHUNK: usize = 64 * 1024;
 
 pub fn routes(state: &AppState) -> Router<AppState> {
     let limit = state.cfg.max_upload_bytes as usize + BODY_SLACK;
@@ -143,15 +146,34 @@ async fn scan_upload(
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    // Answer a quota refusal before the body is read.
-    if let Some(n) = size_hint
-        && let Err(e) = state.quotas.check_room(&unlocked.user_id, n).await
+    // One scan at a time: the pages and the PDF live in memory.
+    let Ok(_permit) = state.scan_permits.try_acquire() else {
+        let mut resp = json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Another scan is being saved \u{2014} try again in a moment",
+        );
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, header::HeaderValue::from_static("5"));
+        return resp;
+    };
+    // Reserve the quota from Content-Length before the body is read, so a
+    // refusal comes first and parallel uploads cannot jointly exceed it.
+    let reservation = match state
+        .quotas
+        .reserve(
+            &unlocked.user_id,
+            size_hint.map_or(UPLOAD_OVERHEAD, upload_reservation),
+        )
+        .await
     {
-        return doc_error(DocError::QuotaExceeded {
-            used: e.used,
-            limit: e.limit,
-        });
-    }
+        Ok(r) => r,
+        Err(e) => {
+            return doc_error(DocError::QuotaExceeded {
+                used: e.used,
+                limit: e.limit,
+            });
+        }
+    };
 
     let max_total = state.cfg.max_upload_bytes as usize;
     let (mut title, mut tags, mut date) = (None, Vec::new(), None);
@@ -229,14 +251,13 @@ async fn scan_upload(
     })
     .await;
     let pdf = match built {
-        Ok(Ok(pdf)) => pdf,
+        Ok(Ok(pdf)) => Zeroizing::new(pdf),
         Ok(Err(e)) => return json_error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string()),
         Err(e) => {
             tracing::error!(error = %e, "PDF build task failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let size = pdf.len() as u64;
     let meta = UploadMeta {
         filename: format!("{default_title}.pdf"),
         mime: Some("application/pdf".into()),
@@ -244,17 +265,25 @@ async fn scan_upload(
         tags,
         document_date: date,
     };
-    let body = stream::once(async move { Ok::<_, anyhow::Error>(Bytes::from(pdf)) });
+    // Small copies out of the wiped buffer, made one at a time.
+    let body = Box::pin(stream::unfold((pdf, 0usize), |(pdf, at)| async move {
+        if at >= pdf.len() {
+            return None;
+        }
+        let end = (at + STORE_CHUNK).min(pdf.len());
+        let chunk = Bytes::copy_from_slice(&pdf[at..end]);
+        Some((Ok::<_, anyhow::Error>(chunk), (pdf, end)))
+    }));
     match state
         .docs
-        .store_sized(
+        .store_reserved(
             &unlocked,
             meta,
-            Box::pin(body),
+            body,
             OnDuplicate::Keep,
             Some(&web_filter()),
             ts,
-            Some(size),
+            reservation,
         )
         .await
     {

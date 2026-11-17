@@ -494,3 +494,44 @@ async fn scan_notes_are_saved_and_exported() {
     let (status, _) = scan(&t, &c, &[("notes", &"a".repeat(2001))], &[P1]).await;
     assert_eq!(status, 422);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_scans_limited_and_quota_reserved() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = t.state.sys.user_by_name("alice").unwrap().unwrap().id;
+
+    // A scan is already being saved: the second one is told to retry.
+    let permit = t.state.scan_permits.clone().try_acquire_owned().unwrap();
+    let resp = t
+        .post_multipart("/api/scan", &[], &[("page", "p.jpg", "image/jpeg", P1)], &c)
+        .await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(header_str(&resp, "retry-after"), "5");
+    let v: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["status"], "error");
+    assert!(v["message"].as_str().unwrap().contains("Another scan"));
+    assert_eq!(blob_count(&t, "alice"), 0);
+    drop(permit);
+
+    // Room for one scan but not two: a reservation held by an upload in
+    // flight (as the first scan's would be) refuses the second at once.
+    let base = t.state.quotas.usage(&id).await;
+    t.state
+        .sys
+        .set_user_quota(&id, QuotaSetting::Custom(base + 60 * 1024))
+        .unwrap();
+    let held = t.state.quotas.reserve(&id, 40 * 1024).await.unwrap();
+    let (status, v) = scan(&t, &c, &[], &[P1, P2]).await;
+    assert_eq!(status, 413);
+    assert_eq!(v["status"], "quota_exceeded");
+    assert_eq!(blob_count(&t, "alice"), 0);
+    drop(held);
+    let (status, v) = scan(&t, &c, &[], &[P1, P2]).await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(blob_count(&t, "alice"), 1);
+    // The stored one used the room: a repeat is refused.
+    let (status, _) = scan(&t, &c, &[], &[P1, P2]).await;
+    assert_eq!(status, 413);
+    assert_eq!(blob_count(&t, "alice"), 1);
+}

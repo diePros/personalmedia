@@ -86,6 +86,9 @@ pub struct AppState {
     pub oauth: Arc<crate::oauth::OAuthState>,
     /// Bodies of `POST /share` being read at once (try-acquire, 503 when full).
     pub share_permits: Arc<Semaphore>,
+    /// One `POST /api/scan` PDF build at a time (the pages and the PDF are
+    /// held in memory); try-acquire, 503 when taken.
+    pub scan_permits: Arc<Semaphore>,
 }
 
 /// The embedding model is unloaded after this long without use.
@@ -188,6 +191,7 @@ impl AppState {
             mcp_write_permits: Arc::new(Semaphore::new(MCP_WRITE_PERMITS)),
             page_images: Arc::new(crate::mcp::PageImageLimiter::default()),
             share_permits: Arc::new(Semaphore::new(SHARE_PERMITS)),
+            scan_permits: Arc::new(Semaphore::new(1)),
         })
     }
 }

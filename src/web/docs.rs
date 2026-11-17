@@ -128,8 +128,14 @@ pub(super) fn doc_error(e: DocError) -> Response {
     }
 }
 
+/// `{"status":"error","message":…}`; `error` repeats the message for the
+/// page scripts that read it.
 pub(super) fn json_error(status: StatusCode, msg: &str) -> Response {
-    (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
+    (
+        status,
+        axum::Json(serde_json::json!({ "status": "error", "message": msg, "error": msg })),
+    )
+        .into_response()
 }
 
 /// Runs index DB work off the async threads.
