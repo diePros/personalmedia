@@ -391,7 +391,7 @@ async fn totp_disable_requires_password() {
             &c,
         )
         .await;
-    assert!(missing.status().is_client_error());
+    assert_eq!(missing.status(), 401);
     assert!(t.state.accounts.totp_enabled(&uid));
     // The form asks for it.
     let html = body_string(t.get("/settings", &c).await).await;

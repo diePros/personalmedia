@@ -658,24 +658,26 @@ async fn recover(
     };
     match result {
         Ok((unlocked, user, new_key)) => {
+            // Remembered devices were granted under the old credentials. They
+            // go first, so no resume can start a session after the sessions
+            // are ended below. A new remember still works: it is a fresh device.
+            let (sys, u2) = (state.sys.clone(), unlocked.clone());
+            let revoked =
+                tokio::task::spawn_blocking(move || crate::devices::revoke_all_devices(&sys, &u2))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!("device revocation task failed: {e}")));
+            if let Err(e) = revoked {
+                tracing::error!(error = %e, "could not revoke devices after recovery");
+                return recover_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    form.username,
+                    "Your password was changed, but remembered devices could not be signed out. Log in and revoke them under Remembered devices.",
+                );
+            }
             // The old password may be compromised: no other session or cached
             // token unlock survives the recovery.
             state.sessions.remove_user(&user.id);
             state.tokens.evict_user(&user.id);
-            // Remembered devices were granted under the old credentials. A
-            // new remember below still works: it creates a fresh device.
-            let (sys, u2) = (state.sys.clone(), unlocked.clone());
-            match tokio::task::spawn_blocking(move || crate::devices::revoke_all_devices(&sys, &u2))
-                .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return internal(&AccountError::Internal(e)),
-                Err(e) => {
-                    return internal(&AccountError::Internal(anyhow::anyhow!(
-                        "device revocation task failed: {e}"
-                    )));
-                }
-            }
             let label = remember_label(&headers, form.remember.as_deref());
             match finish_login(
                 &state,

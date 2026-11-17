@@ -725,3 +725,64 @@ async fn recovery_login_revokes_all_devices() {
     let ids = app.state.sys.token_ids_for_user(&uid).unwrap();
     assert!(!ids.contains(&device_id_of_token(&token)), "{ids:?}");
 }
+
+/// Status of a GET /documents carrying only the session cookie.
+async fn session_status(app: &TestApp, client: &Client) -> (u16, String) {
+    let resp = send(
+        app,
+        Method::GET,
+        "/documents",
+        &format!("__Host-pm_session={}", client.cookie),
+        None,
+    )
+    .await;
+    let loc = resp
+        .headers()
+        .get("location")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    (resp.status().as_u16(), loc)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_device_ends_its_live_session() {
+    let (app, _) = setup().await;
+    let resp_a = login(&app, true).await;
+    let token_a = device_of(&resp_a).unwrap();
+    let client_a = client_from_response(&resp_a);
+    assert_eq!(session_status(&app, &client_a).await.0, 200);
+    let resp_b = login(&app, true).await;
+    let (client_b, _) = settings_client(&app, &resp_b).await;
+
+    let id_a = device_id_of_token(&token_a);
+    let resp = app
+        .post_form(&format!("/settings/devices/{id_a}/revoke"), &[], &client_b)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(
+        session_status(&app, &client_a).await,
+        (303, "/login".to_owned())
+    );
+    assert_eq!(session_status(&app, &client_b).await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sign_out_others_ends_their_live_sessions() {
+    let (app, _) = setup().await;
+    let resp_a = login(&app, true).await;
+    let client_a = client_from_response(&resp_a);
+    // A browser logged in without remembering is "other" too.
+    let resp_c = login(&app, false).await;
+    let client_c = client_from_response(&resp_c);
+    let resp_b = login(&app, true).await;
+    let (client_b, _) = settings_client(&app, &resp_b).await;
+
+    let resp = app
+        .post_form("/settings/devices/revoke-others", &[], &client_b)
+        .await;
+    assert_eq!(resp.status(), 303);
+    for c in [&client_a, &client_c] {
+        assert_eq!(session_status(&app, c).await, (303, "/login".to_owned()));
+    }
+    assert_eq!(session_status(&app, &client_b).await.0, 200);
+}

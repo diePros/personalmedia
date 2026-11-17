@@ -710,6 +710,30 @@ impl SystemDb {
         Ok(ids)
     }
 
+    /// Deletes the device rows of a user except `keep`; returns the deleted ids.
+    pub fn delete_device_tokens_except(
+        &self,
+        user_id: &str,
+        keep: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        let keep = keep.unwrap_or("");
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let ids: Vec<String> = {
+            let mut st = tx.prepare(
+                "SELECT token_id FROM tokens WHERE user_id=?1 AND kind='device' AND token_id<>?2",
+            )?;
+            st.query_map(params![user_id, keep], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM tokens WHERE user_id=?1 AND kind='device' AND token_id<>?2",
+            params![user_id, keep],
+        )?;
+        tx.commit()?;
+        Ok(ids)
+    }
+
     /// Deletes every token row whose expiry has passed (static tokens have
     /// none); returns how many went. Grant metadata left without rows is
     /// pruned on unlock.

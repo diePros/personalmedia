@@ -627,19 +627,30 @@ async fn change_password(
     match result {
         Ok(()) => {
             attempt.success();
+            // Remembered devices were granted under the old password, this
+            // browser's included. They go first, so no resume can start a
+            // session after the other sessions are ended below.
+            let (sys, u) = (state.sys.clone(), session.unlocked.clone());
+            let revoked = match blocking(move || crate::devices::revoke_all_devices(&sys, &u)).await
+            {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            if let Err(e) = revoked {
+                tracing::error!(error = %e, "could not revoke devices after password change");
+                return failure(
+                    &state,
+                    &session,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Password changed, but remembered devices could not be signed out. Revoke them under Remembered devices.",
+                )
+                .await;
+            }
             // The password is the credential of the other browsers, so they go.
             state
                 .sessions
                 .remove_user_except(&session.user_id, &session.id);
             state.tokens.evict_user(&session.user_id);
-            // Remembered devices were granted under the old password, this
-            // browser's included: the session lives on, no longer remembered.
-            let (sys, u) = (state.sys.clone(), session.unlocked.clone());
-            match blocking(move || crate::devices::revoke_all_devices(&sys, &u)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return internal(e),
-                Err(r) => return r,
-            }
             state.sessions.clear_device(&session.id);
             let mut resp = redirect(&headers, "/settings?notice=password");
             resp.headers_mut()
@@ -1165,7 +1176,7 @@ async fn revoke_device_route(
 ) -> Response {
     let (u, sys, id2) = (session.unlocked.clone(), state.sys.clone(), id.clone());
     match blocking(move || crate::devices::revoke_device(&sys, &u, &id2)).await {
-        Ok(Ok(true)) => {}
+        Ok(Ok(true)) => state.sessions.remove_device(&id),
         Ok(Ok(false)) => return StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => return internal(e),
         Err(r) => return r,
@@ -1191,17 +1202,26 @@ async fn revoke_other_devices(
         state.sys.clone(),
         session.device_id.clone(),
     );
-    let result = blocking(move || -> anyhow::Result<()> {
-        for d in u.with_db(crate::user_db::list_device_meta)? {
-            if keep.as_deref() != Some(d.id.as_str()) {
-                crate::devices::revoke_device(&sys, &u, &d.id)?;
-            }
-        }
-        Ok(())
+    let result = blocking(move || -> anyhow::Result<Vec<String>> {
+        // Based on the system rows: a device without metadata is revoked too.
+        let ids = sys.delete_device_tokens_except(&u.user_id, keep.as_deref())?;
+        u.with_db(|c| {
+            ids.iter()
+                .try_for_each(|id| crate::user_db::delete_device_meta(c, id))
+        })?;
+        Ok(ids)
     })
     .await;
     match result {
-        Ok(Ok(())) => redirect(&headers, "/settings?notice=devices_revoked"),
+        Ok(Ok(ids)) => {
+            for id in &ids {
+                state.sessions.remove_device(id);
+            }
+            state
+                .sessions
+                .remove_user_except(&session.user_id, &session.id);
+            redirect(&headers, "/settings?notice=devices_revoked")
+        }
         Ok(Err(e)) => internal(e),
         Err(r) => r,
     }

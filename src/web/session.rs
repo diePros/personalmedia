@@ -293,6 +293,11 @@ impl SessionStore {
         self.remove_where(|s| s.user_id == user_id && s.id != keep);
     }
 
+    /// End every session that belongs to remembered device `device_id`.
+    pub fn remove_device(&self, device_id: &str) {
+        self.remove_where(|s| s.device_id.as_deref() == Some(device_id));
+    }
+
     /// Drop expired sessions. Run every minute by a background task, so keys
     /// do not stay unlocked just because nobody asked for the session again.
     pub fn sweep(&self) {
