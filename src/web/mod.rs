@@ -349,9 +349,9 @@ pub fn redirect(headers: &HeaderMap, to: &str) -> Response {
 }
 
 /// Response extension that replaces the default [`CSP`] for one response:
-/// `resp.extensions_mut().insert(CspOverride("..."))`.
-#[derive(Clone, Copy)]
-pub struct CspOverride(pub &'static str);
+/// `resp.extensions_mut().insert(CspOverride("...".into()))`.
+#[derive(Clone)]
+pub struct CspOverride(pub std::borrow::Cow<'static, str>);
 
 /// What `templates/base.html` needs. Every page template has a `page: Page` field.
 pub struct Page {
@@ -545,12 +545,10 @@ async fn security_headers(req: Request, next: Next) -> Response {
     let csp = resp
         .extensions()
         .get::<CspOverride>()
-        .map_or(CSP, |over| over.0);
+        .and_then(|over| HeaderValue::from_str(&over.0).ok())
+        .unwrap_or_else(|| HeaderValue::from_static(CSP));
     let h = resp.headers_mut();
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(csp),
-    );
+    h.insert(header::CONTENT_SECURITY_POLICY, csp);
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),

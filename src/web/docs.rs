@@ -1017,7 +1017,7 @@ async fn raw(
         HeaderName::from_static("x-frame-options"),
         HeaderValue::from_static("SAMEORIGIN"),
     );
-    resp.extensions_mut().insert(CspOverride(RAW_CSP));
+    resp.extensions_mut().insert(CspOverride(RAW_CSP.into()));
     resp
 }
 

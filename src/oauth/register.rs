@@ -62,10 +62,16 @@ pub async fn register(
         return bad_metadata("The body must be a JSON object");
     };
 
+    // Every client is registered as a public one. A client asking for a
+    // secret-based method still gets a client, and the response says `none`
+    // (RFC 7591 section 3.2.1 lets the server override metadata).
     if let Some(m) = req.get("token_endpoint_auth_method")
-        && m.as_str() != Some("none")
+        && !matches!(
+            m.as_str(),
+            Some("none" | "client_secret_post" | "client_secret_basic")
+        )
     {
-        return bad_metadata("Only public clients are supported (token_endpoint_auth_method none)");
+        return bad_metadata("Unsupported token_endpoint_auth_method");
     }
     if let Some(g) = req.get("grant_types") {
         let ok = str_list(g).is_some_and(|l| {
@@ -104,11 +110,7 @@ pub async fn register(
     // Stored raw (HTML-escaped when rendered), capped, without control characters.
     let name: String = match req.get("client_name") {
         None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(CLIENT_NAME_MAX_CHARS)
-            .collect(),
+        Some(Value::String(s)) => clean_client_name(s),
         Some(_) => return bad_metadata("client_name must be a string"),
     };
     let name = if name.trim().is_empty() {
@@ -163,4 +165,38 @@ pub async fn register(
             "response_types": ["code"],
         }),
     )
+}
+
+/// Unicode format characters (category Cf): bidi controls, zero-width
+/// characters, joiners, tag characters. In a client name they could reorder
+/// or hide text on the consent page.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{08E2}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// A client name safe to show: control and format characters removed, cut to
+/// [`CLIENT_NAME_MAX_CHARS`]. Applied at registration and again at render.
+pub fn clean_client_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control() && !is_format_char(*c))
+        .take(CLIENT_NAME_MAX_CHARS)
+        .collect()
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::clean_client_name;
+
+    #[test]
+    fn bidi_and_format_characters_are_stripped() {
+        assert_eq!(
+            clean_client_name("a\u{202E}b\u{200B}c\u{2066}d\u{2069}e\u{FEFF}\u{0007}f"),
+            "abcdef"
+        );
+    }
 }

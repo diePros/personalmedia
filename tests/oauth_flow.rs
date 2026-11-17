@@ -68,7 +68,11 @@ impl Flow {
     /// Full authorize + consent; returns the code.
     async fn code(&self, fields: &[(&str, &str)]) -> String {
         let req = self.consent_req("").await;
-        let mut all = vec![("req", req.as_str()), ("decision", "approve")];
+        let mut all = vec![
+            ("req", req.as_str()),
+            ("decision", "approve"),
+            ("password", PASSWORD),
+        ];
         all.extend_from_slice(fields);
         let resp = self
             .t
@@ -210,7 +214,7 @@ async fn full_flow_register_authorize_token_mcp_refresh() {
     assert_eq!(resp.status(), 200);
     let csp = header_str(&resp, "content-security-policy").to_owned();
     assert!(csp.contains("frame-ancestors 'none'"));
-    assert!(!csp.contains("form-action"));
+    assert!(csp.contains("form-action 'self' http://127.0.0.1:8123"));
     let html = body_string(resp).await;
     assert!(html.contains("Hermes wants access to your documents"));
     assert!(html.contains("It will send you back to: <strong>127.0.0.1:8123</strong>"));
@@ -622,13 +626,6 @@ async fn redirect_uri_allow_list_enforced() {
             )[..],
             "invalid_target",
         ),
-        (
-            &format!(
-                "&response_type=code&code_challenge={}&code_challenge_method=S256&scope=admin",
-                challenge_of(VERIFIER)
-            )[..],
-            "invalid_scope",
-        ),
     ] {
         let resp = f.t.get(&format!("{base}{extra}"), &f.alice).await;
         assert_eq!(resp.status(), 302, "{extra}");
@@ -637,6 +634,14 @@ async fn redirect_uri_allow_list_enforced() {
         assert_eq!(query_param(loc, "error").as_deref(), Some(code), "{extra}");
         assert_eq!(query_param(loc, "state").as_deref(), Some("s1"));
     }
+
+    // Unknown scopes are ignored, not rejected: the consent page opens.
+    let resp =
+        f.t.get(&f.authorize_uri("&scope=admin%20read"), &f.alice)
+            .await;
+    assert_eq!(resp.status(), 200);
+    let html = body_string(resp).await;
+    assert!(!html.contains("admin"), "unknown scopes are not echoed");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -697,7 +702,9 @@ async fn oauth_scope_enforced_like_static_tokens() {
     let (_, _, v) = call("get_document", json!({"id": other})).await;
     assert_eq!(v["result"]["isError"], true, "{v}");
     let (_, _, v) = call("get_document", json!({"id": hermes})).await;
+    assert_ne!(v["result"]["isError"], true, "{v}");
     let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("title of in-scope.txt"), "{text}");
     assert!(!text.contains("secret words"), "{text}");
 }
 
@@ -739,7 +746,8 @@ async fn store_doc(
 #[tokio::test(flavor = "multi_thread")]
 async fn consent_deny_and_csrf_and_escaping() {
     let f = Flow::new().await;
-    // Requested scopes pre-select the form.
+    // Requested scopes are shown as text only; the form defaults to the least
+    // access whatever the app asked for.
     let resp =
         f.t.get(
             &f.authorize_uri("&scope=mcp%3Awrite%20content%3Afull"),
@@ -747,8 +755,14 @@ async fn consent_deny_and_csrf_and_escaping() {
         )
         .await;
     let html = body_string(resp).await;
-    assert!(html.contains("<option value=\"read_write\" selected>"));
-    assert!(html.contains("<option value=\"full_text\" selected>"));
+    assert!(html.contains("<option value=\"read\" selected>"));
+    assert!(html.contains("<option value=\"metadata_only\" selected>"));
+    assert!(!html.contains("<option value=\"read_write\" selected>"));
+    assert!(!html.contains("<option value=\"full_text\" selected>"));
+    assert!(html.contains("The app asked for: write access, full text"));
+    assert!(html.contains("registered less than a minute ago"));
+    assert!(html.contains("Only approve if you just started connecting this app yourself."));
+    assert!(html.contains("name=\"password\""));
 
     // Deny goes back with access_denied and the state.
     let req = req_id(&html);
@@ -768,7 +782,11 @@ async fn consent_deny_and_csrf_and_escaping() {
     let resp =
         f.t.post_form(
             "/oauth/authorize",
-            &[("req", &req), ("decision", "approve")],
+            &[
+                ("req", &req),
+                ("decision", "approve"),
+                ("password", PASSWORD),
+            ],
             &f.alice,
         )
         .await;
@@ -779,7 +797,12 @@ async fn consent_deny_and_csrf_and_escaping() {
     let resp =
         f.t.post_form_raw(
             "/oauth/authorize",
-            &[("req", &req), ("decision", "approve"), ("csrf", "wrong")],
+            &[
+                ("req", &req),
+                ("decision", "approve"),
+                ("password", PASSWORD),
+                ("csrf", "wrong"),
+            ],
             &f.alice,
         )
         .await;
@@ -806,6 +829,78 @@ async fn consent_deny_and_csrf_and_escaping() {
     assert!(!html.contains("<script>alert"));
     assert!(html.contains("&#60;script&#62;") || html.contains("&lt;script&gt;"));
     assert!(!html.contains(&"x".repeat(60)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn consent_requires_password() {
+    let f = Flow::new().await;
+    let req = f.consent_req("").await;
+    let tokens_before = |f: &Flow| -> i64 {
+        sys_conn(f)
+            .query_row("SELECT count(*) FROM tokens", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // No password and a wrong one: the consent page again, no redirect, no grant.
+    for fields in [
+        vec![("req", req.as_str()), ("decision", "approve")],
+        vec![
+            ("req", req.as_str()),
+            ("decision", "approve"),
+            ("password", "not the password"),
+        ],
+    ] {
+        let resp = f.t.post_form("/oauth/authorize", &fields, &f.alice).await;
+        assert_eq!(resp.status(), 401);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+        let html = body_string(resp).await;
+        assert!(html.contains("The password is wrong."));
+        assert_eq!(req_id(&html), req, "the same request stays pending");
+        assert_eq!(tokens_before(&f), 0);
+    }
+
+    // The right password on the same request goes through.
+    let resp =
+        f.t.post_form(
+            "/oauth/authorize",
+            &[
+                ("req", &req),
+                ("decision", "approve"),
+                ("password", PASSWORD),
+            ],
+            &f.alice,
+        )
+        .await;
+    assert_eq!(resp.status(), 302);
+    assert!(query_param(header_str(&resp, "location"), "code").is_some());
+    assert_eq!(tokens_before(&f), 2);
+
+    // The consent page allows the redirect target in form-action.
+    let resp = f.t.get(&f.authorize_uri(""), &f.alice).await;
+    let csp = header_str(&resp, "content-security-policy");
+    assert!(
+        csp.contains("form-action 'self' http://127.0.0.1:8123"),
+        "{csp}"
+    );
+
+    // Wrong passwords are rate limited like logins.
+    let req = f.consent_req("").await;
+    let mut last = 0;
+    for _ in 0..15 {
+        last =
+            f.t.post_form(
+                "/oauth/authorize",
+                &[("req", &req), ("decision", "approve"), ("password", "x")],
+                &f.alice,
+            )
+            .await
+            .status()
+            .as_u16();
+        if last == 429 {
+            break;
+        }
+    }
+    assert_eq!(last, 429);
 }
 
 #[tokio::test(flavor = "multi_thread")]

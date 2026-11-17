@@ -71,8 +71,11 @@ pub struct AuthRequest {
     pub redirect_uri: String,
     pub state: Option<String>,
     pub challenge: String,
-    /// Requested scopes; they only pre-select the consent form.
+    /// Requested scopes (known ones only); shown on the consent page as text.
+    /// They do not pre-select anything: the form defaults to the least access.
     pub scopes: Vec<String>,
+    /// When the client registered (unix seconds), shown on the consent page.
+    pub client_created_at: i64,
     created: Instant,
 }
 
@@ -84,6 +87,7 @@ impl AuthRequest {
         state: Option<String>,
         challenge: String,
         scopes: Vec<String>,
+        client_created_at: i64,
     ) -> AuthRequest {
         AuthRequest {
             client_id,
@@ -92,6 +96,7 @@ impl AuthRequest {
             state,
             challenge,
             scopes,
+            client_created_at,
             created: Instant::now(),
         }
     }
@@ -199,6 +204,15 @@ impl OAuthState {
     pub fn take_request(&self, id: &str) -> Option<AuthRequest> {
         let mut map = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(id).filter(|r| r.created.elapsed() < REQUEST_TTL)
+    }
+
+    /// Puts back a request taken with [`OAuthState::take_request`] after a
+    /// failed attempt (wrong password, invalid field), keeping its age.
+    pub fn restore_request(&self, id: &str, req: AuthRequest) {
+        self.requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_owned(), req);
     }
 
     /// Stores a code entry; returns the code.

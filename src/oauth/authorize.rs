@@ -9,35 +9,68 @@
 //! who is not logged in gets it in the `__Host-pm_continue` cookie, the
 //! consent form carries it as a hidden field); neither carries any parameter.
 
+use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use askama::Template;
-use axum::extract::{OriginalUri, State};
+use axum::extract::{ConnectInfo, OriginalUri, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
+use super::register::clean_client_name;
 use super::{AuthRequest, CodeEntry, REQUEST_TTL, SCOPES, mcp_url, redirect_uri_allowed};
+use crate::accounts::AccountError;
 use crate::documents::{DocError, validate_meta};
 use crate::tokens::{create_grant, scope_string};
 use crate::user_db::tag_ids as tag_ids_for;
 use crate::user_db::{Access, Content, GrantInfo, ListFilter, TokenScope, list_tags_visible};
+use crate::web::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
 use crate::web::session::{
     CsrfForm, CurrentUser, Session, clear_continue_cookie, continue_cookie, continue_id,
     is_staging_id,
 };
-use crate::web::{AppState, CspOverride, Page, render};
+use crate::web::{AppState, CspOverride, Page, kdf_blocking, render};
 
 /// Consent form bodies are small.
 pub const BODY_LIMIT: usize = 16 * 1024;
 
 const STATE_MAX: usize = 512;
 
-/// The consent page must let the browser follow the redirect to the client's
-/// callback (Chrome checks `form-action` against redirects of a form post), and
-/// that host is not known statically, so `form-action` is left out here. Every
-/// other directive of the default policy stays.
-const CONSENT_CSP: &str = "default-src 'self'; img-src 'self' data:; object-src 'self'; \
-                           frame-ancestors 'none'; base-uri 'none'";
+/// The consent page's policy: the default one, except that `form-action` also
+/// allows the origin the approval redirects to (Chrome checks `form-action`
+/// against the redirect that follows a form post).
+fn consent_csp(redirect_uri: &str) -> String {
+    let origin: String = redirect_uri
+        .splitn(4, '/')
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!(
+        "default-src 'self'; img-src 'self' data:; object-src 'self'; \
+         frame-ancestors 'none'; base-uri 'none'; form-action 'self' {origin}"
+    )
+}
+
+/// "less than a minute ago", "5 minutes ago", "3 hours ago", "2 days ago".
+fn ago(secs: i64) -> String {
+    let plural = |n: i64, unit: &str| format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" });
+    match secs.max(0) {
+        s if s < 60 => "less than a minute ago".to_owned(),
+        s if s < 2 * 3600 => plural(s / 60, "minute"),
+        s if s < 2 * 86400 => plural(s / 3600, "hour"),
+        s => plural(s / 86400, "day"),
+    }
+}
+
+/// Plain words for a requested scope.
+fn scope_words(scope: &str) -> &'static str {
+    match scope {
+        "mcp:read" => "read access",
+        "mcp:write" => "write access",
+        "content:full" => "full text",
+        _ => "offline access",
+    }
+}
 
 fn now() -> i64 {
     SystemTime::now()
@@ -75,8 +108,11 @@ struct ConsentPage {
     client_name: String,
     redirect_host: String,
     req_id: String,
-    read_write: bool,
-    full_text: bool,
+    /// "registered 5 minutes ago"
+    registered: String,
+    /// The scopes the app asked for, as words; empty when it asked for none.
+    asked: String,
+    error: Option<String>,
     tags: Vec<TagChoice>,
 }
 
@@ -219,22 +255,26 @@ pub async fn authorize_get(
         .split_whitespace()
         .map(str::to_owned)
         .collect();
-    if scopes.iter().any(|s| !SCOPES.contains(&s.as_str())) {
-        return fail("invalid_scope", "Unknown scope requested");
-    }
+    // Unknown scopes are ignored (RFC 6749 section 3.3); the consent decision
+    // is what counts.
+    let scopes: Vec<String> = scopes
+        .into_iter()
+        .filter(|s| SCOPES.contains(&s.as_str()))
+        .collect();
 
     let req = AuthRequest::new(
         client_id,
-        client.client_name,
+        clean_client_name(&client.client_name),
         redirect_uri,
         q.state,
         challenge,
         scopes,
+        client.created_at,
     );
     let id = state.oauth.put_request(req.clone());
     match session {
         Some(axum::Extension(s)) if s.must_confirm_recovery.is_none() => {
-            consent_page(&s, &id, &req).await
+            consent_page(&s, &id, &req, None).await
         }
         _ => {
             // Log in first; the login flow returns to `/oauth/authorize/resume`.
@@ -267,10 +307,15 @@ pub async fn resume(
             .append(header::SET_COOKIE, clear_continue_cookie());
         return resp;
     };
-    consent_page(&session, &id, &req).await
+    consent_page(&session, &id, &req, None).await
 }
 
-async fn consent_page(session: &Session, req_id: &str, req: &AuthRequest) -> Response {
+async fn consent_page(
+    session: &Session,
+    req_id: &str,
+    req: &AuthRequest,
+    error: Option<&str>,
+) -> Response {
     let u = session.unlocked.clone();
     let tags = match tokio::task::spawn_blocking(move || {
         u.with_db(|c| list_tags_visible(c, &ListFilter::default()))
@@ -287,24 +332,29 @@ async fn consent_page(session: &Session, req_id: &str, req: &AuthRequest) -> Res
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let has = |s: &str| req.scopes.iter().any(|r| r == s);
     let mut resp = render(&ConsentPage {
         page: Page::for_session(session),
-        client_name: req
-            .client_name
-            .chars()
-            .take(super::CLIENT_NAME_MAX_CHARS)
-            .collect(),
+        client_name: clean_client_name(&req.client_name),
         redirect_host: redirect_host(&req.redirect_uri),
         req_id: req_id.to_owned(),
-        read_write: has("mcp:write"),
-        full_text: has("content:full"),
+        registered: format!("registered {}", ago(now() - req.client_created_at)),
+        asked: req
+            .scopes
+            .iter()
+            .map(|s| scope_words(s))
+            .collect::<Vec<_>>()
+            .join(", "),
+        error: error.map(str::to_owned),
         tags: tags
             .into_iter()
             .map(|(id, name)| TagChoice { id, name })
             .collect(),
     });
-    resp.extensions_mut().insert(CspOverride(CONSENT_CSP));
+    if error.is_some() {
+        *resp.status_mut() = StatusCode::UNAUTHORIZED;
+    }
+    resp.extensions_mut()
+        .insert(CspOverride(consent_csp(&req.redirect_uri).into()));
     resp
 }
 
@@ -323,8 +373,12 @@ fn internal(e: impl std::fmt::Display) -> Response {
 }
 
 /// `POST /oauth/authorize`: the consent decision (session + CSRF protected).
+/// Approving also needs the account password (ruling AG): a grant outlives
+/// logout and password changes, like a static token does.
 pub async fn authorize_post(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     CurrentUser(session): CurrentUser,
     CsrfForm(pairs): CsrfForm<Pairs>,
 ) -> Response {
@@ -338,13 +392,33 @@ pub async fn authorize_post(
     let Some(req_id) = field(&pairs, "req").map(str::to_owned) else {
         return gone();
     };
-    let Some(req) = state.oauth.request(&req_id) else {
+    // Taken up front so a double click cannot mint two grants; put back when
+    // the attempt fails and the user may try again.
+    let Some(req) = state.oauth.take_request(&req_id) else {
         return gone();
     };
+    match decide(&state, peer, &headers, &session, &req_id, &req, &pairs).await {
+        Ok(resp) => resp,
+        Err(resp) => {
+            state.oauth.restore_request(&req_id, req);
+            resp
+        }
+    }
+}
 
-    let decision = field(&pairs, "decision").unwrap_or_default();
+/// `Ok` consumes the request, `Err` leaves it pending for another attempt.
+#[allow(clippy::result_large_err)] // the error is a ready `Response`
+async fn decide(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    session: &Session,
+    req_id: &str,
+    req: &AuthRequest,
+    pairs: &Pairs,
+) -> Result<Response, Response> {
+    let decision = field(pairs, "decision").unwrap_or_default();
     if decision == "deny" {
-        state.oauth.take_request(&req_id);
         let mut resp = redirect_error(
             &req.redirect_uri,
             req.state.as_deref(),
@@ -353,41 +427,59 @@ pub async fn authorize_post(
         );
         resp.headers_mut()
             .append(header::SET_COOKIE, clear_continue_cookie());
-        return resp;
+        return Ok(resp);
     }
     if decision != "approve" {
-        return error_page("Choose Approve or Deny.");
+        return Err(error_page("Choose Approve or Deny."));
     }
 
-    let access = match field(&pairs, "access").unwrap_or("read") {
+    let access = match field(pairs, "access").unwrap_or("read") {
         "read" => Access::Read,
         "read_write" => Access::ReadWrite,
-        _ => return error_page("Invalid access."),
+        _ => return Err(error_page("Invalid access.")),
     };
-    let content = match field(&pairs, "content").unwrap_or("metadata_only") {
+    let content = match field(pairs, "content").unwrap_or("metadata_only") {
         "metadata_only" => Content::MetadataOnly,
         "full_text" => Content::FullText,
-        _ => return error_page("Invalid content level."),
+        _ => return Err(error_page("Invalid content level.")),
     };
     let mut tag_ids: Vec<i64> = Vec::new();
-    for (k, v) in &pairs {
+    for (k, v) in pairs {
         if k == "tags[]" {
             match v.parse::<i64>() {
                 Ok(id) if !tag_ids.contains(&id) => tag_ids.push(id),
                 Ok(_) => {}
-                Err(_) => return error_page("Invalid tag."),
+                Err(_) => return Err(error_page("Invalid tag.")),
             }
         }
     }
-    let new_tag = field(&pairs, "new_tag")
+    let new_tag = field(pairs, "new_tag")
         .unwrap_or_default()
         .trim()
         .to_owned();
     if !new_tag.is_empty() {
         let names = std::slice::from_ref(&new_tag);
         if let Err(DocError::InvalidInput(msg)) = validate_meta(None, None, names) {
-            return error_page(msg);
+            return Err(error_page(msg));
         }
+    }
+
+    // The password, checked under the KDF semaphore and the same limiter keys
+    // as the login and static-token routes.
+    let ip = client_ip(peer, headers, state.cfg.trusted_proxy);
+    let keys = [ip_key(ip), user_key(&session.username)];
+    let attempt = state.limiter.begin(&keys).map_err(too_many_requests)?;
+    let password = field(pairs, "password").unwrap_or_default().to_owned();
+    let accounts = state.accounts.clone();
+    let user_id = session.user_id.clone();
+    match kdf_blocking(state, move || accounts.verify_password(&user_id, &password)).await {
+        Err(r) => return Err(r),
+        Ok(Err(AccountError::InvalidCredentials)) => {
+            attempt.failure();
+            return Err(consent_page(session, req_id, req, Some("The password is wrong.")).await);
+        }
+        Ok(Err(e)) => return Err(internal(e)),
+        Ok(Ok(())) => attempt.success(),
     }
 
     let (u, sys) = (session.unlocked.clone(), state.sys.clone());
@@ -442,11 +534,10 @@ pub async fn authorize_post(
     .await;
     let entry = match result {
         Ok(Ok(Some(e))) => e,
-        Ok(Ok(None)) => return error_page("Invalid tag or unknown app."),
-        Ok(Err(e)) => return internal(e),
-        Err(e) => return internal(e),
+        Ok(Ok(None)) => return Err(error_page("Invalid tag or unknown app.")),
+        Ok(Err(e)) => return Err(internal(e)),
+        Err(e) => return Err(internal(e)),
     };
-    state.oauth.take_request(&req_id);
     let code = state.oauth.put_code(entry);
     let mut params = vec![("code", code.as_str())];
     if let Some(s) = req.state.as_deref() {
@@ -455,5 +546,5 @@ pub async fn authorize_post(
     let mut resp = redirect_with(&req.redirect_uri, &params);
     resp.headers_mut()
         .append(header::SET_COOKIE, clear_continue_cookie());
-    resp
+    Ok(resp)
 }

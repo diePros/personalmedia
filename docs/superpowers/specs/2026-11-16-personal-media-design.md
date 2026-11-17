@@ -240,10 +240,11 @@ Clients: **claude.ai custom connectors** and **Hermes** (`auth: oauth`). Static 
 **User flow**
 - The user adds `{PM_PUBLIC_URL}/mcp` as a connector.
 - The client opens PMS's `/oauth/authorize` in the browser. The user logs in if needed.
-- A consent page shows "{client name} wants access to your documents" and the redirect URI's host, prominently. The user picks:
+- A consent page shows "{client name} wants access to your documents" and the redirect URI's host, prominently, plus when the client registered and the line "Only approve if you just started connecting this app yourself." The scopes the app asked for are shown as text only. The user picks, with the form defaulting to the least access (read, metadata only, no tags) whatever was asked:
   - read or read+write
   - metadata only or full text
   - an optional tag restriction (existing or new tag)
+- **Approving needs the account password** (ruling AG), checked like the static-token form: under the KDF semaphore and the login rate-limiter keys. A wrong password re-renders the consent page with an error and no redirect. Deny needs no password. A grant outlives logout and password changes, exactly like a static token, so a stolen session alone must not be able to mint one.
 - On approval, the client is connected. Settings → **Connected apps** lists each grant (client name, scope, created, last used) with a Revoke button.
 
 **Protocol** (Claude connector requirements + MCP authorization spec)
@@ -259,6 +260,9 @@ Clients: **claude.ai custom connectors** and **Hermes** (`auth: oauth`). Static 
 - Dynamic Client Registration (RFC 7591) for public clients only.
 - Authorization code + PKCE S256 is mandatory; `state` is passed through.
 - `/oauth/token` accepts `application/x-www-form-urlencoded`. Refresh tokens rotate; an invalid one returns `invalid_grant`.
+- **Reuse detection with a grace window (ruling AF):** replaying a consumed refresh token revokes the whole grant, except within 60 s of its rotation, where it only returns `invalid_grant` (a lost response or a parallel refresh must not drop the connector). Replaying an authorization code revokes everything issued from it (RFC 6749 section 4.1.2).
+- Unknown requested scopes are ignored, not rejected. Dynamic registration with `client_secret_post` or `client_secret_basic` is accepted but registers a public client, and the response says `token_endpoint_auth_method: "none"` (RFC 7591 section 3.2.1).
+- **Rate limiting (ruling AH):** `/oauth/token` failures are keyed by `oauth-client:{client_id}` (by IP only when the client id is missing or unknown), never by the `mcp-ip:` key `/mcp` uses, so one party cannot lock out a shared egress IP such as claude.ai's. On `/mcp` an expired but otherwise valid access token returns `401` without counting as a failure (the secret is verified first, then expiry).
 - Revocation endpoint (RFC 7009).
 - Discovery, registration and token responses must be fast (< 1 s server-side); Anthropic gives them 10 s end to end.
 
@@ -281,8 +285,8 @@ Everything else is rejected at registration and again at authorize.
 
 **Abuse limits**
 - DCR is rate-limited per IP: 10 per hour.
-- At most 200 registered clients; clients without a grant are pruned after 24 h.
-- The authorize and consent pages require a session and CSRF, and cannot be framed.
+- At most 200 registered clients; clients without a grant are pruned after 24 h, and clients with no activity for 30 days (a grant or a refresh; the refresh lifetime) are pruned too. Expired token rows are swept.
+- The authorize and consent pages require a session and CSRF, and cannot be framed. The consent POST also needs the password (above). Client names are stripped of control and Unicode format characters (bidi overrides, zero-width).
 
 ## 14. Security hardening (required because the app is public)
 

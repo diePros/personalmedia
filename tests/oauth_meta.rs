@@ -226,12 +226,8 @@ async fn dcr_registers_public_client() {
         64
     );
 
-    // Confidential clients are refused.
-    for method in [
-        "client_secret_basic",
-        "client_secret_post",
-        "private_key_jwt",
-    ] {
+    // Secret-based methods are accepted but registered as public clients.
+    for method in ["client_secret_basic", "client_secret_post"] {
         let resp = app
             .request(post_json(
                 "/oauth/register",
@@ -239,9 +235,31 @@ async fn dcr_registers_public_client() {
                         "token_endpoint_auth_method": method}),
             ))
             .await;
-        assert_eq!(resp.status(), 400);
-        assert_eq!(json_of(resp).await["error"], "invalid_client_metadata");
+        assert_eq!(resp.status(), 201, "{method}");
+        let v = json_of(resp).await;
+        assert_eq!(v["token_endpoint_auth_method"], "none");
+        assert!(v.get("client_secret").is_none());
     }
+    // Methods the server cannot honour even as public are refused.
+    let resp = app
+        .request(post_json(
+            "/oauth/register",
+            &json!({"redirect_uris": ["http://127.0.0.1:9/cb"],
+                    "token_endpoint_auth_method": "private_key_jwt"}),
+        ))
+        .await;
+    assert_eq!(resp.status(), 400);
+    assert_eq!(json_of(resp).await["error"], "invalid_client_metadata");
+
+    // Bidi and format characters are stripped from the name.
+    let resp = app
+        .request(post_json(
+            "/oauth/register",
+            &json!({"client_name": "Ev\u{202E}il\u{200B}App",
+                    "redirect_uris": ["http://127.0.0.1:9/cb"]}),
+        ))
+        .await;
+    assert_eq!(json_of(resp).await["client_name"], "EvilApp");
     // Not JSON.
     let req = Request::builder()
         .method(Method::POST)
