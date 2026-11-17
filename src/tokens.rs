@@ -89,6 +89,10 @@ impl TokenCache {
 pub struct Principal {
     pub unlocked: Arc<Unlocked>,
     pub token_id: String,
+    /// What the token's metadata is stored under: the token id for a static
+    /// token, the grant id for OAuth (it survives refreshes, unlike
+    /// `token_id`). Rate limits are keyed by it.
+    pub meta_id: String,
     pub scope: TokenScope,
 }
 
@@ -285,6 +289,7 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
         return Ok(Principal {
             unlocked,
             token_id: id.to_owned(),
+            meta_id,
             scope,
         });
     }
@@ -321,6 +326,7 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
     Ok(Principal {
         unlocked,
         token_id: id.to_owned(),
+        meta_id,
         scope: meta.scope,
     })
 }

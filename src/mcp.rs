@@ -12,8 +12,8 @@
 //! through `Principal::filter` (channel `Mcp`, cap from the token, tag
 //! allow-list); a document the token may not see is reported as not found.
 //!
-//! Logging: only the tool name and the outcome. Never arguments, queries or
-//! document content.
+//! Logging: the tool name and the outcome, plus the document id and page
+//! number of `get_page_image`. Never queries, text or document content.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
@@ -34,6 +34,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
@@ -936,7 +937,8 @@ async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, ToolErro
 const PAGE_IMAGES_PER_WINDOW: usize = 20;
 const PAGE_IMAGE_WINDOW: Duration = Duration::from_secs(60);
 /// Largest image sent to the client (raw bytes, before base64).
-const PAGE_IMAGE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// 3.5 MiB raw is about 4.7 MiB as base64, inside the 5 MiB response budget.
+const PAGE_IMAGE_MAX_BYTES: u64 = 3584 * 1024;
 /// Longest transcription, in characters.
 const TRANSCRIPTION_MAX_CHARS: usize = 500_000;
 const RATE_LIMITED: &str = "rate limit: try again in a minute";
@@ -1031,7 +1033,7 @@ async fn get_page_image(
     if page == 0 {
         return Err(ToolError::Tool("page must be at least 1".into()));
     }
-    if !state.page_images.allow(&p.token_id, Instant::now()) {
+    if !state.page_images.allow(&p.meta_id, Instant::now()) {
         return Err(ToolError::Tool(RATE_LIMITED.into()));
     }
     tracing::info!(doc_id = %doc.id, page, "mcp page image");
@@ -1039,8 +1041,8 @@ async fn get_page_image(
     let tmp = state.cfg.data_dir.join("tmp");
     let id = doc.id.clone();
     let mime = doc.mime.clone();
-    let rendered =
-        tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, &'static str, u32), String> {
+    let rendered = tokio::task::spawn_blocking(
+        move || -> Result<(Zeroizing<Vec<u8>>, &'static str, u32), String> {
             if let Some(mime) = image_mime(&mime) {
                 if page != 1 {
                     return Err("page out of range (document has 1 page)".into());
@@ -1049,7 +1051,7 @@ async fn get_page_image(
                 if d.size > PAGE_IMAGE_MAX_BYTES {
                     return Err(TOO_LARGE.into());
                 }
-                let mut bytes = Vec::new();
+                let mut bytes = Zeroizing::new(Vec::new());
                 reader
                     .take(PAGE_IMAGE_MAX_BYTES + 1)
                     .read_to_end(&mut bytes)
@@ -1082,11 +1084,12 @@ async fn get_page_image(
             if jpeg.len() as u64 > PAGE_IMAGE_MAX_BYTES {
                 return Err(TOO_LARGE.into());
             }
-            Ok((jpeg, "image/jpeg", pages))
-        })
-        .await
-        .map_err(|e| ToolError::Tool(internal(e)))?
-        .map_err(ToolError::Tool)?;
+            Ok((Zeroizing::new(jpeg), "image/jpeg", pages))
+        },
+    )
+    .await
+    .map_err(|e| ToolError::Tool(internal(e)))?
+    .map_err(ToolError::Tool)?;
     let (bytes, mime, pages) = rendered;
     Ok(Reply::Content(vec![
         json!({"type": "image", "data": BASE64.encode(&bytes), "mimeType": mime}),

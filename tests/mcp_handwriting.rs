@@ -162,8 +162,10 @@ impl Fx {
             .collect()
     }
 
-    fn tmp_entries(&self) -> usize {
-        std::fs::read_dir(self.t.state.cfg.data_dir.join("tmp")).map_or(0, |d| d.count())
+    fn tmp_names(&self) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(self.t.state.cfg.data_dir.join("tmp"))
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -303,11 +305,56 @@ async fn page_image_rate_limited() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn page_image_rate_limit_survives_oauth_refresh() {
+    let f = Fx::new();
+    let id = f.doc("a.jpg", "image/jpeg", JPG1, &[], Level::Full).await;
+    let scope = TokenScope {
+        access: Access::Read,
+        content: Content::FullText,
+        tags: None,
+    };
+    let (_, pair) = personal_media::tokens::create_grant(
+        &f.t.state.sys,
+        &f.u,
+        scope,
+        personal_media::user_db::GrantInfo {
+            client_id: "cid".into(),
+            client_name: "app".into(),
+            redirect_host: "claude.ai".into(),
+        },
+        now(),
+    )
+    .unwrap();
+    for i in 0..20 {
+        let r = f
+            .raw_call(&pair.access, "get_page_image", json!({"id": id}))
+            .await;
+        assert_eq!(r["isError"], false, "call {i}: {r}");
+    }
+    // A refresh mints a new access token id; the window is the grant's.
+    let state = f.t.state.clone();
+    let refresh = pair.refresh.to_string();
+    let fresh = tokio::task::spawn_blocking(move || {
+        personal_media::tokens::refresh_grant(&state, &refresh, "cid")
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let (err, msg) = f
+        .call(&fresh.pair.access, "get_page_image", json!({"id": id}))
+        .await;
+    assert!(err);
+    assert_eq!(msg, "rate limit: try again in a minute");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn page_image_temp_files_removed() {
     let f = Fx::new();
     let full = f.token(Access::Read, Content::FullText, None);
     let id = f.two_page_pdf(Level::Full).await;
-    let before = f.tmp_entries();
+    // Entries may vanish (an OCR job finishing its cleanup), but this
+    // tool's calls must not leave any new one behind.
+    let before = f.tmp_names();
     let r = f
         .raw_call(&full, "get_page_image", json!({"id": id, "page": 2}))
         .await;
@@ -317,7 +364,12 @@ async fn page_image_temp_files_removed() {
         .call(&full, "get_page_image", json!({"id": id, "page": 9}))
         .await;
     assert!(err);
-    assert_eq!(f.tmp_entries(), before, "scratch dir left behind");
+    let left: Vec<_> = f
+        .tmp_names()
+        .into_iter()
+        .filter(|n| !before.contains(n))
+        .collect();
+    assert!(left.is_empty(), "scratch dir left behind: {left:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

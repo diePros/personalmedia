@@ -19,7 +19,7 @@ use crate::user_db::vectors::{
     docs_needing_embedding, enforce_all, get_document_text_prefix, needs_embedding,
     replace_vectors_guarded, set_embed_status,
 };
-use crate::user_db::{TextStatus, pending_document_ids, set_text};
+use crate::user_db::{TextStatus, pending_document_ids, set_extracted_text};
 
 /// Chunks embedded per `embed_passages` call.
 pub const EMBED_BATCH: usize = 16;
@@ -794,19 +794,18 @@ async fn run_job(docs: &Arc<Documents>, cfg: &ExtractConfig, u: Arc<Unlocked>, i
         Err(ExtractError::Unsupported) => ("unsupported", TextStatus::Unsupported, None, None),
         Err(ExtractError::Failed(_)) => ("failed", TextStatus::Failed, None, None),
     };
-    // Handwriting transcribed by the user's AI while this job ran wins.
-    let transcribed = u
-        .with_db(|c| crate::user_db::get_document(c, &id))
-        .ok()
-        .flatten()
-        .is_some_and(|d| d.text_source == crate::user_db::TextSource::Transcription);
-    if transcribed {
-        tracing::info!(doc_id = %id, "keeping transcription over extraction result");
-        return false;
-    }
-    if let Err(e) = u.with_db(|c| set_text(c, &id, status, text, pages, now_secs())) {
-        tracing::warn!(doc_id = %id, error = %e, "could not store extraction result");
-        return false;
+    // Handwriting transcribed by the user's AI while this job ran wins; the
+    // check is part of the write.
+    match u.with_db(|c| set_extracted_text(c, &id, status, text, pages, now_secs())) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(doc_id = %id, "keeping transcription over extraction result");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(doc_id = %id, error = %e, "could not store extraction result");
+            return false;
+        }
     }
     tracing::info!(doc_id = %id, outcome, "extraction finished");
     status == TextStatus::Done

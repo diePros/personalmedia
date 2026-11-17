@@ -22,8 +22,8 @@ pub use documents::{
     Document, ListFilter, NOTES_MAX_CHARS, NewDocument, SearchHit, TextSource, TextStatus,
     delete_document, find_by_sha256, find_by_sha256_visible, get_document, get_document_text,
     hidden_from, insert_document, list_documents, list_tags, list_tags_visible,
-    pending_document_ids, search, set_notes, set_text, set_transcription, tag_ids,
-    update_document_meta,
+    pending_document_ids, search, set_extracted_text, set_notes, set_text, set_transcription,
+    tag_ids, update_document_meta, update_document_meta_notes,
 };
 pub use meta::{
     Access, Content, GrantInfo, TokenMeta, TokenScope, delete_token_meta, get_setting,

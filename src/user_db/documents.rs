@@ -507,7 +507,26 @@ pub fn update_document_meta(
     tags: Option<&[String]>,
     now: i64,
 ) -> Result<()> {
+    update_document_meta_notes(conn, id, title, document_date, tags, None, now)
+}
+
+/// [`update_document_meta`] plus the notes, all in one transaction.
+pub fn update_document_meta_notes(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    document_date: Option<Option<&str>>,
+    tags: Option<&[String]>,
+    notes: Option<&str>,
+    now: i64,
+) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    if let Some(n) = notes {
+        tx.execute(
+            "UPDATE documents SET notes = ?2 WHERE id = ?1",
+            params![id, n],
+        )?;
+    }
     if let Some(t) = title {
         tx.execute(
             "UPDATE documents SET title = ?2 WHERE id = ?1",
@@ -556,6 +575,26 @@ pub fn set_text(
     set_text_from(conn, id, status, text, page_count, source, now)
 }
 
+/// Stores a background extraction result, unless the user's AI transcribed
+/// the document meanwhile (the check and the write are one transaction, so a
+/// transcription can never be overwritten by a late OCR result). `false`
+/// means the transcription was kept and nothing changed.
+pub fn set_extracted_text(
+    conn: &Connection,
+    id: &str,
+    status: TextStatus,
+    text: Option<&str>,
+    page_count: Option<u32>,
+    now: i64,
+) -> Result<bool> {
+    let source = if text.is_some() {
+        TextSource::Ocr
+    } else {
+        TextSource::None
+    };
+    set_text_from_unless_transcribed(conn, id, status, text, page_count, source, now)
+}
+
 /// Store handwriting transcribed by the user's AI: `text_source` becomes
 /// `transcription`, status `done`; vectors are dropped (the caller
 /// re-enqueues embedding) and the FTS row is rebuilt.
@@ -599,7 +638,45 @@ fn set_text_from(
     source: TextSource,
     now: i64,
 ) -> Result<()> {
+    write_text(conn, id, status, text, page_count, source, now, false).map(|_| ())
+}
+
+fn set_text_from_unless_transcribed(
+    conn: &Connection,
+    id: &str,
+    status: TextStatus,
+    text: Option<&str>,
+    page_count: Option<u32>,
+    source: TextSource,
+    now: i64,
+) -> Result<bool> {
+    write_text(conn, id, status, text, page_count, source, now, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_text(
+    conn: &Connection,
+    id: &str,
+    status: TextStatus,
+    text: Option<&str>,
+    page_count: Option<u32>,
+    source: TextSource,
+    now: i64,
+    keep_transcription: bool,
+) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
+    if keep_transcription {
+        let kept: Option<String> = tx
+            .query_row(
+                "SELECT text_source FROM documents WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if kept.as_deref() == Some(TextSource::Transcription.as_str()) {
+            return Ok(false);
+        }
+    }
     let n = tx.execute(
         "UPDATE documents SET text_status = ?2, page_count = ?3,
             text_source = ?5, updated_at = ?4 WHERE id = ?1",
@@ -634,7 +711,7 @@ fn set_text_from(
     )?;
     reindex(&tx, id)?;
     tx.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// The extracted text of a document, if extraction produced any.

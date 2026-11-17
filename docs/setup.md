@@ -298,7 +298,7 @@ PMS cannot read handwriting itself yet. Instead your own AI assistant (claude.ai
 
 Tools involved:
 
-- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored when they are at most 4 MiB. At most 20 page images per token (or connected app) per minute.
+- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute.
 - `set_transcription { id, text, mode? }` stores the text (`replace`, the default, or `append`). It becomes the searchable text, is marked "transcribed by an AI assistant" on the document page and is indexed for semantic search again if that is enabled for the document.
 - `set_notes { id, notes }` sets the document's notes (see below).
 

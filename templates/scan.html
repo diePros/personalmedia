@@ -12,15 +12,15 @@
 <section id="scan-empty" class="scan-empty" aria-labelledby="scan-heading">
 <h1 id="scan-heading">Scan</h1>
 <p class="muted">Photograph pages. They become one PDF in your vault.</p>
-<input type="file" id="scan-camera" class="sr-only" accept="image/*" capture="environment">
+<input type="file" id="scan-camera" class="sr-only" data-disable-while-busy accept="image/*" capture="environment">
 <label for="scan-camera" class="capture" id="scan-capture">
 <svg viewBox="0 0 24 24" width="44" height="44" aria-hidden="true" focusable="false"><path d="M4 8a2 2 0 0 1 2-2h1.5l1.2-1.8A1 1 0 0 1 9.5 4h5a1 1 0 0 1 .8.2L16.5 6H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="12.5" r="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
 <span class="sr-only">Take a photo</span>
 </label>
 <div class="scan-alt">
-<input type="file" id="scan-library" class="sr-only" accept="image/*" multiple>
+<input type="file" id="scan-library" class="sr-only" data-disable-while-busy accept="image/*" multiple>
 <label for="scan-library" class="pill">Photo library</label>
-<input type="file" id="scan-files" class="sr-only" accept="image/*,application/pdf" multiple>
+<input type="file" id="scan-files" class="sr-only" data-disable-while-busy accept="image/*,application/pdf" multiple>
 <label for="scan-files" class="pill">Files</label>
 </div>
 </section>
@@ -57,28 +57,28 @@
 <h2 id="scan-sheet-title">Save scan</h2>
 <div>
 <label for="scan-title">Title (optional)</label>
-<input type="text" id="scan-title" maxlength="300" autocomplete="off" placeholder="Scan, named by date and time">
+<input type="text" id="scan-title" data-disable-while-busy maxlength="300" autocomplete="off" placeholder="Scan, named by date and time">
 </div>
 <fieldset>
 <legend>Tags</legend>
 <div id="scan-tags" class="chips">
-<button type="button" class="chip" data-tag="inbox" aria-pressed="false">inbox</button>
+<button type="button" class="chip" data-disable-while-busy data-tag="inbox" aria-pressed="false">inbox</button>
 {% for t in tags -%}
-<button type="button" class="chip" data-tag="{{ t }}" aria-pressed="false">{{ t }}</button>
+<button type="button" class="chip" data-disable-while-busy data-tag="{{ t }}" aria-pressed="false">{{ t }}</button>
 {% endfor -%}
 </div>
 </fieldset>
 <div>
 <label for="scan-date">Date (optional)</label>
-<input type="date" id="scan-date">
+<input type="date" id="scan-date" data-disable-while-busy>
 </div>
 <div>
 <label for="scan-notes">Notes (optional)</label>
-<textarea id="scan-notes" rows="2" maxlength="2000" placeholder="Keywords you want to find this by"></textarea>
+<textarea id="scan-notes" data-disable-while-busy rows="2" maxlength="2000" placeholder="Keywords you want to find this by"></textarea>
 </div>
 <div class="sheet-actions">
-<button type="button" id="scan-sheet-cancel" class="pill">Cancel</button>
-<button type="submit" id="scan-upload" class="primary">Upload</button>
+<button type="button" id="scan-sheet-cancel" class="pill" data-disable-while-busy>Cancel</button>
+<button type="submit" id="scan-upload" class="primary" data-disable-while-busy>Upload</button>
 </div>
 </form>
 </div>

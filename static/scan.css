@@ -244,6 +244,11 @@
   cursor: default;
 }
 
+.is-disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 .add-tile {
   display: flex;
   align-items: center;

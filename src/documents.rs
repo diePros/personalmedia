@@ -481,6 +481,35 @@ impl Documents {
             .map_err(DocError::Internal)
     }
 
+    /// [`Documents::update`] and the notes in one transaction: either all of
+    /// it is saved or none.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_notes(
+        &self,
+        u: &Unlocked,
+        id: &str,
+        title: Option<&str>,
+        date: Option<Option<&str>>,
+        tags: Option<&[String]>,
+        notes: &str,
+        now: i64,
+    ) -> Result<(), DocError> {
+        if let Some(Some(d)) = date {
+            validate_date(d)?;
+        }
+        validate_meta(title, None, tags.unwrap_or_default())?;
+        if notes.chars().count() > crate::user_db::NOTES_MAX_CHARS {
+            return Err(DocError::InvalidInput("notes too long"));
+        }
+        u.with_db(|c| get_document(c, id))
+            .map_err(DocError::Internal)?
+            .ok_or(DocError::NotFound)?;
+        u.with_db(|c| {
+            crate::user_db::update_document_meta_notes(c, id, title, date, tags, Some(notes), now)
+        })
+        .map_err(DocError::Internal)
+    }
+
     /// Replace the notes of a document (at most [`NOTES_MAX_CHARS`] characters).
     pub fn set_notes(&self, u: &Unlocked, id: &str, notes: &str, now: i64) -> Result<(), DocError> {
         if notes.chars().count() > crate::user_db::NOTES_MAX_CHARS {

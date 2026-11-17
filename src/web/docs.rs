@@ -1146,15 +1146,15 @@ async fn edit(
     }
     let (docs, u, doc_id) = (state.docs.clone(), session.unlocked.clone(), id.clone());
     let result = tokio::task::spawn_blocking(move || {
-        docs.update(
+        docs.update_with_notes(
             &u,
             &doc_id,
             (!title.is_empty()).then_some(title.as_str()),
             Some((!date.is_empty()).then_some(date.as_str())),
             Some(&tags),
+            &notes,
             now(),
-        )?;
-        docs.set_notes(&u, &doc_id, &notes, now())
+        )
     })
     .await;
     match result {

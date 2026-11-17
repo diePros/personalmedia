@@ -121,10 +121,11 @@ fn push(buf: &mut Zeroizing<Vec<u8>>, chunk: &[u8]) {
     buf.extend_from_slice(chunk);
 }
 
-/// `Scan YYYY-MM-DD HH-MM` (UTC), the default title and the file name stem.
-fn stamp(ts: i64) -> String {
-    let d =
-        time::OffsetDateTime::from_unix_timestamp(ts).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+/// `Scan YYYY-MM-DD HH-MM`, the default title and the file name stem, in the
+/// browser's time zone (`tz_offset`: minutes east of UTC; UTC without it).
+fn stamp(ts: i64, tz_offset: i32) -> String {
+    let d = time::OffsetDateTime::from_unix_timestamp(ts + i64::from(tz_offset) * 60)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     format!(
         "Scan {:04}-{:02}-{:02} {:02}-{:02}",
         d.year(),
@@ -136,7 +137,7 @@ fn stamp(ts: i64) -> String {
 }
 
 /// Session + CSRF header (checked by the session layer), like `/api/upload`.
-/// Text fields `title`, `tags`, `date` and `notes`, then the `page` fields in order.
+/// Text fields `title`, `tags`, `date`, `notes` and `tz_offset`, then the `page` fields in order.
 async fn scan_upload(
     State(state): State<AppState>,
     CurrentUser(session): CurrentUser,
@@ -180,6 +181,7 @@ async fn scan_upload(
     let max_total = state.cfg.max_upload_bytes as usize;
     let (mut title, mut tags, mut date) = (None, Vec::new(), None);
     let mut notes = String::new();
+    let mut tz_offset = 0i32;
     let mut pages: Vec<Zeroizing<Vec<u8>>> = Vec::new();
     let mut total = 0usize;
     loop {
@@ -199,6 +201,15 @@ async fn scan_upload(
                 "tags" => tags = parse_tags(&value),
                 "date" => date = Some(value.trim().to_owned()).filter(|v| !v.is_empty()),
                 "notes" => notes = value.trim().to_owned(),
+                // Minutes east of UTC; anything implausible means UTC.
+                "tz_offset" => {
+                    tz_offset = value
+                        .trim()
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|m| (-14 * 60..=14 * 60).contains(m))
+                        .unwrap_or(0);
+                }
                 _ => {}
             }
             continue;
@@ -237,7 +248,7 @@ async fn scan_upload(
         return json_error(StatusCode::UNPROCESSABLE_ENTITY, "no pages");
     }
     let ts = now();
-    let default_title = stamp(ts);
+    let default_title = stamp(ts, tz_offset);
     if let Err(e) = validate_meta(title.as_deref(), Some(&default_title), &tags) {
         return doc_error(e);
     }
@@ -288,6 +299,7 @@ async fn scan_upload(
         .await
     {
         Ok(outcome) => {
+            let mut notes_saved = true;
             if !notes.is_empty()
                 && let crate::documents::StoreOutcome::Stored { id } = &outcome
             {
@@ -296,9 +308,18 @@ async fn scan_upload(
                     tokio::task::spawn_blocking(move || docs.set_notes(&u, &id, &notes, ts)).await;
                 if !matches!(saved, Ok(Ok(()))) {
                     tracing::warn!("could not save the notes of a scan");
+                    notes_saved = false;
                 }
             }
-            axum::Json(outcome).into_response()
+            let mut body = serde_json::to_value(&outcome).unwrap_or_default();
+            if !notes_saved && let Some(o) = body.as_object_mut() {
+                o.insert(
+                    "warning".into(),
+                    "Saved, but the notes could not be saved. Add them on the document page."
+                        .into(),
+                );
+            }
+            axum::Json(body).into_response()
         }
         Err(e) => doc_error(e),
     }
@@ -310,7 +331,9 @@ mod tests {
 
     #[test]
     fn stamp_format() {
-        assert_eq!(stamp(1794918480), "Scan 2026-11-17 12-28");
+        assert_eq!(stamp(1794918480, 0), "Scan 2026-11-17 12-28");
+        assert_eq!(stamp(1794918480, 120), "Scan 2026-11-17 14-28");
+        assert_eq!(stamp(1794918480, -330), "Scan 2026-11-17 06-58");
     }
 
     #[test]

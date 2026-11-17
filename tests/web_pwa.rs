@@ -159,7 +159,14 @@ async fn sw_cache_name_tracks_asset_version() {
     let body = body_string(t.get("/sw.js", &Client::anon()).await).await;
     let version = &*personal_media::web::ASSET_VERSION;
     assert!(!version.is_empty());
-    assert!(body.contains(&format!("\"pm-shell-{version}\"")), "{body}");
+    assert!(
+        body.contains(&format!("const VERSION = \"{version}\";")),
+        "{body}"
+    );
+    assert!(
+        body.contains("const CACHE = \"pm-shell-\" + VERSION;"),
+        "{body}"
+    );
     assert!(!body.contains("__ASSET_VERSION__"));
     assert!(body.contains("cache: \"reload\""));
 }
@@ -333,4 +340,13 @@ async fn install_hint_markup_present_and_scripts_external() {
     let js = include_str!("../static/app.js");
     assert!(js.contains("pms.installHint.dismissed"));
     assert!(js.contains("beforeinstallprompt"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sw_ignores_versioned_urls_of_other_builds() {
+    let t = TestApp::new();
+    let body = body_string(t.get("/sw.js", &Client::anon()).await).await;
+    let version = &*personal_media::web::ASSET_VERSION;
+    assert!(body.contains(&format!("const VERSION = \"{version}\";")));
+    assert!(body.contains("wanted === null || wanted === VERSION"));
 }

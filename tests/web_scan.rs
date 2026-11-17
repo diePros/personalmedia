@@ -569,3 +569,63 @@ async fn standalone_settings_has_logout_and_admin_for_admins() {
     // Signed-out: the browser header is unchanged.
     assert!(html.contains("class=\"site-header\""));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_controls_are_disabled_while_busy() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let html = body_string(t.get("/scan", &c).await).await;
+    // Every input that can add or change a page, and every sheet field.
+    for id in [
+        "scan-camera",
+        "scan-library",
+        "scan-files",
+        "scan-title",
+        "scan-date",
+        "scan-notes",
+        "scan-sheet-cancel",
+        "scan-upload",
+    ] {
+        let at = html
+            .find(&format!("id=\"{id}\""))
+            .unwrap_or_else(|| panic!("{id}"));
+        let tag = &html[at..at + html[at..].find('>').unwrap()];
+        assert!(tag.contains("data-disable-while-busy"), "{id}: {tag}");
+    }
+    assert!(
+        html.matches("class=\"chip\" data-disable-while-busy")
+            .count()
+            >= 1
+    );
+    // The strip controls are built by the script with the same marker, and
+    // preparing/uploading are tracked apart.
+    let js = include_str!("../static/scan.js");
+    assert!(js.matches("data-disable-while-busy").count() >= 4);
+    assert!(js.contains("var preparing = false;") && js.contains("var uploading = false;"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_default_title_uses_the_browsers_offset() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let title_of = |v: &Value| v["id"].as_str().unwrap().to_owned();
+    let mut hours = Vec::new();
+    for off in ["0", "120", "bogus"] {
+        // A different page set each time keeps duplicates out of the way.
+        let pages: &[&[u8]] = if off == "0" {
+            &[P1]
+        } else if off == "120" {
+            &[P2]
+        } else {
+            &[P1, P2]
+        };
+        let (status, v) = scan(&t, &c, &[("tz_offset", off)], pages).await;
+        assert_eq!(status, 200, "{v}");
+        let detail = body_string(t.get(&format!("/documents/{}", title_of(&v)), &c).await).await;
+        let i = detail.find("Scan 20").unwrap();
+        hours.push(detail[i + 16..i + 18].parse::<i64>().unwrap());
+    }
+    // +2 h from UTC (mod 24; a minute boundary between calls cannot move the hour by more).
+    assert_eq!((hours[0] + 2) % 24, hours[1]);
+    assert_eq!(hours[0], hours[2]);
+}

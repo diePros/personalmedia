@@ -724,6 +724,21 @@ fn index_migration_v3_rebuilds_fts_once() {
         // Content still does not match at the metadata level.
         assert!(search(&conn, "hallo", &meta_only).unwrap().is_empty());
 
+        // Re-saving the notes of both rows gives their FTS rows new rowids
+        // (3 and 4); a second rebuild would renumber them 1 and 2.
+        set_notes(&conn, "a1", "kept", 6).unwrap();
+        set_notes(&conn, "b2", "tiramisu recipe", 7).unwrap();
+        let rowids = |c: &rusqlite::Connection| -> Vec<(i64, String)> {
+            c.prepare("SELECT rowid, doc_id FROM documents_fts ORDER BY rowid")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = rowids(&conn);
+        assert_eq!(before.iter().map(|r| r.0).min(), Some(3), "from v{from}");
+
         // Opening again does not migrate (or rebuild) a second time.
         drop(conn);
         let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
@@ -732,6 +747,7 @@ fn index_migration_v3_rebuilds_fts_once() {
             .query_row("SELECT count(*) FROM documents_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+        assert_eq!(rowids(&conn), before, "second open rebuilt the FTS table");
     }
 }
 
@@ -777,4 +793,70 @@ fn text_source_follows_the_writer() {
         get_document(&conn, "a1").unwrap().unwrap().text_source,
         TextSource::None
     );
+}
+
+#[test]
+fn late_extraction_never_overwrites_a_transcription() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_user_db(&dir.path().join("index.db"), &Key32::from_bytes([7; 32])).unwrap();
+    insert_document(&conn, &nd("d1", "Brief", "d1.pdf", &[], 100)).unwrap();
+    set_transcription(&conn, "d1", "handwritten words", 5).unwrap();
+    // The OCR result arrives afterwards: nothing changes.
+    let stored = personal_media::user_db::set_extracted_text(
+        &conn,
+        "d1",
+        TextStatus::Done,
+        Some("garbled ocr"),
+        Some(1),
+        6,
+    )
+    .unwrap();
+    assert!(!stored);
+    assert_eq!(
+        get_document_text(&conn, "d1").unwrap().as_deref(),
+        Some("handwritten words")
+    );
+    let d = get_document(&conn, "d1").unwrap().unwrap();
+    assert_eq!(d.text_source, TextSource::Transcription);
+    // Without a transcription the result is stored as OCR.
+    insert_document(&conn, &nd("d2", "Zettel", "d2.pdf", &[], 100)).unwrap();
+    assert!(
+        personal_media::user_db::set_extracted_text(
+            &conn,
+            "d2",
+            TextStatus::Done,
+            Some("ocr text"),
+            Some(1),
+            6
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        get_document(&conn, "d2").unwrap().unwrap().text_source,
+        TextSource::Ocr
+    );
+}
+
+#[test]
+fn metadata_and_notes_update_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_user_db(&dir.path().join("index.db"), &Key32::from_bytes([7; 32])).unwrap();
+    insert_document(&conn, &nd("d1", "Brief", "d1.pdf", &[], 100)).unwrap();
+    personal_media::user_db::update_document_meta_notes(
+        &conn,
+        "d1",
+        Some("Neuer Titel"),
+        None,
+        None,
+        Some("kochbuch rezept"),
+        200,
+    )
+    .unwrap();
+    let d = get_document(&conn, "d1").unwrap().unwrap();
+    assert_eq!(
+        (d.title.as_str(), d.notes.as_str()),
+        ("Neuer Titel", "kochbuch rezept")
+    );
+    assert_eq!(ids(&search(&conn, "kochbuch", &all()).unwrap()), ["d1"]);
+    assert_eq!(ids(&search(&conn, "neuer", &all()).unwrap()), ["d1"]);
 }

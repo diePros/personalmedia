@@ -47,8 +47,34 @@
 
   var pages = []; // { blob, url }
   var xhr = null;
-  var busy = false; // preparing or uploading
+  // Preparing photos and uploading are separate: finishing the one must never
+  // clear the other. While uploading, everything marked data-disable-while-busy
+  // is disabled, so nothing can be added, moved or removed mid-upload.
+  var preparing = false;
+  var uploading = false;
   var saved = false;
+
+  function isBusy() {
+    return preparing || uploading;
+  }
+
+  // Disables the controls marked data-disable-while-busy (the capture inputs
+  // and the sheet fields in the page, the strip buttons made by render()).
+  function applyBusy() {
+    Array.prototype.forEach.call(
+      app.querySelectorAll("[data-disable-while-busy]"),
+      function (el) {
+        if (el.tagName === "LABEL") {
+          el.setAttribute("aria-disabled", uploading ? "true" : "false");
+          el.classList.toggle("is-disabled", uploading);
+        } else if (uploading) {
+          el.disabled = true;
+        } else if (!el.hasAttribute("data-edge")) {
+          el.disabled = false;
+        }
+      }
+    );
+  }
 
   function announce(text) {
     els.status.textContent = text;
@@ -195,6 +221,7 @@
         openViewer(i);
       });
       var del = iconButton("page-del", "Delete page " + (i + 1), "");
+      del.setAttribute("data-disable-while-busy", "");
       var x = document.createElement("span");
       x.setAttribute("aria-hidden", "true");
       x.textContent = "✕";
@@ -206,6 +233,14 @@
       mv.className = "move";
       var left = iconButton("move-left", "Move page " + (i + 1) + " left", "←");
       var right = iconButton("move-right", "Move page " + (i + 1) + " right", "→");
+      left.setAttribute("data-disable-while-busy", "");
+      right.setAttribute("data-disable-while-busy", "");
+      if (i === 0) {
+        left.setAttribute("data-edge", "");
+      }
+      if (i === n - 1) {
+        right.setAttribute("data-edge", "");
+      }
       left.disabled = i === 0;
       right.disabled = i === n - 1;
       left.addEventListener("click", function () {
@@ -228,6 +263,7 @@
       tile.setAttribute("for", "scan-camera");
       tile.setAttribute("role", "button");
       tile.setAttribute("aria-label", "Add a page");
+      tile.setAttribute("data-disable-while-busy", "");
       tile.textContent = "+";
       add.appendChild(tile);
       els.strip.appendChild(add);
@@ -235,14 +271,15 @@
     var editing = n > 0 && !saved;
     els.empty.hidden = n > 0 || saved;
     els.wrap.hidden = !editing;
-    els.savebar.hidden = !editing || busy;
+    els.savebar.hidden = !editing || isBusy();
     els.done.hidden = !saved;
     els.save.textContent = "Save (" + plural(n) + ")";
+    applyBusy();
   }
 
   function addFiles(list) {
     var files = Array.prototype.slice.call(list || []);
-    if (!files.length) {
+    if (!files.length || uploading) {
       return;
     }
     showError("");
@@ -254,7 +291,7 @@
     });
     var chain = Promise.resolve();
     if (images.length) {
-      busy = true;
+      preparing = true;
       render();
       announce("Preparing photos");
       var room = MAX_PAGES - pages.length;
@@ -276,7 +313,7 @@
         });
       });
       chain = chain.then(function () {
-        busy = false;
+        preparing = false;
         render();
         announce(plural(pages.length) + " ready");
       });
@@ -311,7 +348,7 @@
   // ---- Save sheet ----------------------------------------------------------
 
   function openSheet() {
-    if (!pages.length || busy) {
+    if (!pages.length || isBusy()) {
       return;
     }
     showError("");
@@ -410,21 +447,25 @@
   }
 
   function setBusy(on) {
-    busy = on;
+    uploading = on;
     els.progress.hidden = !on;
-    els.savebar.hidden = on || !pages.length || saved;
+    els.savebar.hidden = on || preparing || !pages.length || saved;
+    applyBusy();
     if (on) {
       els.sheet.hidden = true;
       setProgress("Uploading… 0%", 0);
     }
   }
 
-  function finish(id) {
-    pages.forEach(function (p) {
+  // `sent` is the batch that was uploaded; only those pages are dropped.
+  function finish(id, sent) {
+    sent.forEach(function (p) {
       URL.revokeObjectURL(p.url);
     });
-    pages = [];
-    saved = true;
+    pages = pages.filter(function (p) {
+      return sent.indexOf(p) === -1;
+    });
+    saved = pages.length === 0;
     els.open.href = id ? "/documents/" + encodeURIComponent(id) : "/documents";
     setBusy(false);
     render();
@@ -433,7 +474,7 @@
   }
 
   function upload() {
-    if (!pages.length || busy) {
+    if (!pages.length || isBusy()) {
       return;
     }
     if (navigator.onLine === false) {
@@ -442,13 +483,16 @@
       return;
     }
     showError("");
+    var sent = pages.slice(); // the batch; nothing is added while uploading
     var form = new FormData();
     // Text fields first: the server reads them before the pages.
     form.append("title", els.title.value.trim());
     form.append("tags", selectedTags().join(","));
     form.append("date", els.date.value);
     form.append("notes", els.notes.value.trim());
-    pages.forEach(function (p, i) {
+    // Minutes east of UTC, for the default title (local time).
+    form.append("tz_offset", String(-new Date().getTimezoneOffset()));
+    sent.forEach(function (p, i) {
       form.append("page", p.blob, "page-" + (i + 1) + ".jpg");
     });
     setBusy(true);
@@ -461,7 +505,10 @@
         return;
       }
       if (!r.network && r.status === 200 && r.data && r.data.status) {
-        finish(r.data.id || r.data.existing_id);
+        finish(r.data.id || r.data.existing_id, sent);
+        if (r.data.warning) {
+          showError(r.data.warning);
+        }
         return;
       }
       setBusy(false);
@@ -510,7 +557,7 @@
         render();
         showError(failed);
       } else if (!pages.length) {
-        finish(files.length === 1 ? lastId : null);
+        finish(files.length === 1 ? lastId : null, []);
       } else {
         render();
         announce("PDF uploaded");
@@ -587,7 +634,10 @@
       e.returnValue = "";
     }
   });
-  window.addEventListener("pagehide", function () {
+  window.addEventListener("pagehide", function (e) {
+    if (e.persisted) {
+      return; // kept in the back/forward cache; the thumbnails must survive
+    }
     pages.forEach(function (p) {
       URL.revokeObjectURL(p.url);
     });
