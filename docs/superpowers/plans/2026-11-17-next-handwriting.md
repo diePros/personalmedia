@@ -70,6 +70,19 @@
 
 Review focus for the milestone: memory bound on the N150, no plaintext page crops on disk outside tmpfs, never clobbering AI or user transcriptions, the switchboard off by default, and quality gating (don't index garbage: a minimum confidence, otherwise keep `text_source = 'none'`).
 
+## Update after v1.6.0 (2026-11-17)
+
+- **Released v1.6.0:** the needs-transcription filter (A4, MCP + web), page-image rate-limit docs (A3), "Remember this device" (spec/plan `2026-11-17-remember-device*`), `.env` deploy settings, and a password-manager username hint. Index DB is now **v4** (`device_meta`), and system.db is still v3. Part B (local HTR) moves to **v1.7**; its index migration becomes v5.
+- **HTR spike done:** `docs/superpowers/specs/2026-11-17-htr-spike.md` recommends go with conditions (German CRNN `naeyn/de-htr-web-v2`). Owner decisions are pending: test on own pages, English engine, ruled-paper photos, fuzzy search.
+- **Mobile layout audit done, not built:** waiting for the owner's OK on a CSS pass (wrap long titles, tokens and the invite URL; 44 px tap targets; `viewport-fit=cover`; `dvh`) plus the bottom tab bar in the phone browser.
+- **Remember-device follow-ups (parked in final review):**
+  - Multiple open tabs with a stale CSRF token on logout still return 403. Fix: on a CSRF mismatch in logout, fall through to the device-cookie path.
+  - `start_session` calls `remove_device` for an unverified cookie id. Only do it when `revoke_device` returned true.
+  - The no-session logout path skips the limiter.
+  - The resume gate entry leaks on a cancelled future (needs an RAII guard).
+  - Edge on iOS is labelled Safari. iPadOS with a desktop user agent is labelled Mac.
+  - setup.md:250 still says `mem_limit: 1536m`; it is now `${MEM_LIMIT:-1536m}`.
+
 ## Open deferred minors (from earlier reviews; optional cleanup batch)
 
 - Per-token MCP rate limit (v1.2 M3) and the user-DB mutex held during the vector scan (v1.2 M4).
