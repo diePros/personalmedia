@@ -13,6 +13,8 @@ pub const DEFAULT_SHARE_TTL: Duration = Duration::from_secs(15 * 60);
 #[derive(Clone, Debug)]
 pub struct Config {
     pub data_dir: PathBuf,
+    /// `{data_dir}/models`: downloaded embedding model files.
+    pub models_dir: PathBuf,
     pub bind: SocketAddr,
     pub public_url: String,
     pub max_upload_bytes: u64,
@@ -86,8 +88,10 @@ impl Config {
         let idle_min: u64 = parse_var("PM_SESSION_IDLE_MINUTES", "30")?;
         let max_hours: u64 = parse_var("PM_SESSION_MAX_HOURS", "12")?;
         let max_upload_mb: u64 = parse_var("PM_MAX_UPLOAD_MB", "100")?;
+        let data_dir = PathBuf::from(var("PM_DATA_DIR").unwrap_or_else(|| "/data".into()));
         Ok(Config {
-            data_dir: PathBuf::from(var("PM_DATA_DIR").unwrap_or_else(|| "/data".into())),
+            models_dir: data_dir.join("models"),
+            data_dir,
             bind: parse_var("PM_BIND", "127.0.0.1:8080")?,
             public_url: var("PM_PUBLIC_URL")
                 .map(|u| u.trim_end_matches('/').to_string())
@@ -112,6 +116,7 @@ impl Config {
 
     pub fn for_tests(data_dir: PathBuf) -> Config {
         Config {
+            models_dir: data_dir.join("models"),
             data_dir,
             bind: "127.0.0.1:0".parse().unwrap(),
             public_url: "https://test.example".into(),

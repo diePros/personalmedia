@@ -30,6 +30,12 @@ enum Command {
         #[arg(long)]
         admin: bool,
     },
+    /// Download and verify the embedding model into `<data>/models` (idempotent)
+    FetchModel {
+        /// Data directory (default: `PM_DATA_DIR`, else `/data`)
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
     /// Offline recovery export for a user
     Recover {
         #[arg(long)]
@@ -163,6 +169,18 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::from_env()?;
             config.require_public_url()?;
             println!("{}", create_invite(&config, admin)?);
+        }
+        Command::FetchModel { data } => {
+            let data = match data {
+                Some(d) => d,
+                None => Config::from_env()?.data_dir,
+            };
+            let dir = personal_media::embed::model::ensure_model_with_progress(
+                &data.join("models"),
+                &personal_media::embed::MODEL,
+                &mut |line| println!("{line}"),
+            )?;
+            println!("Model ready: {}", dir.display());
         }
         Command::Recover {
             data,
