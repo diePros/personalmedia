@@ -74,7 +74,7 @@ Review focus for the milestone: memory bound on the N150, no plaintext page crop
 
 - **Released v1.6.0:** the needs-transcription filter (A4, MCP + web), page-image rate-limit docs (A3), "Remember this device" (spec/plan `2026-11-17-remember-device*`), `.env` deploy settings, and a password-manager username hint. Index DB is now **v4** (`device_meta`), and system.db is still v3. Part B (local HTR) moves to **v1.7**; its index migration becomes v5.
 - **HTR spike done:** `docs/superpowers/specs/2026-11-17-htr-spike.md` recommends go with conditions (German CRNN `naeyn/de-htr-web-v2`). Owner decisions are pending: test on own pages, English engine, ruled-paper photos, fuzzy search.
-- **Mobile layout audit done, not built:** waiting for the owner's OK on a CSS pass (wrap long titles, tokens and the invite URL; 44 px tap targets; `viewport-fit=cover`; `dvh`) plus the bottom tab bar in the phone browser.
+- **Mobile layout pass released in v1.6.1:** no sideways scrolling, 44 px targets, safe areas, `dvh`, and the bottom tab bar in phone browsers (`width < 40rem`). Left open: the app.css:465 comment says "up to 40rem"; there is no real-iPhone check yet (owner); `svg.check` should be renamed.
 - **Remember-device follow-ups (parked in final review):**
   - Multiple open tabs with a stale CSRF token on logout still return 403. Fix: on a CSRF mismatch in logout, fall through to the device-cookie path.
   - `start_session` calls `remove_device` for an unverified cookie id. Only do it when `revoke_device` returned true.
