@@ -17,7 +17,9 @@
 <dt>Added</dt><dd>{{ created }}</dd>
 {% if !date.is_empty() %}<dt>Document date</dt><dd>{{ date }}</dd>{% endif -%}
 {% if !tags.is_empty() %}<dt>Tags</dt><dd>{% for tag in tags %}<span class="tag">{{ tag }}</span> {% endfor %}</dd>{% endif -%}
+{% if !notes.is_empty() %}<dt>Notes</dt><dd>{{ notes }}</dd>{% endif -%}
 <dt>Text extraction</dt><dd>{{ status }}</dd>
+<dt>Text</dt><dd>{{ text_source }}{% if transcribed %} <span class="tag">Transcribed by AI</span>{% endif %}</dd>
 <dt>Semantic index</dt><dd>{{ embed_status }}</dd>
 </dl>
 
@@ -48,6 +50,10 @@
 <div>
 <label for="tags">Tags (comma separated)</label>
 <input type="text" id="tags" name="tags" value="{{ tags_csv }}">
+</div>
+<div>
+<label for="notes">Notes (searchable keywords, up to 2000 characters)</label>
+<textarea id="notes" name="notes" rows="3" maxlength="2000">{{ notes }}</textarea>
 </div>
 <button type="submit">Save</button>
 </form>

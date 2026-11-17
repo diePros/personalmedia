@@ -723,3 +723,68 @@ async fn web_input_caps_are_422() {
     assert_eq!(edit("ok".into(), "x".repeat(65)).await, 422);
     assert_eq!(edit("t".repeat(300), "x".repeat(64)).await, 303);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notes_edit_roundtrip_web() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "hand.bin", "application/octet-stream", b"data").await;
+    let path = format!("/documents/{id}");
+
+    let resp = t
+        .post_form(
+            &path,
+            &[
+                ("title", "Handwritten"),
+                ("date", ""),
+                ("tags", "a"),
+                ("notes", "  tiramisu <b>recipe</b> "),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+
+    let html = body_string(t.get(&path, &c).await).await;
+    assert!(
+        html.contains("tiramisu &#60;b&#62;recipe&#60;/b&#62;"),
+        "{html}"
+    );
+    assert!(!html.contains("<b>recipe"));
+    assert!(html.contains("<textarea id=\"notes\""));
+    assert!(html.contains("recognised by OCR") || html.contains("Text"));
+
+    // Searchable like the title.
+    let list = body_string(t.get("/documents?q=tiramisu", &c).await).await;
+    assert!(list.contains("Handwritten"), "{list}");
+
+    // Cleared again.
+    let resp = t
+        .post_form(
+            &path,
+            &[
+                ("title", "Handwritten"),
+                ("date", ""),
+                ("tags", "a"),
+                ("notes", ""),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    let list = body_string(t.get("/documents?q=tiramisu", &c).await).await;
+    assert!(!list.contains("Handwritten"));
+
+    // Over the cap.
+    let resp = t
+        .post_form(&path, &[("title", "x"), ("notes", &"a".repeat(2001))], &c)
+        .await;
+    assert_eq!(resp.status(), 422);
+
+    // The transcription badge.
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    u.with_db(|conn| personal_media::user_db::set_transcription(conn, &id, "hi", 1_700_000_000))
+        .unwrap();
+    let html = body_string(t.get(&path, &c).await).await;
+    assert!(html.contains("transcribed by an AI assistant"), "{html}");
+}

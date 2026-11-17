@@ -812,6 +812,10 @@ struct DetailPage {
     date: String,
     tags_csv: String,
     tags: Vec<String>,
+    notes: String,
+    /// "Recognised by OCR" / "Transcribed by an AI assistant (date)".
+    text_source: String,
+    transcribed: bool,
     created: String,
     status: &'static str,
     can_retry: bool,
@@ -905,6 +909,16 @@ async fn detail_page(CurrentUser(session): CurrentUser, Path(id): Path<String>) 
         size: human_size(doc.size),
         date: doc.document_date.unwrap_or_default(),
         tags_csv: doc.tags.join(", "),
+        notes: doc.notes,
+        text_source: match doc.text_source {
+            crate::user_db::TextSource::Transcription => format!(
+                "transcribed by an AI assistant ({})",
+                format_date(doc.updated_at)
+            ),
+            crate::user_db::TextSource::Ocr => "recognised by OCR".to_owned(),
+            crate::user_db::TextSource::None => "none".to_owned(),
+        },
+        transcribed: doc.text_source == crate::user_db::TextSource::Transcription,
         tags: doc.tags,
         created: format_date(doc.created_at),
         status: status_words(doc.text_status),
@@ -1060,6 +1074,8 @@ struct EditForm {
     date: String,
     #[serde(default)]
     tags: String,
+    #[serde(default)]
+    notes: String,
 }
 
 async fn edit(
@@ -1077,6 +1093,10 @@ async fn edit(
     let title = form.title.trim().to_owned();
     let date = form.date.trim().to_owned();
     let tags = parse_tags(&form.tags);
+    let notes = form.notes.trim().to_owned();
+    if notes.chars().count() > crate::user_db::NOTES_MAX_CHARS {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "Notes are too long");
+    }
     let (docs, u, doc_id) = (state.docs.clone(), session.unlocked.clone(), id.clone());
     let result = tokio::task::spawn_blocking(move || {
         docs.update(
@@ -1086,7 +1106,8 @@ async fn edit(
             Some((!date.is_empty()).then_some(date.as_str())),
             Some(&tags),
             now(),
-        )
+        )?;
+        docs.set_notes(&u, &doc_id, &notes, now())
     })
     .await;
     match result {

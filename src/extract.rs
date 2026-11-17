@@ -162,6 +162,89 @@ impl Drop for DirGuard {
     }
 }
 
+/// A per-call scratch directory under the tmp dir (mode 0700) that is removed
+/// again when this guard is dropped, whatever happens in between.
+pub struct JobDir {
+    path: PathBuf,
+}
+
+impl JobDir {
+    pub fn new(tmp_dir: &Path) -> io::Result<JobDir> {
+        Ok(JobDir {
+            path: make_job_dir(tmp_dir)?,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for JobDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Longest side, in pixels, of a rendered page preview.
+pub const PAGE_PREVIEW_PX: u32 = 1568;
+
+const PAGE_RENDER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Number of pages of the PDF at `path` (via `pdfinfo`).
+pub fn pdf_page_count(path: &Path, scratch: &Path, limits: &ChildLimits) -> Result<u32, String> {
+    let info = run_cmd(
+        "pdfinfo",
+        &[path.as_os_str()],
+        PDFINFO_TIMEOUT,
+        scratch,
+        limits,
+    )?;
+    String::from_utf8_lossy(&info)
+        .lines()
+        .find_map(|l| l.strip_prefix("Pages:"))
+        .and_then(|v| v.trim().parse().ok())
+        .ok_or_else(|| "pdfinfo: no page count".to_owned())
+}
+
+/// Renders page `page` (1-based) of the PDF at `path` as a JPEG whose long side
+/// is at most [`PAGE_PREVIEW_PX`]. Writes only inside `scratch`, and removes
+/// the rendered file again before returning.
+pub fn render_pdf_page_jpeg(
+    path: &Path,
+    scratch: &Path,
+    page: u32,
+    limits: &ChildLimits,
+) -> Result<Vec<u8>, String> {
+    let n = page.to_string();
+    let px = PAGE_PREVIEW_PX.to_string();
+    let prefix = scratch.join("page");
+    run_cmd(
+        "pdftoppm",
+        &[
+            os("-r"),
+            os("150"),
+            os("-f"),
+            os(&n),
+            os("-l"),
+            os(&n),
+            os("-jpeg"),
+            os("-scale-to"),
+            os(&px),
+            os("-singlefile"),
+            path.as_os_str(),
+            prefix.as_os_str(),
+        ],
+        PAGE_RENDER_TIMEOUT,
+        scratch,
+        limits,
+    )?;
+    let out = scratch.join("page.jpg");
+    let bytes = fs::read(&out).map_err(|e| format!("reading rendered page: {e}"));
+    let _ = fs::remove_file(&out);
+    bytes
+}
+
 /// Creates `{tmp_dir}/{random hex}` with mode 0700.
 fn make_job_dir(tmp_dir: &Path) -> io::Result<PathBuf> {
     fs::create_dir_all(tmp_dir)?;
@@ -711,6 +794,16 @@ async fn run_job(docs: &Arc<Documents>, cfg: &ExtractConfig, u: Arc<Unlocked>, i
         Err(ExtractError::Unsupported) => ("unsupported", TextStatus::Unsupported, None, None),
         Err(ExtractError::Failed(_)) => ("failed", TextStatus::Failed, None, None),
     };
+    // Handwriting transcribed by the user's AI while this job ran wins.
+    let transcribed = u
+        .with_db(|c| crate::user_db::get_document(c, &id))
+        .ok()
+        .flatten()
+        .is_some_and(|d| d.text_source == crate::user_db::TextSource::Transcription);
+    if transcribed {
+        tracing::info!(doc_id = %id, "keeping transcription over extraction result");
+        return false;
+    }
     if let Err(e) = u.with_db(|c| set_text(c, &id, status, text, pages, now_secs())) {
         tracing::warn!(doc_id = %id, error = %e, "could not store extraction result");
         return false;

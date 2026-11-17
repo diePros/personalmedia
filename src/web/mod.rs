@@ -80,6 +80,8 @@ pub struct AppState {
     /// Bounds concurrent MCP `upload_document` calls (each holds the base64
     /// text and the decoded bytes in memory).
     pub mcp_write_permits: Arc<Semaphore>,
+    /// MCP `get_page_image` calls per token (memory only).
+    pub page_images: Arc<crate::mcp::PageImageLimiter>,
     /// OAuth registration counters (memory only).
     pub oauth: Arc<crate::oauth::OAuthState>,
     /// Bodies of `POST /share` being read at once (try-acquire, 503 when full).
@@ -184,6 +186,7 @@ impl AppState {
             oauth,
             kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
             mcp_write_permits: Arc::new(Semaphore::new(MCP_WRITE_PERMITS)),
+            page_images: Arc::new(crate::mcp::PageImageLimiter::default()),
             share_permits: Arc::new(Semaphore::new(SHARE_PERMITS)),
         })
     }

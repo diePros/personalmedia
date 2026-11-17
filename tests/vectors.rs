@@ -197,7 +197,7 @@ fn migration_v2_upgrades_v1_db_once() {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         let (title, status): (String, String) = conn
             .query_row(
                 "SELECT title, embed_status FROM documents WHERE id = 'd1'",
@@ -727,7 +727,7 @@ fn readonly_open_works_on_v1_and_v2_databases() {
     assert_eq!(title, "Old doc");
     assert_eq!(user_version(&ro), 1);
 
-    // v2: migrated by the server; vectors and embed_status are readable.
+    // Current schema (v3): vectors and embed_status are readable.
     let v2 = dir.path().join("v2.db");
     {
         let conn = open_user_db(&v2, &key).unwrap();
@@ -742,7 +742,7 @@ fn readonly_open_works_on_v1_and_v2_databases() {
             .unwrap();
     }
     let ro = open_user_db_readonly(&v2, &key).unwrap();
-    assert_eq!(user_version(&ro), 2);
+    assert_eq!(user_version(&ro), 3);
     let (n, st): (i64, String) = ro
         .query_row(
             "SELECT (SELECT count(*) FROM chunk_vectors), embed_status FROM documents",

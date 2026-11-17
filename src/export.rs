@@ -96,6 +96,7 @@ struct MetaEntry<'a> {
     mime: &'a str,
     document_date: Option<&'a str>,
     tags: &'a [String],
+    notes: &'a str,
     created_at: i64,
 }
 
@@ -113,6 +114,7 @@ pub fn metadata_json(docs: &[Document], plan: &[(String, String)]) -> anyhow::Re
             mime: &d.mime,
             document_date: d.document_date.as_deref(),
             tags: &d.tags,
+            notes: &d.notes,
             created_at: d.created_at,
         })
         .collect();

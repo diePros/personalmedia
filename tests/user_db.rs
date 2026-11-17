@@ -630,3 +630,151 @@ fn web_channel_still_uses_user_default() {
     set_access_defaults(&conn, &d).unwrap();
     assert!(list_documents(&conn, &web()).unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// v3: notes, text source, FTS with a notes column
+// ---------------------------------------------------------------------------
+
+fn raw_conn(path: &std::path::Path) -> Connection {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode([7u8; 32])))
+        .unwrap();
+    conn
+}
+
+/// An index DB as v1.4 left it (`upto` = 1 or 2) with two documents.
+fn old_db(path: &std::path::Path, upto: i64) {
+    let conn = raw_conn(path);
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+    if upto >= 2 {
+        conn.execute_batch(MIGRATION_V2).unwrap();
+    }
+    for (id, title) in [("a1", "Rechnung"), ("b2", "Brief")] {
+        conn.execute(
+            "INSERT INTO documents(id, wrapped_dek, original_filename, title, mime, size, sha256,
+                created_at, updated_at, text_status)
+             VALUES (?1, x'010203', ?2, ?3, 'application/pdf', 1, x'00', 100, 100, 'done')",
+            rusqlite::params![id, format!("{id}.pdf"), title],
+        )
+        .unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO tags(name) VALUES ('steuer');
+         INSERT INTO document_tags VALUES ('a1', 1);
+         INSERT INTO document_text VALUES ('a1', 'Strom und Wasser');
+         INSERT INTO document_text VALUES ('b2', 'Hallo');
+         INSERT INTO documents_fts(doc_id, title, filename, tags, content)
+            VALUES ('a1', 'Rechnung', 'a1.pdf', 'steuer', 'Strom und Wasser');
+         INSERT INTO documents_fts(doc_id, title, filename, tags, content)
+            VALUES ('b2', 'Brief', 'b2.pdf', '', 'Hallo');",
+    )
+    .unwrap();
+}
+
+fn all() -> ListFilter {
+    ListFilter {
+        access: None,
+        ..ListFilter::default()
+    }
+}
+
+#[test]
+fn index_migration_v3_rebuilds_fts_once() {
+    for from in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        old_db(&path, from);
+
+        let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3, "from v{from}");
+
+        // Old content, title and tag are still searchable.
+        for (q, id) in [
+            ("strom", "a1"),
+            ("rechnung", "a1"),
+            ("steuer", "a1"),
+            ("hallo", "b2"),
+        ] {
+            let hits = search(&conn, q, &all()).unwrap();
+            assert_eq!(ids(&hits), [id], "{q} from v{from}");
+        }
+        let a1 = get_document(&conn, "a1").unwrap().unwrap();
+        assert_eq!(a1.notes, "");
+        assert_eq!(a1.text_source, TextSource::Ocr);
+
+        // Notes are searchable (also at the metadata level) and re-saved ones too.
+        assert!(search(&conn, "tiramisu", &all()).unwrap().is_empty());
+        set_notes(&conn, "b2", "tiramisu recipe", 5).unwrap();
+        let hits = search(&conn, "tiramisu", &all()).unwrap();
+        assert_eq!(ids(&hits), ["b2"]);
+        let meta_only = ListFilter {
+            access: Some(AccessFilter {
+                channel: Channel::Mcp,
+                cap: Level::Metadata,
+            }),
+            ..ListFilter::default()
+        };
+        let hits = search(&conn, "tiramisu", &meta_only).unwrap();
+        assert_eq!(ids(&hits), ["b2"]);
+        assert!(hits[0].snippet.is_none());
+        // Content still does not match at the metadata level.
+        assert!(search(&conn, "hallo", &meta_only).unwrap().is_empty());
+
+        // Opening again does not migrate (or rebuild) a second time.
+        drop(conn);
+        let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
+        assert_eq!(ids(&search(&conn, "tiramisu", &all()).unwrap()), ["b2"]);
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM documents_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+}
+
+#[test]
+fn readonly_open_reads_v1_v2_and_v3_without_migrating() {
+    for v in [1, 2, 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        if v == 3 {
+            let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
+            insert_document(&conn, &nd("a1", "Rechnung", "a1.pdf", &[], 100)).unwrap();
+            set_notes(&conn, "a1", "n", 1).unwrap();
+        } else {
+            old_db(&path, v);
+        }
+        let conn = open_user_db_readonly(&path, &Key32::from_bytes([7; 32])).unwrap();
+        let docs = list_documents(&conn, &all()).unwrap();
+        assert!(!docs.is_empty(), "v{v}");
+        let d = get_document(&conn, &docs[0].id).unwrap().unwrap();
+        assert_eq!(d.notes, if v == 3 { "n" } else { "" });
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, v, "recover must not migrate");
+    }
+}
+
+#[test]
+fn text_source_follows_the_writer() {
+    let (_d, conn) = db();
+    insert_document(&conn, &nd("a1", "T", "a1.pdf", &[], 1)).unwrap();
+    set_text(&conn, "a1", TextStatus::Done, Some("ocr text"), Some(2), 2).unwrap();
+    assert_eq!(
+        get_document(&conn, "a1").unwrap().unwrap().text_source,
+        TextSource::Ocr
+    );
+    set_transcription(&conn, "a1", "hand text", 3).unwrap();
+    let d = get_document(&conn, "a1").unwrap().unwrap();
+    assert_eq!(d.text_source, TextSource::Transcription);
+    assert_eq!(d.page_count, Some(2));
+    set_text(&conn, "a1", TextStatus::Failed, None, None, 4).unwrap();
+    assert_eq!(
+        get_document(&conn, "a1").unwrap().unwrap().text_source,
+        TextSource::None
+    );
+}

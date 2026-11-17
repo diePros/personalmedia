@@ -464,3 +464,33 @@ async fn static_urls_are_versioned() {
     assert!(sw.contains("PRECACHE.indexOf(url.pathname)"));
     assert!(sw.contains("caches.match(url.pathname)"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_notes_are_saved_and_exported() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let (status, v) = scan(
+        &t,
+        &c,
+        &[("title", "Letter"), ("notes", " grandma tiramisu ")],
+        &[P1],
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    let id = v["id"].as_str().unwrap().to_owned();
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    let doc = u
+        .with_db(|conn| personal_media::user_db::get_document(conn, &id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(doc.notes, "grandma tiramisu");
+    let plan = personal_media::export::plan_entries(std::slice::from_ref(&doc));
+    let meta: Value = serde_json::from_slice(
+        &personal_media::export::metadata_json(std::slice::from_ref(&doc), &plan).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta[0]["notes"], "grandma tiramisu");
+
+    let (status, _) = scan(&t, &c, &[("notes", &"a".repeat(2001))], &[P1]).await;
+    assert_eq!(status, 422);
+}

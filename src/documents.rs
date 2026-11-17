@@ -456,6 +456,18 @@ impl Documents {
             .map_err(DocError::Internal)
     }
 
+    /// Replace the notes of a document (at most [`NOTES_MAX_CHARS`] characters).
+    pub fn set_notes(&self, u: &Unlocked, id: &str, notes: &str, now: i64) -> Result<(), DocError> {
+        if notes.chars().count() > crate::user_db::NOTES_MAX_CHARS {
+            return Err(DocError::InvalidInput("notes too long"));
+        }
+        u.with_db(|c| get_document(c, id))
+            .map_err(DocError::Internal)?
+            .ok_or(DocError::NotFound)?;
+        u.with_db(|c| crate::user_db::set_notes(c, id, notes, now))
+            .map_err(DocError::Internal)
+    }
+
     pub fn retry_extraction(&self, u: &Arc<Unlocked>, id: &str) -> Result<(), DocError> {
         u.with_db(|c| get_document(c, id))
             .map_err(DocError::Internal)?

@@ -1,4 +1,4 @@
-//! MCP endpoint over HTTP: auth, scope enforcement and the six tools.
+//! MCP endpoint over HTTP: auth, scope enforcement and the tools.
 
 mod common;
 
@@ -276,8 +276,8 @@ async fn client_handshake_with_mcp_headers() {
         .await;
     assert_eq!(resp.status(), 200);
     let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    // A read-only full-text token is not offered the two write tools.
-    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
+    // A read-only full-text token is not offered the write tools.
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 6);
 
     // An unsupported version is answered with ours.
     let resp = f
@@ -298,7 +298,7 @@ async fn client_handshake_with_mcp_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tools_list_has_six_tools() {
+async fn tools_list_has_seven_tools_for_metadata_writers() {
     let f = Fx::new();
     let tok = f.token(Access::ReadWrite, Content::MetadataOnly, None);
     let (status, v) = f
@@ -322,6 +322,7 @@ async fn tools_list_has_six_tools() {
             "list_documents",
             "list_tags",
             "search_documents",
+            "set_notes",
             "update_document",
             "upload_document"
         ]
@@ -1012,6 +1013,7 @@ async fn tools_list_hides_write_tools_from_read_only_tokens() {
         names,
         [
             "get_document",
+            "get_page_image",
             "list_documents",
             "list_tags",
             "search_documents",

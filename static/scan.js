@@ -26,6 +26,7 @@
     form: $("scan-form"),
     title: $("scan-title"),
     date: $("scan-date"),
+    notes: $("scan-notes"),
     tags: $("scan-tags"),
     progress: $("scan-progress"),
     progressText: $("scan-progress-text"),
@@ -446,6 +447,7 @@
     form.append("title", els.title.value.trim());
     form.append("tags", selectedTags().join(","));
     form.append("date", els.date.value);
+    form.append("notes", els.notes.value.trim());
     pages.forEach(function (p, i) {
       form.append("page", p.blob, "page-" + (i + 1) + ".jpg");
     });
@@ -520,6 +522,7 @@
     saved = false;
     els.title.value = "";
     els.date.value = "";
+    els.notes.value = "";
     Array.prototype.forEach.call(els.tags.querySelectorAll(".chip"), function (c) {
       c.setAttribute("aria-pressed", "false");
     });

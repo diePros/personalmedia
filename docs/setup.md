@@ -286,6 +286,26 @@ Then run `hermes mcp login pms`, or simply use the server once. The browser open
 - Revoke an app under **Settings → Connected apps**. It stops working at once.
 - Static `pm_` tokens still work and are managed under **Settings → Tokens**.
 
+## 7e. Handwritten notes (v1.5)
+
+PMS cannot read handwriting itself yet. Instead your own AI assistant (claude.ai, Hermes) reads the pages through MCP and saves a transcription that PMS then searches like any other text.
+
+1. Connect the assistant with a **read and write** token or app with **full text** access (section 7 or 7d). Add a tag allow-list such as `handwritten` if it should only see those documents.
+2. Scan or upload the handwritten pages and tag them (for example `handwritten`). The document's own MCP setting must not be limited below `full`.
+3. Ask the assistant, for example in claude.ai:
+
+   > Find my documents tagged handwritten, read each page with get_page_image, and save a faithful transcription with set_transcription.
+
+Tools involved:
+
+- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored when they are at most 4 MiB. At most 20 page images per token (or connected app) per minute.
+- `set_transcription { id, text, mode? }` stores the text (`replace`, the default, or `append`). It becomes the searchable text, is marked "transcribed by an AI assistant" on the document page and is indexed for semantic search again if that is enabled for the document.
+- `set_notes { id, notes }` sets the document's notes (see below).
+
+**Privacy:** page images leave your server and go to the AI provider of the assistant you connected, but only for documents that your token or app may read in full and whose MCP setting is `full`. Documents set to `metadata` or `off` for MCP, and tokens without full text access, never get page images. Images are rendered on demand in memory-backed scratch space, never cached and deleted right after.
+
+**Notes:** every document has an optional **Notes** field (up to 2000 characters), editable on the document page and in the Scan save sheet. Notes count as metadata, like title and tags: they are searchable even for assistants that only get metadata, so keep secrets out of them. They are included in the ZIP export.
+
 ## 8. Backups
 
 `/DATA/AppData/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle.

@@ -42,9 +42,10 @@ Configuration is by environment variables (`PM_DATA_DIR`, `PM_BIND`, `PM_PUBLIC_
 negotiated, `2025-03-26` is not because it requires JSON-RPC batches) over stateless Streamable
 HTTP with plain JSON responses. Authenticate with
 `Authorization: Bearer pm_...` (a token created under Settings). Tools: `search_documents`,
-`list_documents`, `get_document`, `list_tags`, `upload_document`, `update_document` (the
-two write tools are only listed for `read_write` tokens), and `semantic_search` (only for
-`full_text` tokens, see below).
+`list_documents`, `get_document`, `list_tags`, `upload_document`, `update_document`,
+`set_notes` (the write tools are only listed for `read_write` tokens), `semantic_search` and
+`get_page_image` (only for `full_text` tokens, see below), and `set_transcription`
+(`read_write` plus `full_text`).
 
 Deviation from the plan: this is a small hand-written JSON-RPC 2.0 handler (`src/mcp.rs`),
 not the `rmcp` SDK. The endpoint is stateless and each request needs its own authenticated
@@ -61,6 +62,9 @@ host allow-list. There is no SSE stream: `GET /mcp` is 405.
 - OAuth for MCP (v1.4): claude.ai custom connectors and Hermes connect with authorization code +
   PKCE and dynamic client registration; grants are listed and revocable under Settings →
   Connected apps. Static `pm_` tokens still work. See [docs/setup.md](docs/setup.md) section 7d.
+- Handwriting through your own AI (v1.5): an assistant reads page images with `get_page_image` and
+  saves a transcription with `set_transcription`; documents also have a searchable Notes field.
+  See [docs/setup.md](docs/setup.md) section 7e.
 - Semantic search (v1.2): an in-process multilingual embedding model (multilingual-e5-small, int8)
   downloaded on first use. Off by default; enable it in Settings. See
   [docs/setup.md](docs/setup.md) section 7c, including `fetch-model` and `embed-selftest`.

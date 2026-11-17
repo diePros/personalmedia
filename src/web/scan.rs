@@ -131,7 +131,7 @@ fn stamp(ts: i64) -> String {
 }
 
 /// Session + CSRF header (checked by the session layer), like `/api/upload`.
-/// Text fields `title`, `tags` and `date`, then the `page` fields in order.
+/// Text fields `title`, `tags`, `date` and `notes`, then the `page` fields in order.
 async fn scan_upload(
     State(state): State<AppState>,
     CurrentUser(session): CurrentUser,
@@ -155,6 +155,7 @@ async fn scan_upload(
 
     let max_total = state.cfg.max_upload_bytes as usize;
     let (mut title, mut tags, mut date) = (None, Vec::new(), None);
+    let mut notes = String::new();
     let mut pages: Vec<Zeroizing<Vec<u8>>> = Vec::new();
     let mut total = 0usize;
     loop {
@@ -173,6 +174,7 @@ async fn scan_upload(
                 "title" => title = Some(value.trim().to_owned()).filter(|v| !v.is_empty()),
                 "tags" => tags = parse_tags(&value),
                 "date" => date = Some(value.trim().to_owned()).filter(|v| !v.is_empty()),
+                "notes" => notes = value.trim().to_owned(),
                 _ => {}
             }
             continue;
@@ -217,6 +219,9 @@ async fn scan_upload(
     if let Err(e) = validate_meta(title.as_deref(), Some(&default_title), &tags) {
         return doc_error(e);
     }
+    if notes.chars().count() > crate::user_db::NOTES_MAX_CHARS {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "notes too long");
+    }
     // Building the PDF copies every page once; keep it off the async threads.
     let built = tokio::task::spawn_blocking(move || {
         let refs: Vec<&[u8]> = pages.iter().map(|p| p.as_slice()).collect();
@@ -253,7 +258,19 @@ async fn scan_upload(
         )
         .await
     {
-        Ok(outcome) => axum::Json(outcome).into_response(),
+        Ok(outcome) => {
+            if !notes.is_empty()
+                && let crate::documents::StoreOutcome::Stored { id } = &outcome
+            {
+                let (docs, u, id) = (state.docs.clone(), unlocked.clone(), id.clone());
+                let saved =
+                    tokio::task::spawn_blocking(move || docs.set_notes(&u, &id, &notes, ts)).await;
+                if !matches!(saved, Ok(Ok(()))) {
+                    tracing::warn!("could not save the notes of a scan");
+                }
+            }
+            axum::Json(outcome).into_response()
+        }
         Err(e) => doc_error(e),
     }
 }
