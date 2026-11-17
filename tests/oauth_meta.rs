@@ -335,12 +335,16 @@ async fn dcr_rate_limited_and_capped() {
 
     // The cap: 200 clients, then 503 temporarily_unavailable (fresh IP).
     let app = TestApp::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     for i in 0..200 {
         let c = OauthClient {
             client_id: format!("pmc_{i:032x}"),
             client_name: "c".into(),
             redirect_uris: vec![],
-            created_at: 1,
+            created_at: now,
             last_grant_at: None,
         };
         assert!(app.state.sys.insert_oauth_client(&c, 200).unwrap());

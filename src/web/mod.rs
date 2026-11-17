@@ -214,7 +214,10 @@ fn spawn_sweeper(
         Arc::downgrade(keyring),
     );
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+        // The first sweep is one interval away: `interval` would fire at
+        // once and race whatever the app does in its first moments.
+        let mut tick =
+            tokio::time::interval_at(tokio::time::Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
         loop {
             tick.tick().await;
             let (
