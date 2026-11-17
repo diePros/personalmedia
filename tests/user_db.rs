@@ -693,7 +693,7 @@ fn index_migration_v3_rebuilds_fts_once() {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4, "from v{from}");
+        assert_eq!(v, 5, "from v{from}");
 
         // Old content, title and tag are still searchable.
         for (q, id) in [
@@ -933,7 +933,7 @@ fn index_migration_v3_to_v4_keeps_data() {
     let v: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 4);
+    assert_eq!(v, 5);
     conn.execute(
         "INSERT INTO device_meta(id, label, created_at) VALUES ('d1','Mac · Safari',9)",
         [],
@@ -980,4 +980,70 @@ fn search_newest_orders_by_created_at() {
         ..web()
     };
     assert_eq!(ids(&newest), ["new", "old"]);
+}
+
+fn v4_db(path: &std::path::Path) {
+    let conn = raw_conn(path);
+    conn.execute_batch(SCHEMA_V1).unwrap();
+    conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+    conn.execute_batch(MIGRATION_V2).unwrap();
+    conn.execute_batch(MIGRATION_V3).unwrap();
+    conn.execute_batch(MIGRATION_V4).unwrap();
+    conn.execute(
+        "INSERT INTO documents(id, wrapped_dek, original_filename, title, mime, size, sha256,
+            document_date, created_at, updated_at, text_status)
+         VALUES ('a1', x'010203', 'a1.pdf', 'Rechnung', 'application/pdf', 1, x'00',
+                 '2025-03-04', 100, 100, 'done')",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn index_migration_v4_to_v5_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    v4_db(&path);
+    let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 5);
+    let (date, source): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT document_date, date_source FROM documents WHERE id='a1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(date.as_deref(), Some("2025-03-04"));
+    assert_eq!(source, None);
+    let d = get_document(&conn, "a1").unwrap().unwrap();
+    assert_eq!(d.date_source, None);
+    // The CHECK constraint rejects unknown sources.
+    assert!(
+        conn.execute("UPDATE documents SET date_source = 'bogus'", [])
+            .is_err()
+    );
+    drop(conn);
+    // Reopening does not migrate again.
+    open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
+}
+
+#[test]
+fn readonly_open_of_v4_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    v4_db(&path);
+    let conn = open_user_db_readonly(&path, &Key32::from_bytes([7; 32])).unwrap();
+    let docs = list_documents(&conn, &all()).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].document_date.as_deref(), Some("2025-03-04"));
+    assert_eq!(docs[0].date_source, None);
+    let d = get_document(&conn, "a1").unwrap().unwrap();
+    assert_eq!(d.date_source, None);
+    let ver: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, 4, "recover must not migrate");
 }

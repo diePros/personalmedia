@@ -1083,6 +1083,8 @@ struct DetailPage {
     mime: String,
     size: String,
     date: String,
+    /// "found in text" / "set by AI" after the date; empty otherwise.
+    date_hint: &'static str,
     tags_csv: String,
     tags: Vec<String>,
     notes: String,
@@ -1181,6 +1183,11 @@ async fn detail_page(CurrentUser(session): CurrentUser, Path(id): Path<String>) 
         filename: doc.original_filename,
         size: human_size(doc.size),
         date: doc.document_date.unwrap_or_default(),
+        date_hint: match doc.date_source {
+            Some(crate::user_db::DateSource::Detected) => "found in text",
+            Some(crate::user_db::DateSource::Ai) => "set by AI",
+            _ => "",
+        },
         tags_csv: doc.tags.join(", "),
         notes: doc.notes,
         text_source: match doc.text_source {

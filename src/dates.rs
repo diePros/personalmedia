@@ -187,10 +187,20 @@ fn line_candidates(
         let after = found.get(i + 1).is_some_and(|n| joiner(&c[f.end..n.start]));
         // `vom/von/from ... bis/to/until <date>`: this date ends an open range.
         // The end word must sit right before the date.
+        // `bis` may be followed by `zum` or `einschließlich`.
         let open_range = words.last().is_some_and(|last| {
-            ["bis", "to", "until"].contains(&last.as_str())
+            let n = words.len();
+            let end = if n >= 2
+                && ["zum", "einschließlich"].contains(&last.as_str())
+                && words[n - 2] == "bis"
+            {
+                n - 2
+            } else {
+                n - 1
+            };
+            ["bis", "to", "until"].contains(&words[end].as_str())
                 && seg.trim_end().to_lowercase().ends_with(last.as_str())
-                && words[..words.len() - 1]
+                && words[..end]
                     .iter()
                     .any(|w| ["vom", "von", "from"].contains(&w.as_str()))
         });
@@ -752,6 +762,8 @@ mod tests {
     fn range_joiners() {
         assert_eq!(d("01.10.2026 bis zum 31.10.2026"), None);
         assert_eq!(d("vom 01.10. bis 31.10.2026"), None);
+        assert_eq!(d("vom 01.10. bis zum 31.10.2026"), None);
+        assert_eq!(d("vom 01.10. bis einschließlich 31.10.2026"), None);
     }
 
     #[test]

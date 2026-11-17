@@ -1237,3 +1237,110 @@ async fn day_groups_use_separate_lists_and_search_has_one() {
     let s = body_string(t.get("/search?tag=red", &c).await).await;
     assert_eq!(s.matches("<ul class=\"doc-list\">").count(), 1, "{s}");
 }
+
+fn doc_state(
+    t: &TestApp,
+    c: &Client,
+    id: &str,
+) -> (Option<String>, Option<personal_media::user_db::DateSource>) {
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    let d = u
+        .with_db(|conn| personal_media::user_db::get_document(conn, id))
+        .unwrap()
+        .unwrap();
+    (d.document_date, d.date_source)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_edit_sets_user_source() {
+    use personal_media::user_db::DateSource;
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"data").await;
+    assert_eq!(doc_state(&t, &c, &id), (None, None));
+    let resp = t
+        .post_form(
+            &format!("/documents/{id}"),
+            &[("title", "T"), ("date", "2023-05-06"), ("tags", "")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(
+        doc_state(&t, &c, &id),
+        (Some("2023-05-06".into()), Some(DateSource::User))
+    );
+    // An upload form with a date is the user's date too.
+    let v = upload(
+        &t,
+        &c,
+        "b.bin",
+        "application/octet-stream",
+        b"other",
+        &[("date", "2022-01-02")],
+    )
+    .await;
+    assert_eq!(
+        doc_state(&t, &c, v["id"].as_str().unwrap()),
+        (Some("2022-01-02".into()), Some(DateSource::User))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn web_clear_date_blocks_detection() {
+    use personal_media::user_db::{DateSource, apply_detected_date};
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"data").await;
+    let resp = t
+        .post_form(
+            &format!("/documents/{id}"),
+            &[("title", "T"), ("date", ""), ("tags", "")],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(doc_state(&t, &c, &id), (None, Some(DateSource::User)));
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    let today = time::Date::from_calendar_date(2026, time::Month::November, 17).unwrap();
+    let set = u
+        .with_db(|conn| apply_detected_date(conn, &id, "Rechnungsdatum 05.10.2026", today, 5))
+        .unwrap();
+    assert!(!set);
+    assert_eq!(doc_state(&t, &c, &id), (None, Some(DateSource::User)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn document_page_shows_date_hint() {
+    use personal_media::user_db::{DateSource, update_document_meta_sourced};
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let id = upload_id(&t, &c, "a.bin", "application/octet-stream", b"data").await;
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    let set = |src: DateSource| {
+        u.with_db(|conn| {
+            update_document_meta_sourced(
+                conn,
+                &id,
+                None,
+                Some(Some("2024-04-05")),
+                None,
+                None,
+                src,
+                9,
+            )
+        })
+        .unwrap()
+    };
+    set(DateSource::Detected);
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(html.contains("2024-04-05") && html.contains("found in text"));
+    assert!(!html.contains("set by AI"));
+    set(DateSource::Ai);
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(html.contains("set by AI") && !html.contains("found in text"));
+    set(DateSource::User);
+    let html = body_string(t.get(&format!("/documents/{id}"), &c).await).await;
+    assert!(html.contains("2024-04-05"));
+    assert!(!html.contains("set by AI") && !html.contains("found in text"));
+}

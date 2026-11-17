@@ -24,11 +24,12 @@ pub use devices::{
     prune_device_meta, touch_device_meta,
 };
 pub use documents::{
-    Document, ListFilter, NOTES_MAX_CHARS, NewDocument, SearchHit, TextSource, TextStatus,
-    delete_document, find_by_sha256, find_by_sha256_visible, get_document, get_document_text,
-    hidden_from, insert_document, list_documents, list_tags, list_tags_visible,
-    pending_document_ids, search, set_extracted_text, set_notes, set_text, set_transcription,
-    tag_ids, update_document_meta, update_document_meta_notes,
+    DateSource, Document, ListFilter, NOTES_MAX_CHARS, NewDocument, SearchHit, TextSource,
+    TextStatus, apply_detected_date, backfill_batch, backfill_detected_dates, delete_document,
+    find_by_sha256, find_by_sha256_visible, get_document, get_document_text, hidden_from,
+    insert_document, list_documents, list_tags, list_tags_visible, pending_document_ids, search,
+    set_date_source, set_extracted_text, set_notes, set_text, set_transcription, tag_ids,
+    update_document_meta, update_document_meta_notes, update_document_meta_sourced,
 };
 pub use meta::{
     Access, Content, GrantInfo, TokenMeta, TokenScope, delete_token_meta, get_setting,
@@ -139,6 +140,15 @@ CREATE TABLE device_meta (
 PRAGMA user_version = 4;
 ";
 
+/// v5 (v1.6.3): where a document's date came from. Existing dates keep a NULL
+/// source (unknown); they are never overwritten by detection.
+#[doc(hidden)]
+pub const MIGRATION_V5: &str = "
+ALTER TABLE documents ADD COLUMN date_source TEXT
+    CHECK (date_source IN ('user','detected','ai'));
+PRAGMA user_version = 5;
+";
+
 /// Open (creating if needed) the user's SQLCipher index with a raw key, and migrate.
 pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
     let conn = Connection::open(path).context("opening user db")?;
@@ -157,7 +167,12 @@ pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
             "BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"
         ))?;
     }
-    for (target, sql) in [(2, MIGRATION_V2), (3, MIGRATION_V3), (4, MIGRATION_V4)] {
+    for (target, sql) in [
+        (2, MIGRATION_V2),
+        (3, MIGRATION_V3),
+        (4, MIGRATION_V4),
+        (5, MIGRATION_V5),
+    ] {
         if version >= target {
             continue;
         }

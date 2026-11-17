@@ -40,8 +40,8 @@ use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
 use crate::tokens::{AuthFail, Principal, authenticate, parse_bearer};
 use crate::user_db::{
-    Document, Level, effective_level, get_document, get_document_text, list_documents,
-    list_tags_visible, search, update_document_meta,
+    DateSource, Document, Level, effective_level, get_document, get_document_text, list_documents,
+    list_tags_visible, search, set_date_source, update_document_meta_sourced,
 };
 use crate::web::AppState;
 use crate::web::ratelimit::{client_ip, mcp_ip_key, too_many_requests};
@@ -420,7 +420,7 @@ fn tool_definitions(can_write: bool, full_text: bool) -> Value {
         },
         {
             "name": "set_transcription",
-            "description": "Stores a transcription of a document's handwriting as its searchable text (read_write + full_text tokens only). It replaces the extracted text unless mode is append.",
+            "description": "Stores a transcription of a document's handwriting as its searchable text (read_write + full_text tokens only). It replaces the extracted text unless mode is append. If the page shows a date, also set it with update_document.",
             "inputSchema": {"type": "object", "properties": {
                 "id": {"type": "string"},
                 "text": {"type": "string", "maxLength": 500000},
@@ -855,6 +855,7 @@ async fn upload_document(
         tags,
         document_date: clean(a.date),
     };
+    let has_date = meta.document_date.is_some();
     let filter = p.filter();
     let size = bytes.len() as u64;
     let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
@@ -873,7 +874,18 @@ async fn upload_document(
         )
         .await
     {
-        Ok(outcome) => serde_json::to_value(outcome).map_err(|e| ToolError::Tool(internal(e))),
+        Ok(outcome) => {
+            // A date given through MCP is the AI's, not the user's.
+            if has_date && let crate::documents::StoreOutcome::Stored { id } = &outcome {
+                let id = id.clone();
+                blocking(&p.unlocked, move |c| {
+                    set_date_source(c, &id, DateSource::Ai)
+                })
+                .await
+                .map_err(ToolError::Tool)?;
+            }
+            serde_json::to_value(outcome).map_err(|e| ToolError::Tool(internal(e)))
+        }
         Err(e) => Err(doc_err(e)),
     }
 }
@@ -929,7 +941,16 @@ async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, ToolErro
         {
             return Ok(Err(doc_err(e)));
         }
-        update_document_meta(c, &id, a.title.as_deref(), date, tags.as_deref(), now())?;
+        update_document_meta_sourced(
+            c,
+            &id,
+            a.title.as_deref(),
+            date,
+            tags.as_deref(),
+            None,
+            DateSource::Ai,
+            now(),
+        )?;
         Ok(Ok(()))
     })
     .await
