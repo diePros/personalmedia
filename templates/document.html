@@ -18,6 +18,7 @@
 {% if !date.is_empty() %}<dt>Document date</dt><dd>{{ date }}</dd>{% endif -%}
 {% if !tags.is_empty() %}<dt>Tags</dt><dd>{% for tag in tags %}<span class="tag">{{ tag }}</span> {% endfor %}</dd>{% endif -%}
 <dt>Text extraction</dt><dd>{{ status }}</dd>
+<dt>Semantic index</dt><dd>{{ embed_status }}</dd>
 </dl>
 
 {% if full -%}

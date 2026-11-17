@@ -55,7 +55,9 @@ Everything the app stores there is encrypted per user. You can back it up as-is 
 ```yaml
 services:
   personal-media:
-    build: .
+    build:
+      context: .
+      network: host        # the build downloads from cdn.pyke.io; avoids IPv6-only build networks
     image: personal-media
     container_name: personal-media
     restart: unless-stopped
@@ -235,6 +237,24 @@ Treat the token like a key: it can unlock your documents within its scope. If it
 
 *Memory:* staged shares live in RAM only, counted while the upload streams in: anonymous 25 MiB in total, `PM_MAX_UPLOAD_MB` per logged-in user, and twice `PM_MAX_UPLOAD_MB` for everything together, with at most two share uploads read at a time. Keep that well below the container's `mem_limit` (1.5 GiB in the shipped compose file); with the default 100 MB it peaks at about 200 MB.
 
+## 7c. Semantic search (v1.2)
+
+Semantic search lets an assistant find documents by meaning (also across German and English) through the `semantic_search` MCP tool.
+
+- **Off by default.** The access switchboard's `semantic_index` default is `off`. Turn it on in **Settings → Access defaults → Semantic index = Full** (or per document on its page). Settings then shows "Semantic index: N of M documents indexed". Lowering the level again deletes the vectors at once.
+- **Who can use it.** Only tokens with content `full_text` see the tool, and only for documents whose MCP level is `full`. Vectors are stored encrypted in the user's index database, like the text.
+- **Model download.** The model (multilingual-e5-small, int8, about 135 MB, pinned revision and SHA-256) is not part of the image. It is downloaded on first indexing into `/data/models/<name>/` and verified against the pinned hash; a mismatch is a hard error. The container needs outbound access to huggingface.co for that, once.
+- **Pre-download:** `sudo docker exec personal-media personal-media fetch-model` (idempotent).
+- **Air-gapped:** copy the two files (`model_qint8_avx512_vnni.onnx`, `tokenizer.json`) into `/data/models/multilingual-e5-small/` yourself. They are hash-checked on load.
+- **Memory.** Loading and running the model needs a few hundred MB; it unloads after 10 minutes idle and runs one job at a time. The compose file sets `mem_limit: 1536m` for this.
+- **Self-test (run once after the first 1.2 deploy).** Checks that the quantized model ranks sensibly on this CPU and reports speed and peak memory:
+
+  ```bash
+  sudo docker exec personal-media personal-media embed-selftest
+  ```
+
+  It works with the read-only root file system (the model lives in `/data/models`, which is writable) and downloads the model if it is missing. It embeds a few synthetic German/English passages, checks that 3 of 4 test queries (two cross-language) rank the right passage first, and prints ms per 300-token passage and peak RSS. Exit code 0 means OK; 1 means the quantized model may not suit this CPU.
+
 ## 8. Backups
 
 `/DATA/AppData/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle.
@@ -282,7 +302,7 @@ sudo DOCKER_CONFIG=/DATA/.docker docker compose pull
 sudo DOCKER_CONFIG=/DATA/.docker docker compose up -d
 ```
 
-To pin a version instead of `latest`, set `image: ghcr.io/diepros/personalmedia:1.1` in `docker-compose.yml`. A local build still works without the registry: `docker compose up -d --build`.
+To pin a version instead of `latest`, set `image: ghcr.io/diepros/personalmedia:1.1` in `docker-compose.yml`. A local build still works without the registry: `docker compose up -d --build`. A local build needs outbound access to crates.io, cdn.pyke.io (ONNX runtime) and huggingface.co (the test model); pulling the GHCR image avoids all of it.
 
 What an update does:
 - Documents, accounts, MCP tokens and the Funnel setup stay as they are.

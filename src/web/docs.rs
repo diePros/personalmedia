@@ -34,6 +34,7 @@ use super::session::{AuthRejection, CsrfForm, CurrentUser, NoFields};
 use super::{AppState, CspOverride, Page, is_htmx, render};
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
+use crate::user_db::vectors::embed_status_words;
 use crate::user_db::{
     AccessFilter, Channel, Document, Level, ListFilter, TextStatus, document_overrides,
     effective_level, get_access_defaults, get_document, list_documents, list_tags_visible, search,
@@ -645,6 +646,7 @@ struct DetailPage {
     preview_pdf: bool,
     preview_image: bool,
     switches: Vec<SwitchRow>,
+    embed_status: &'static str,
 }
 
 fn mime_essence(mime: &str) -> String {
@@ -705,7 +707,11 @@ async fn detail_page(CurrentUser(session): CurrentUser, Path(id): Path<String>) 
         Err(r) => return r,
     };
     let doc_id = doc.id.clone();
-    let switches = match db(&session.unlocked, move |c| switch_rows(c, &doc_id)).await {
+    let (switches, embed_status) = match db(&session.unlocked, move |c| {
+        Ok::<_, anyhow::Error>((switch_rows(c, &doc_id)?, embed_status_words(c, &doc_id)?))
+    })
+    .await
+    {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return internal(e),
         Err(r) => return r,
@@ -731,6 +737,7 @@ async fn detail_page(CurrentUser(session): CurrentUser, Path(id): Path<String>) 
         id: doc.id,
         full,
         switches,
+        embed_status,
     })
 }
 

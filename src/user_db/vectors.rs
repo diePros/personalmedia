@@ -299,3 +299,48 @@ pub fn search(
     best.truncate(limit);
     Ok(best)
 }
+
+/// Counts over the documents whose effective `semantic_index` is full.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticStatus {
+    /// Documents whose effective `semantic_index` is full.
+    pub eligible: usize,
+    /// Of those, with finished vectors.
+    pub indexed: usize,
+    pub failed: usize,
+    pub pending: usize,
+}
+
+pub fn semantic_status(conn: &Connection) -> Result<SemanticStatus> {
+    let mut stmt = conn.prepare("SELECT id, embed_status FROM documents")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    let mut st = SemanticStatus::default();
+    for (id, status) in rows {
+        if effective_level(conn, &id, Channel::SemanticIndex, Level::Full)? != Level::Full {
+            continue;
+        }
+        st.eligible += 1;
+        match status.as_str() {
+            "done" => st.indexed += 1,
+            "failed" => st.failed += 1,
+            "pending" => st.pending += 1,
+            _ => {}
+        }
+    }
+    Ok(st)
+}
+
+/// The embed status of one document in plain words.
+pub fn embed_status_words(conn: &Connection, doc_id: &str) -> Result<&'static str> {
+    if effective_level(conn, doc_id, Channel::SemanticIndex, Level::Full)? != Level::Full {
+        return Ok("Not indexed (the semantic index is not set to full for this document)");
+    }
+    Ok(match get_embed_status(conn, doc_id)?.as_deref() {
+        Some("done") => "Indexed for semantic search",
+        Some("failed") => "Indexing failed; it is retried the next time you log in",
+        _ => "Waiting to be indexed",
+    })
+}

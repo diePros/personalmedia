@@ -1033,3 +1033,62 @@ async fn lowering_semantic_index_in_web_requests_deletes_vectors_before_response
     assert_eq!(resp.status(), 303);
     assert_eq!(u.with_db(|conn| vector_count(conn, &id).unwrap()), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_shows_semantic_index_status() {
+    use personal_media::user_db::vectors::set_embed_status;
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let a = upload_named(&t, &c, "a.pdf", PDF, "A").await;
+    let b = upload_named(&t, &c, "b.pdf", b"%PDF-1.4 b", "B").await;
+    let off = upload_named(&t, &c, "c.pdf", b"%PDF-1.4 c", "C").await;
+
+    // Let the extraction workers finish, or they would race with the statuses set below.
+    for _ in 0..400 {
+        let pending = u.with_db(|conn| {
+            [&a, &b, &off].iter().any(|id| {
+                personal_media::user_db::get_document(conn, id)
+                    .unwrap()
+                    .unwrap()
+                    .text_status
+                    == personal_media::user_db::TextStatus::Pending
+            })
+        });
+        if !pending {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Default is off: nothing eligible, no failed/pending noise.
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(
+        html.contains("Semantic index: 0 of 0 documents indexed"),
+        "{html}"
+    );
+    assert!(!html.contains("failed"));
+    assert!(html.contains(
+        "Semantic index lets your AI assistant (via MCP, full-text tokens only) search by meaning. Vectors are stored encrypted like your text."
+    ));
+
+    u.with_db(|conn| {
+        set_document_access(conn, &a, Channel::SemanticIndex, Some(Level::Full)).unwrap();
+        set_document_access(conn, &b, Channel::SemanticIndex, Some(Level::Full)).unwrap();
+        set_document_access(conn, &off, Channel::SemanticIndex, Some(Level::Off)).unwrap();
+        set_embed_status(conn, &a, "done").unwrap();
+        set_embed_status(conn, &b, "failed").unwrap();
+    });
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(
+        html.contains("Semantic index: 1 of 2 documents indexed, 1 failed"),
+        "{html}"
+    );
+
+    let detail = body_string(t.get(&format!("/documents/{a}"), &c).await).await;
+    assert!(detail.contains("Indexed for semantic search"), "{detail}");
+    let detail = body_string(t.get(&format!("/documents/{b}"), &c).await).await;
+    assert!(detail.contains("Indexing failed"), "{detail}");
+    let detail = body_string(t.get(&format!("/documents/{off}"), &c).await).await;
+    assert!(detail.contains("Not indexed"), "{detail}");
+}

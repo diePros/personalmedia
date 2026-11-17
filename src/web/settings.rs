@@ -33,6 +33,7 @@ use crate::documents::{DocError, validate_meta};
 use crate::export;
 use crate::tokens::{create_token, revoke_token};
 use crate::user_db::tag_ids as tag_ids_for;
+use crate::user_db::vectors::{SemanticStatus, semantic_status};
 use crate::user_db::{
     Access, Channel, Content, Level, TokenScope, document_overrides, get_access_defaults,
     get_token_meta, hidden_from, list_tags, list_tags_visible, list_token_meta,
@@ -154,6 +155,7 @@ struct SettingsPage {
     tags: Vec<TagBox>,
     totp_enabled: bool,
     totp_setup: Option<SetupView>,
+    semantic: SemanticStatus,
 }
 
 #[derive(Template)]
@@ -292,7 +294,7 @@ async fn settings_response(
     let (u, accounts) = (session.unlocked.clone(), state.accounts.clone());
     let user_id = session.user_id.clone();
     let loaded = blocking(move || -> anyhow::Result<_> {
-        let (defaults, hidden, tokens, tags) = u.with_db(|c| -> anyhow::Result<_> {
+        let (defaults, hidden, tokens, tags, semantic) = u.with_db(|c| -> anyhow::Result<_> {
             let defaults = get_access_defaults(c)?;
             let hidden = hidden_rows(c, &defaults)?;
             let all_tags = list_tags(c)?;
@@ -302,18 +304,20 @@ async fn settings_response(
                 .collect();
             // The token form offers tags attached to at least one document.
             let tags = list_tags_visible(c, &ListFilter::default())?;
-            Ok((defaults, hidden, tokens, tags))
+            let semantic = semantic_status(c)?;
+            Ok((defaults, hidden, tokens, tags, semantic))
         })?;
         Ok((
             defaults,
             hidden,
             tokens,
             tags,
+            semantic,
             accounts.totp_enabled(&user_id),
         ))
     })
     .await;
-    let (defaults, hidden, tokens, tags, totp_enabled) = match loaded {
+    let (defaults, hidden, tokens, tags, semantic, totp_enabled) = match loaded {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(r) => return r,
@@ -330,6 +334,7 @@ async fn settings_response(
             .map(|(id, name)| TagBox { id, name })
             .collect(),
         totp_enabled,
+        semantic,
         totp_setup: view.setup.map(|s| SetupView {
             secret: s.secret_b32,
             qr: s.qr_png_base64,
