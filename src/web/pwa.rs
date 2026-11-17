@@ -36,7 +36,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::stream;
 use serde::Deserialize;
@@ -97,9 +97,6 @@ pub fn routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/manifest.webmanifest", get(manifest))
         .route("/sw.js", get(service_worker))
-        // Task 30 replaces this: the manifest start_url is /scan, so until the
-        // scan page exists it leads to the documents page (which handles login).
-        .route("/scan", get(|| async { Redirect::to("/documents") }))
         .route(
             SHARE_PATH,
             post(stage_share).layer(DefaultBodyLimit::max(limit)),

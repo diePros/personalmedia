@@ -110,7 +110,7 @@ fn internal(e: impl std::fmt::Display) -> Response {
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
-fn doc_error(e: DocError) -> Response {
+pub(super) fn doc_error(e: DocError) -> Response {
     match e {
         DocError::TooLarge => json_error(StatusCode::PAYLOAD_TOO_LARGE, "upload too large"),
         e @ DocError::QuotaExceeded { .. } => (
@@ -128,12 +128,12 @@ fn doc_error(e: DocError) -> Response {
     }
 }
 
-fn json_error(status: StatusCode, msg: &str) -> Response {
+pub(super) fn json_error(status: StatusCode, msg: &str) -> Response {
     (status, axum::Json(serde_json::json!({ "error": msg }))).into_response()
 }
 
 /// Runs index DB work off the async threads.
-async fn db<T: Send + 'static>(
+pub(super) async fn db<T: Send + 'static>(
     u: &Arc<Unlocked>,
     f: impl FnOnce(&rusqlite::Connection) -> T + Send + 'static,
 ) -> Result<T, Response> {

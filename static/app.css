@@ -410,3 +410,108 @@ fieldset.mode legend {
     display: none;
   }
 }
+
+/* App shell. The bottom tab bar exists in the markup of every signed-in page
+   but is hidden; it only shows (and the site header goes away) when the app is
+   installed and running standalone. `app.js` adds the `standalone` class for
+   iOS, which has no display-mode media query. */
+.tabbar {
+  display: none;
+}
+
+.standalone {
+  --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+}
+
+.standalone .site-header {
+  display: none;
+}
+
+.standalone .tabbar {
+  display: flex;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  height: var(--tabbar-h);
+  padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
+    env(safe-area-inset-left, 0px);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+}
+
+.standalone .tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.125rem;
+  min-width: 44px;
+  min-height: 44px;
+  color: var(--muted);
+  font-size: 0.6875rem;
+  line-height: 1.2;
+  text-decoration: none;
+}
+
+.standalone .tab[aria-current="page"] {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.standalone .tab:focus-visible {
+  outline-offset: -4px;
+}
+
+.standalone main {
+  padding-top: calc(var(--gap) + env(safe-area-inset-top, 0px));
+  padding-bottom: calc(var(--gap) + var(--tabbar-h));
+}
+
+/* Same rules before the script has run (Android Chrome and others that
+   support the media query): no flash of the header. */
+@media (display-mode: standalone) {
+  :root {
+    --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+  }
+
+  .site-header {
+    display: none;
+  }
+
+  .tabbar {
+    display: flex;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 20;
+    height: var(--tabbar-h);
+    padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
+      env(safe-area-inset-left, 0px);
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+  }
+
+  .tab {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 0.125rem;
+    min-width: 44px;
+    min-height: 44px;
+    color: var(--muted);
+    font-size: 0.6875rem;
+    line-height: 1.2;
+    text-decoration: none;
+  }
+
+  main {
+    padding-top: calc(var(--gap) + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(var(--gap) + var(--tabbar-h));
+  }
+}

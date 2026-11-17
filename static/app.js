@@ -199,10 +199,72 @@
     return (iphoneOrIpad || ipadAsMac) && navigator.standalone === false;
   }
 
-  function initInstallHint() {
+  // Runs at once (the script is deferred, so <html> exists and the page is
+  // parsed): the standalone shell must not wait for DOMContentLoaded.
+  function markStandalone() {
     if (isStandalone()) {
       document.documentElement.classList.add("standalone");
     }
+  }
+
+  // Bottom tab bar (shown only when standalone, see app.css): highlights the
+  // current tab and makes Search focus the documents search field.
+  function initTabbar() {
+    var bar = document.querySelector(".tabbar");
+    if (!bar) {
+      return;
+    }
+    var tabs = bar.querySelectorAll(".tab");
+    function current() {
+      var path = window.location.pathname;
+      if (path === "/documents" && window.location.hash === "#q") {
+        return "/documents#q";
+      }
+      if (path === "/scan" || path === "/settings") {
+        return path;
+      }
+      return path.indexOf("/documents") === 0 ? "/documents" : "";
+    }
+    function mark() {
+      var here = current();
+      Array.prototype.forEach.call(tabs, function (tab) {
+        if (tab.getAttribute("href") === here) {
+          tab.setAttribute("aria-current", "page");
+        } else {
+          tab.removeAttribute("aria-current");
+        }
+      });
+    }
+    function focusSearch() {
+      var q = document.getElementById("q");
+      if (q) {
+        q.focus();
+        if (q.scrollIntoView) {
+          q.scrollIntoView({ block: "center" });
+        }
+      }
+      return !!q;
+    }
+    Array.prototype.forEach.call(tabs, function (tab) {
+      if (tab.getAttribute("href") !== "/documents#q") {
+        return;
+      }
+      tab.addEventListener("click", function (e) {
+        // Already on the documents page: no reload, just focus the field.
+        if (window.location.pathname === "/documents" && focusSearch()) {
+          e.preventDefault();
+          window.history.replaceState(null, "", "/documents#q");
+          mark();
+        }
+      });
+    });
+    mark();
+    if (window.location.pathname === "/documents" && window.location.hash === "#q") {
+      focusSearch();
+    }
+  }
+
+  function initInstallHint() {
     var hint = document.getElementById("install-hint");
     if (!hint) {
       return;
@@ -261,11 +323,15 @@
     });
   }
 
+  markStandalone();
+
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", initUpload);
     document.addEventListener("DOMContentLoaded", initInstallHint);
+    document.addEventListener("DOMContentLoaded", initTabbar);
   } else {
     initUpload();
     initInstallHint();
+    initTabbar();
   }
 })();

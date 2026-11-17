@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}Scan · PMS{% endblock %}
+{% block head %}<link rel="stylesheet" href="/static/scan.css">
+<script src="/static/scan.js" defer></script>
+{% endblock %}
+{% block content %}
+<div id="scan-app" class="scan">
+<p id="scan-offline" class="banner" role="status" hidden>You are offline. Your pages are kept here; upload them when you are back online.</p>
+<p id="scan-error" class="banner banner-error" role="alert" hidden></p>
+<p id="scan-status" class="sr-only" role="status" aria-live="polite"></p>
+
+<section id="scan-empty" class="scan-empty" aria-labelledby="scan-heading">
+<h1 id="scan-heading">Scan</h1>
+<p class="muted">Photograph pages. They become one PDF in your vault.</p>
+<input type="file" id="scan-camera" class="sr-only" accept="image/*" capture="environment">
+<label for="scan-camera" class="capture" id="scan-capture">
+<svg viewBox="0 0 24 24" width="44" height="44" aria-hidden="true" focusable="false"><path d="M4 8a2 2 0 0 1 2-2h1.5l1.2-1.8A1 1 0 0 1 9.5 4h5a1 1 0 0 1 .8.2L16.5 6H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="12" cy="12.5" r="3.5" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+<span class="sr-only">Take a photo</span>
+</label>
+<div class="scan-alt">
+<input type="file" id="scan-library" class="sr-only" accept="image/*" multiple>
+<label for="scan-library" class="pill">Photo library</label>
+<input type="file" id="scan-files" class="sr-only" accept="image/*,application/pdf" multiple>
+<label for="scan-files" class="pill">Files</label>
+</div>
+</section>
+
+<section id="scan-pages-wrap" class="scan-pages-wrap" aria-label="Scanned pages" hidden>
+<h1>Pages</h1>
+<ul id="scan-pages" class="strip"></ul>
+</section>
+
+<section id="scan-done" class="scan-done" aria-live="polite" hidden>
+<svg class="check" viewBox="0 0 24 24" width="72" height="72" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="m7.5 12.5 3 3 6-6.5" fill="none" stroke="var(--bg)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+<h2>Saved</h2>
+<p class="muted">Saved — text recognition runs in the background</p>
+<div class="scan-alt">
+<button type="button" id="scan-another" class="pill">Scan another</button>
+<a id="scan-open" class="pill pill-solid" href="/documents">Open document</a>
+</div>
+</section>
+
+<div id="scan-savebar" class="savebar" hidden>
+<button type="button" id="scan-save" class="primary">Save (1 page)</button>
+</div>
+
+<div id="scan-progress" class="progress" role="status" hidden>
+<p id="scan-progress-text">Uploading…</p>
+<progress id="scan-bar" max="100" value="0" aria-label="Upload progress"></progress>
+<button type="button" id="scan-cancel" class="pill">Cancel</button>
+</div>
+
+<div id="scan-sheet" class="sheet-wrap" hidden>
+<div id="scan-sheet-backdrop" class="sheet-backdrop"></div>
+<form id="scan-form" class="sheet" role="dialog" aria-modal="true" aria-labelledby="scan-sheet-title" novalidate>
+<div class="grab" aria-hidden="true"></div>
+<h2 id="scan-sheet-title">Save scan</h2>
+<div>
+<label for="scan-title">Title (optional)</label>
+<input type="text" id="scan-title" maxlength="300" autocomplete="off" placeholder="Scan, named by date and time">
+</div>
+<fieldset>
+<legend>Tags</legend>
+<div id="scan-tags" class="chips">
+<button type="button" class="chip" data-tag="inbox" aria-pressed="false">inbox</button>
+{% for t in tags -%}
+<button type="button" class="chip" data-tag="{{ t }}" aria-pressed="false">{{ t }}</button>
+{% endfor -%}
+</div>
+</fieldset>
+<div>
+<label for="scan-date">Date (optional)</label>
+<input type="date" id="scan-date">
+</div>
+<div class="sheet-actions">
+<button type="button" id="scan-sheet-cancel" class="pill">Cancel</button>
+<button type="submit" id="scan-upload" class="primary">Upload</button>
+</div>
+</form>
+</div>
+
+<div id="scan-viewer" class="viewer" role="dialog" aria-modal="true" aria-label="Page preview" hidden>
+<button type="button" id="scan-viewer-close" class="viewer-close" aria-label="Close preview">&times;</button>
+<img id="scan-viewer-img" alt="Page preview">
+</div>
+</div>
+{% endblock %}

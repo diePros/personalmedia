@@ -48,3 +48,6 @@ render("Versicherungsnummer 12345").save(os.path.join(HERE, "scan.png"))
 with open(os.path.join(HERE, "corrupt.pdf"), "wb") as f:
     f.write(b"%PDF-" + bytes((i * 37 + 11) % 256 for i in range(512)))
 open(os.path.join(HERE, "empty.pdf"), "wb").close()
+# JPEG scan pages for the scanner tests: one grayscale, one RGB.
+render("Versicherungsnummer 12345").save(os.path.join(HERE, "scan1.jpg"), quality=85)
+render("Kuendigungsfrist 67890").convert("RGB").save(os.path.join(HERE, "scan2.jpg"), quality=85)

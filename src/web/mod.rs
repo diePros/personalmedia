@@ -15,6 +15,7 @@ pub mod auth;
 pub mod docs;
 pub mod pwa;
 pub mod ratelimit;
+pub mod scan;
 pub mod session;
 pub mod settings;
 
@@ -283,6 +284,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(docs::routes(&state))
         .merge(settings::routes())
         .merge(pwa::routes(&state))
+        .merge(scan::routes(&state))
         .merge(crate::mcp::routes(&state))
         .merge(crate::oauth::routes())
         .route("/static/{file}", get(static_file))
@@ -615,6 +617,12 @@ const STATIC_FILES: &[(&str, &str, &[u8])] = &[
         include_bytes!("../../static/app.css"),
     ),
     ("app.js", JS, include_bytes!("../../static/app.js")),
+    (
+        "scan.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../../static/scan.css"),
+    ),
+    ("scan.js", JS, include_bytes!("../../static/scan.js")),
     (
         "htmx.min.js",
         JS,

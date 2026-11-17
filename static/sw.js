@@ -8,6 +8,8 @@ const OFFLINE = "/static/offline.html";
 const PRECACHE = [
   "/static/app.css",
   "/static/app.js",
+  "/static/scan.css",
+  "/static/scan.js",
   "/static/htmx.min.js",
   "/static/icons/icon.svg",
   "/static/icons/favicon.svg",

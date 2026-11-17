@@ -306,10 +306,10 @@ async fn manifest_lists_new_icons_and_start_url_scan() {
     ] {
         assert!(pre.contains(&e.to_owned()), "{e}");
     }
-    // /scan never 404s (until Task 30): it leads to the documents page / login.
+    // /scan leads to login (and back) without a session.
     let resp = t.get("/scan", &Client::anon()).await;
     assert_eq!(resp.status(), 303);
-    assert_eq!(header_str(&resp, "location"), "/documents");
+    assert_eq!(header_str(&resp, "location"), "/login?next=scan");
 }
 
 #[tokio::test(flavor = "multi_thread")]
