@@ -301,7 +301,7 @@ Tools involved:
 - `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute; this limit is kept in memory, so it resets when the server restarts.
 - `set_transcription { id, text, mode? }` stores the text (`replace`, the default, or `append`). It becomes the searchable text, is marked "transcribed by an AI assistant" on the document page and is indexed for semantic search again if that is enabled for the document.
 - `set_notes { id, notes }` sets the document's notes (see below).
-- `list_documents { needs_transcription: true }` lists only documents tagged `handwritten` that have no transcription yet. The documents page has the same **Needs transcription** filter. Your token's tag allow-list still applies, so it must include `handwritten`.
+- `list_documents { needs_transcription: true }` lists only documents tagged `handwritten` that have no transcription yet. The documents page has the same **Needs transcription** filter. If the token has a tag allow-list, it must include `handwritten`, otherwise the filter returns nothing.
 
 **Privacy:** page images leave your server and go to the AI provider of the assistant you connected, but only for documents that your token or app may read in full and whose MCP setting is `full`. Documents set to `metadata` or `off` for MCP, and tokens without full text access, never get page images. Images are rendered on demand in memory-backed scratch space, never cached and deleted right after.
 

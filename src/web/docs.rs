@@ -622,11 +622,13 @@ fn page_url(q: &ListQuery, page: u32) -> String {
         ("tag", &q.tag),
         ("from", &q.from),
         ("to", &q.to),
-        ("needs_transcription", &q.needs_transcription),
     ] {
         if let Some(v) = non_empty(v) {
             pairs.push((k, v));
         }
+    }
+    if needs_transcription_on(q) {
+        pairs.push(("needs_transcription", "1".into()));
     }
     pairs.push(("page", page.to_string()));
     format!(

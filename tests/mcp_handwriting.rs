@@ -600,6 +600,14 @@ async fn list_documents_needs_transcription_filter() {
     assert_eq!(all.as_array().unwrap().len(), 3);
 
     // A tag allow-list without `handwritten` still gates everything.
+    f.doc(
+        "both.bin",
+        "application/octet-stream",
+        b"both",
+        &["diary", "handwritten"],
+        Level::Full,
+    )
+    .await;
     let diary = f.token(Access::Read, Content::FullText, Some(&["diary"]));
     let (_, v) = f
         .call(
@@ -613,5 +621,5 @@ async fn list_documents_needs_transcription_filter() {
     let (_, v) = f
         .call(&hw, "list_documents", json!({"needs_transcription": true}))
         .await;
-    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v.as_array().unwrap().len(), 2);
 }

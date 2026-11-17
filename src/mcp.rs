@@ -739,7 +739,13 @@ async fn list_docs(p: &Principal, a: ListArgs) -> Result<Value, String> {
     f.offset = a.offset.unwrap_or(0);
     let p2 = p.clone();
     let docs = blocking(&p.unlocked, move |c| {
-        if !tags_filter_allowed(&p2, c, &f.tags_all)? {
+        // `needs_transcription` implicitly filters on the `handwritten` tag, so
+        // that tag must be allowed too (else it would leak tag membership).
+        let mut wanted = f.tags_all.clone();
+        if f.needs_transcription {
+            wanted.push("handwritten".into());
+        }
+        if !tags_filter_allowed(&p2, c, &wanted)? {
             return Ok(vec![]);
         }
         let mut docs = list_documents(c, &f)?;
