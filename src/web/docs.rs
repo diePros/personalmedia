@@ -984,6 +984,7 @@ fn parse_override(s: &str) -> Option<Option<Level>> {
 /// Exempt from the web-visibility check: the owner can always change access,
 /// including un-hiding a document.
 async fn set_access(
+    State(state): State<AppState>,
     CurrentUser(session): CurrentUser,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -1013,6 +1014,11 @@ async fn set_access(
         },
     )
     .await;
+    if matches!(result, Ok(Ok(Some(_)))) {
+        // Lowering already deleted vectors inside set_document_access.
+        let (queue, u, doc) = (state.queue.clone(), session.unlocked.clone(), id.clone());
+        let _ = tokio::task::spawn_blocking(move || queue.enqueue_embed_if_needed(&u, &doc)).await;
+    }
     match result {
         Ok(Ok(Some(Level::Off))) => redirect_to(&headers, "/documents"),
         Ok(Ok(Some(_))) => redirect_to(&headers, &format!("/documents/{id}")),

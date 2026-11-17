@@ -64,7 +64,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 1g
+    mem_limit: 1536m
     pids_limit: 256
     logging:
       driver: json-file
@@ -233,7 +233,7 @@ Treat the token like a key: it can unlock your documents within its scope. If it
 
 *Manual owner check, still outstanding:* share a file from a real Android phone with the installed app, both while logged in and after the session expired, and note here whether the session cookie arrived and what `Sec-Fetch-Site` was. This cannot be checked from the test suite. Offline, a share is simply lost (the browser shows its own error page); the service worker never intercepts the `POST`.
 
-*Memory:* staged shares live in RAM only, counted while the upload streams in: anonymous 25 MiB in total, `PM_MAX_UPLOAD_MB` per logged-in user, and twice `PM_MAX_UPLOAD_MB` for everything together, with at most two share uploads read at a time. Keep that well below the container's `mem_limit` (1 GiB in the shipped compose file); with the default 100 MB it peaks at about 200 MB.
+*Memory:* staged shares live in RAM only, counted while the upload streams in: anonymous 25 MiB in total, `PM_MAX_UPLOAD_MB` per logged-in user, and twice `PM_MAX_UPLOAD_MB` for everything together, with at most two share uploads read at a time. Keep that well below the container's `mem_limit` (1.5 GiB in the shipped compose file); with the default 100 MB it peaks at about 200 MB.
 
 ## 8. Backups
 

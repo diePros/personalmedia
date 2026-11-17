@@ -958,3 +958,78 @@ async fn token_form_new_restricted_tag() {
         before
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lowering_semantic_index_in_web_requests_deletes_vectors_before_response() {
+    use personal_media::embed::{Chunk, MODEL};
+    use personal_media::user_db::vectors::{replace_vectors, vector_count};
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let id = upload_named(&t, &c, "v.pdf", PDF, "Vectors").await;
+    let store = |u: &std::sync::Arc<personal_media::keyring::Unlocked>| {
+        u.with_db(|conn| {
+            set_document_access(conn, &id, Channel::SemanticIndex, Some(Level::Full)).unwrap();
+            replace_vectors(
+                conn,
+                &id,
+                MODEL.name,
+                &[(Chunk { start: 0, end: 1 }, vec![0.5; 384])],
+            )
+            .unwrap();
+            vector_count(conn, &id).unwrap()
+        })
+    };
+    // Per-document override lowered through the page's form.
+    assert_eq!(store(&u), 1);
+    let resp = t
+        .post_form(
+            &format!("/documents/{id}/access"),
+            &[
+                ("web", "default"),
+                ("mcp", "default"),
+                ("semantic_index", "metadata"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(u.with_db(|conn| vector_count(conn, &id).unwrap()), 0);
+
+    // Default lowered through settings.
+    u.with_db(|conn| {
+        set_document_access(conn, &id, Channel::SemanticIndex, None).unwrap();
+        personal_media::user_db::set_access_defaults(
+            conn,
+            &personal_media::user_db::AccessDefaults(
+                [
+                    (Channel::Web, Level::Full),
+                    (Channel::Mcp, Level::Metadata),
+                    (Channel::SemanticIndex, Level::Full),
+                ]
+                .into(),
+            ),
+        )
+        .unwrap();
+        replace_vectors(
+            conn,
+            &id,
+            MODEL.name,
+            &[(Chunk { start: 0, end: 1 }, vec![0.5; 384])],
+        )
+        .unwrap();
+    });
+    let resp = t
+        .post_form(
+            "/settings/access",
+            &[
+                ("web", "full"),
+                ("mcp", "metadata"),
+                ("semantic_index", "off"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(u.with_db(|conn| vector_count(conn, &id).unwrap()), 0);
+}

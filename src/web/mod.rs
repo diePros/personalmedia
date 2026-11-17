@@ -33,7 +33,8 @@ use axum::routing::get;
 use crate::accounts::Accounts;
 use crate::config::Config;
 use crate::documents::Documents;
-use crate::extract::{ExtractConfig, ExtractQueue, start_workers, wipe_tmp};
+use crate::embed::Engine;
+use crate::extract::{EmbedRuntime, ExtractConfig, ExtractQueue, start_workers, wipe_tmp};
 use crate::keyring::Keyring;
 use crate::system_db::{SYSTEM_DB_FILE, SystemDb};
 use crate::tokens::TokenCache;
@@ -61,6 +62,10 @@ pub struct AppState {
     pub keyring: Arc<Keyring>,
     pub accounts: Arc<Accounts>,
     pub docs: Arc<Documents>,
+    /// Extraction and embedding jobs.
+    pub queue: ExtractQueue,
+    /// The one embedding engine, shared with the workers.
+    pub engine: Arc<Engine>,
     pub sessions: Arc<SessionStore>,
     /// Shared files waiting for review (`/share`); memory only.
     pub shared: Arc<SharedStaging>,
@@ -74,6 +79,9 @@ pub struct AppState {
     /// Bodies of `POST /share` being read at once (try-acquire, 503 when full).
     pub share_permits: Arc<Semaphore>,
 }
+
+/// The embedding model is unloaded after this long without use.
+const EMBED_IDLE: Duration = Duration::from_secs(10 * 60);
 
 /// Concurrent MCP uploads.
 const MCP_WRITE_PERMITS: usize = 2;
@@ -89,17 +97,23 @@ impl AppState {
         std::fs::create_dir_all(&data_dir)?;
         let sys = Arc::new(SystemDb::open(&data_dir.join(SYSTEM_DB_FILE))?);
         let (queue, rx) = ExtractQueue::channel();
+        let engine = Arc::new(Engine::new(cfg.models_dir.clone(), EMBED_IDLE));
+        engine.start_idle_reaper();
         let keyring = Arc::new(Keyring::new(data_dir.clone(), Arc::new(queue.clone())));
         let accounts = Arc::new(Accounts::new(&cfg, sys.clone(), keyring.clone()));
         let docs = Arc::new(Documents::new(
             data_dir.clone(),
             cfg.max_upload_bytes,
-            Arc::new(queue),
+            Arc::new(queue.clone()),
         ));
 
         let tmp = data_dir.join("tmp");
         wipe_tmp(&tmp)?;
-        start_workers(cfg.ocr_workers, ExtractConfig::new(tmp), docs.clone(), rx);
+        let extract_cfg = ExtractConfig::new(tmp).with_embed(EmbedRuntime {
+            engine: engine.clone(),
+            hook: None,
+        });
+        start_workers(cfg.ocr_workers, extract_cfg, docs.clone(), rx);
 
         let sessions = Arc::new(SessionStore::new(cfg.session_idle, cfg.session_max));
         let shared = Arc::new(SharedStaging::new(
@@ -116,6 +130,8 @@ impl AppState {
             keyring,
             accounts,
             docs,
+            queue,
+            engine,
             sessions,
             shared,
             limiter,

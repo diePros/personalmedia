@@ -98,12 +98,47 @@ pub fn get_access_defaults(conn: &Connection) -> Result<AccessDefaults> {
     }
 }
 
+/// Runs `f` inside a savepoint (works with or without an open transaction).
+fn atomically(conn: &Connection, f: impl FnOnce() -> Result<()>) -> Result<()> {
+    conn.execute_batch("SAVEPOINT access_change;")?;
+    match f() {
+        Ok(()) => Ok(conn.execute_batch("RELEASE access_change;")?),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO access_change; RELEASE access_change;");
+            Err(e)
+        }
+    }
+}
+
+/// Lowering `semantic_index` deletes the affected vectors in the same
+/// operation. Raising it only changes the setting: the caller enqueues
+/// embedding (`ExtractQueue::enqueue_embeds_needed`).
 pub fn set_access_defaults(conn: &Connection, defaults: &AccessDefaults) -> Result<()> {
-    set_setting(conn, DEFAULTS_KEY, &serde_json::to_string(defaults)?)
+    atomically(conn, || {
+        set_setting(conn, DEFAULTS_KEY, &serde_json::to_string(defaults)?)?;
+        super::vectors::enforce_all(conn)
+    })
 }
 
 /// `None` removes the override (document follows the default again).
+/// Lowering `semantic_index` deletes the document's vectors in the same
+/// operation; raising it needs the caller to enqueue embedding.
 pub fn set_document_access(
+    conn: &Connection,
+    doc_id: &str,
+    channel: Channel,
+    level: Option<Level>,
+) -> Result<()> {
+    atomically(conn, || {
+        write_document_access(conn, doc_id, channel, level)?;
+        if channel == Channel::SemanticIndex {
+            super::vectors::enforce_document(conn, doc_id)?;
+        }
+        Ok(())
+    })
+}
+
+fn write_document_access(
     conn: &Connection,
     doc_id: &str,
     channel: Channel,

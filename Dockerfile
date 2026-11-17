@@ -26,7 +26,13 @@ COPY tests ./tests
 # Make sure cargo rebuilds the crate itself over the dummy artifacts.
 RUN touch src/main.rs src/lib.rs
 
-# Tests run with output shown; an OCR test that printed SKIP fails the build.
+# The embedding model is fetched here for the tests only (needs network access
+# to huggingface.co and cdn.pyke.io). It lives in a build-stage directory and is
+# never copied into the runtime stage; the app downloads it into /data/models.
+ENV PM_TEST_MODELS_DIR=/opt/test-models
+RUN cargo run --release --locked -- fetch-model --data /opt/test-models
+
+# Tests run with output shown; an OCR or model test that printed SKIP fails the build.
 RUN cargo test --release --locked -- --nocapture > /tmp/test.log 2>&1; rc=$?; \
     tail -n 40 /tmp/test.log; \
     [ "$rc" -eq 0 ] || exit 1; \

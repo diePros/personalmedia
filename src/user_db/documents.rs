@@ -472,6 +472,12 @@ pub fn set_text(
             tx.execute("DELETE FROM document_text WHERE document_id = ?1", [id])?;
         }
     }
+    // New text invalidates its vectors; the caller re-enqueues embedding.
+    tx.execute("DELETE FROM chunk_vectors WHERE document_id = ?1", [id])?;
+    tx.execute(
+        "UPDATE documents SET embed_status = 'none' WHERE id = ?1",
+        [id],
+    )?;
     reindex(&tx, id)?;
     tx.commit()?;
     Ok(())

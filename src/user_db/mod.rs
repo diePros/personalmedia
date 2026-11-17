@@ -12,6 +12,7 @@ use crate::crypto::Key32;
 pub mod access;
 pub mod documents;
 pub mod meta;
+pub mod vectors;
 
 pub use access::{
     AccessDefaults, AccessFilter, Channel, Level, document_overrides, effective_level,
@@ -28,7 +29,8 @@ pub use meta::{
     insert_token_meta, list_token_meta, set_setting, touch_token,
 };
 
-const SCHEMA_V1: &str = "
+#[doc(hidden)]
+pub const SCHEMA_V1: &str = "
 CREATE TABLE documents (
     id TEXT PRIMARY KEY,
     wrapped_dek BLOB NOT NULL,
@@ -76,6 +78,21 @@ CREATE TABLE token_meta (
 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// v2 (v1.2): encrypted chunk vectors for semantic search.
+const MIGRATION_V2: &str = "
+CREATE TABLE chunk_vectors (
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_no INTEGER NOT NULL,
+    start INTEGER NOT NULL,
+    end INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    vector BLOB NOT NULL,
+    PRIMARY KEY(document_id, chunk_no)
+);
+ALTER TABLE documents ADD COLUMN embed_status TEXT NOT NULL DEFAULT 'none';
+PRAGMA user_version = 2;
+";
+
 /// Open (creating if needed) the user's SQLCipher index with a raw key, and migrate.
 pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
     let conn = Connection::open(path).context("opening user db")?;
@@ -93,6 +110,25 @@ pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
         conn.execute_batch(&format!(
             "BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"
         ))?;
+    }
+    if version < 2 {
+        // Re-checked inside the write transaction so a concurrent opener
+        // cannot apply the migration twice.
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<()> {
+            let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if v < 2 {
+                conn.execute_batch(MIGRATION_V2)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(e.context("migrating user db to v2"));
+            }
+        }
     }
     Ok(conn)
 }

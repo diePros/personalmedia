@@ -415,8 +415,14 @@ async fn set_defaults(
         .into(),
     );
     let u = session.unlocked.clone();
+    let u2 = u.clone();
     match blocking(move || u.with_db(|c| set_access_defaults(c, &defaults))).await {
-        Ok(Ok(())) => redirect(&headers, "/settings?notice=access"),
+        Ok(Ok(())) => {
+            // Lowering already deleted vectors inside set_access_defaults.
+            let queue = state.queue.clone();
+            let _ = blocking(move || queue.enqueue_embeds_needed(&u2)).await;
+            redirect(&headers, "/settings?notice=access")
+        }
         Ok(Err(e)) => internal(e),
         Err(r) => r,
     }

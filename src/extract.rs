@@ -9,11 +9,42 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, WeakUnboundedSender};
 
 use crate::documents::{Documents, Enqueue};
+use crate::embed::{Chunk, Engine, MODEL};
 use crate::keyring::{OnUnlock, Unlocked};
-use crate::user_db::{TextStatus, pending_document_ids, set_text};
+use crate::user_db::vectors::{
+    docs_needing_embedding, needs_embedding, replace_vectors_guarded, set_embed_status,
+};
+use crate::user_db::{TextStatus, get_document_text, pending_document_ids, set_text};
+
+/// Chunks embedded per `embed_passages` call.
+pub const EMBED_BATCH: usize = 16;
+
+/// Test instrumentation points inside an embed job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedEvent {
+    /// A batch of this many chunks was just embedded.
+    Batch(usize),
+    /// All vectors are computed; the guarded write comes next.
+    BeforeCommit,
+}
+
+pub type EmbedHookFn = dyn Fn(EmbedEvent) + Send + Sync;
+
+/// The shared embedding engine plus an optional test hook.
+#[derive(Clone)]
+pub struct EmbedRuntime {
+    pub engine: Arc<Engine>,
+    pub hook: Option<Arc<EmbedHookFn>>,
+}
+
+impl std::fmt::Debug for EmbedRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbedRuntime").finish_non_exhaustive()
+    }
+}
 
 const PDFINFO_TIMEOUT: Duration = Duration::from_secs(30);
 const PDFTOTEXT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -53,6 +84,8 @@ pub struct ExtractConfig {
     pub max_pages: u32,
     pub job_timeout: Duration,
     pub limits: ChildLimits,
+    /// Without it embed jobs are skipped.
+    pub embed: Option<EmbedRuntime>,
 }
 
 impl ExtractConfig {
@@ -62,7 +95,13 @@ impl ExtractConfig {
             max_pages: 200,
             job_timeout: Duration::from_secs(30 * 60),
             limits: ChildLimits::default(),
+            embed: None,
         }
+    }
+
+    pub fn with_embed(mut self, embed: EmbedRuntime) -> ExtractConfig {
+        self.embed = Some(embed);
+        self
     }
 }
 
@@ -401,28 +440,76 @@ pub fn extract_text(
     res.map_err(ExtractError::Failed)
 }
 
-type Job = (Arc<Unlocked>, String);
+enum Job {
+    Extract(Arc<Unlocked>, String),
+    Embed(Arc<Unlocked>, String),
+}
 
 #[derive(Clone)]
 pub struct ExtractQueue {
     tx: UnboundedSender<Job>,
 }
 
-pub struct ExtractReceiver(Arc<tokio::sync::Mutex<UnboundedReceiver<Job>>>);
+pub struct ExtractReceiver {
+    rx: Arc<tokio::sync::Mutex<UnboundedReceiver<Job>>>,
+    /// Weak so workers still end when every queue handle is dropped.
+    tx: WeakUnboundedSender<Job>,
+}
 
 impl ExtractQueue {
     pub fn channel() -> (ExtractQueue, ExtractReceiver) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let weak = tx.downgrade();
         (
             ExtractQueue { tx },
-            ExtractReceiver(Arc::new(tokio::sync::Mutex::new(rx))),
+            ExtractReceiver {
+                rx: Arc::new(tokio::sync::Mutex::new(rx)),
+                tx: weak,
+            },
         )
+    }
+
+    /// Enqueue embedding of one document if it needs it (effective
+    /// `semantic_index` full, text done, no vectors for the current model).
+    pub fn enqueue_embed_if_needed(&self, u: &Arc<Unlocked>, doc_id: &str) {
+        match u.with_db(|c| {
+            let need = needs_embedding(c, doc_id, MODEL.name)?;
+            if need {
+                set_embed_status(c, doc_id, "pending")?;
+            }
+            anyhow::Ok(need)
+        }) {
+            Ok(true) => {
+                let _ = self.tx.send(Job::Embed(u.clone(), doc_id.to_string()));
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!(doc_id, error = %e, "could not check embedding need"),
+        }
+    }
+
+    /// Enqueue every document that needs vectors. Call after anything that
+    /// may raise `semantic_index` (overrides, defaults) and on unlock.
+    pub fn enqueue_embeds_needed(&self, u: &Arc<Unlocked>) {
+        match u.with_db(|c| {
+            let ids = docs_needing_embedding(c, MODEL.name)?;
+            for id in &ids {
+                set_embed_status(c, id, "pending")?;
+            }
+            anyhow::Ok(ids)
+        }) {
+            Ok(ids) => {
+                for id in ids {
+                    let _ = self.tx.send(Job::Embed(u.clone(), id));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not list documents needing embedding"),
+        }
     }
 }
 
 impl Enqueue for ExtractQueue {
     fn enqueue(&self, u: Arc<Unlocked>, doc_id: String) {
-        let _ = self.tx.send((u, doc_id));
+        let _ = self.tx.send(Job::Extract(u, doc_id));
     }
 }
 
@@ -436,6 +523,7 @@ impl OnUnlock for ExtractQueue {
             }
             Err(e) => tracing::warn!(error = %e, "could not list pending documents"),
         }
+        self.enqueue_embeds_needed(u);
     }
 }
 
@@ -451,18 +539,28 @@ pub fn start_workers(n: usize, cfg: ExtractConfig, docs: Arc<Documents>, rx: Ext
     for _ in 0..n.max(1) {
         let cfg = cfg.clone();
         let docs = docs.clone();
-        let rx = rx.0.clone();
+        let (rx, weak_tx) = (rx.rx.clone(), rx.tx.clone());
         tokio::spawn(async move {
             loop {
                 let job = rx.lock().await.recv().await;
-                let Some((u, id)) = job else { break };
-                run_job(&docs, &cfg, u, id).await;
+                match job {
+                    None => break,
+                    Some(Job::Extract(u, id)) => {
+                        if run_job(&docs, &cfg, u.clone(), id.clone()).await
+                            && let Some(tx) = weak_tx.upgrade()
+                        {
+                            ExtractQueue { tx }.enqueue_embed_if_needed(&u, &id);
+                        }
+                    }
+                    Some(Job::Embed(u, id)) => run_embed_job(&cfg, u, id).await,
+                }
             }
         });
     }
 }
 
-async fn run_job(docs: &Arc<Documents>, cfg: &ExtractConfig, u: Arc<Unlocked>, id: String) {
+/// Returns true if text extraction finished with `Done` and was stored.
+async fn run_job(docs: &Arc<Documents>, cfg: &ExtractConfig, u: Arc<Unlocked>, id: String) -> bool {
     let (docs2, cfg2, u2, id2) = (docs.clone(), cfg.clone(), u.clone(), id.clone());
     let res = tokio::task::spawn_blocking(move || {
         let dir = make_job_dir(&cfg2.tmp_dir).map_err(|e| ExtractError::Failed(e.to_string()))?;
@@ -488,7 +586,82 @@ async fn run_job(docs: &Arc<Documents>, cfg: &ExtractConfig, u: Arc<Unlocked>, i
     };
     if let Err(e) = u.with_db(|c| set_text(c, &id, status, text, pages, now_secs())) {
         tracing::warn!(doc_id = %id, error = %e, "could not store extraction result");
-        return;
+        return false;
     }
     tracing::info!(doc_id = %id, outcome, "extraction finished");
+    status == TextStatus::Done
+}
+
+async fn run_embed_job(cfg: &ExtractConfig, u: Arc<Unlocked>, id: String) {
+    let Some(rt) = cfg.embed.clone() else {
+        return;
+    };
+    let started = Instant::now();
+    let (u2, id2) = (u.clone(), id.clone());
+    let res = tokio::task::spawn_blocking(move || embed_document(&rt, &u2, &id2))
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("worker panicked")));
+    match res {
+        Ok(outcome) => tracing::info!(
+            doc_id = %id,
+            outcome,
+            ms = started.elapsed().as_millis() as u64,
+            "embedding finished"
+        ),
+        Err(e) => {
+            // Only the outcome is logged (the error may name model files, never text).
+            tracing::warn!(doc_id = %id, error = %e, "embedding failed");
+            let _ = u.with_db(|c| set_embed_status(c, &id, "failed"));
+        }
+    }
+}
+
+/// Byte offset of every character boundary of `text` (plus the end).
+fn char_boundaries(text: &str) -> Vec<usize> {
+    let mut v: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    v.push(text.len());
+    v
+}
+
+/// Embeds one document and stores its vectors. Blocking.
+fn embed_document(rt: &EmbedRuntime, u: &Arc<Unlocked>, id: &str) -> anyhow::Result<&'static str> {
+    // Eligibility is re-checked now, the job may have waited in the queue.
+    let text = u.with_db(|c| {
+        if !needs_embedding(c, id, MODEL.name)? {
+            return anyhow::Ok(None);
+        }
+        let text = get_document_text(c, id)?;
+        if text.is_some() {
+            set_embed_status(c, id, "pending")?;
+        }
+        anyhow::Ok(text)
+    })?;
+    let Some(text) = text else {
+        return Ok("skipped");
+    };
+    let chunks: Vec<Chunk> = rt.engine.chunk(&text)?;
+    let bounds = char_boundaries(&text);
+    let mut items: Vec<(Chunk, Vec<f32>)> = Vec::with_capacity(chunks.len());
+    for batch in chunks.chunks(EMBED_BATCH) {
+        let passages: Vec<&str> = batch
+            .iter()
+            .map(|c| &text[bounds[c.start]..bounds[c.end]])
+            .collect();
+        let vectors = rt.engine.embed_passages(&passages)?;
+        anyhow::ensure!(vectors.len() == batch.len(), "embedding count mismatch");
+        if let Some(h) = &rt.hook {
+            h(EmbedEvent::Batch(batch.len()));
+        }
+        items.extend(batch.iter().copied().zip(vectors));
+    }
+    if let Some(h) = &rt.hook {
+        h(EmbedEvent::BeforeCommit);
+    }
+    let stored = u.with_db(|c| replace_vectors_guarded(c, id, MODEL.name, &text, &items))?;
+    if !stored {
+        // Level lowered, text changed or document gone: nothing is kept.
+        // A raise that happened meanwhile enqueued its own job.
+        return Ok("discarded");
+    }
+    Ok("done")
 }
