@@ -233,6 +233,57 @@ Each user decides, per **access channel**, how much of a document that channel m
 - **Storage:** defaults go in `settings` and overrides in a `document_access(document_id, channel, level)` table, both inside the encrypted index DB.
 - **`web = off` semantics:** **OPEN, owner to decide**: hidden from the web UI entirely, or listed but locked behind re-entering the password, or `off` not allowed for `web`.
 
+## 13b. OAuth for MCP (v1.4, approved by owner 2026-11-17)
+
+Clients: **claude.ai custom connectors** and **Hermes** (`auth: oauth`). Static `pm_…` tokens keep working.
+
+**User flow**
+- The user adds `{PM_PUBLIC_URL}/mcp` as a connector.
+- The client opens PMS's `/oauth/authorize` in the browser. The user logs in if needed.
+- A consent page shows "{client name} wants access to your documents" and the redirect URI's host, prominently. The user picks:
+  - read or read+write
+  - metadata only or full text
+  - an optional tag restriction (existing or new tag)
+- On approval, the client is connected. Settings → **Connected apps** lists each grant (client name, scope, created, last used) with a Revoke button.
+
+**Protocol** (Claude connector requirements + MCP authorization spec)
+- An unauthenticated or invalid request to `/mcp` gets `401` with `WWW-Authenticate: Bearer resource_metadata="{PM_PUBLIC_URL}/.well-known/oauth-protected-resource"`.
+- Protected resource metadata (RFC 9728): `resource` = `{PM_PUBLIC_URL}/mcp` exactly; `authorization_servers` = [`{PM_PUBLIC_URL}`]; `scopes_supported`.
+- Authorization server metadata (RFC 8414) at `/.well-known/oauth-authorization-server`:
+  - `registration_endpoint`
+  - `code_challenge_methods_supported: ["S256"]`
+  - `token_endpoint_auth_methods_supported: ["none"]`
+  - grant types `authorization_code` and `refresh_token`
+  - `scopes_supported` including `offline_access`
+  - `client_id_metadata_document_supported` **not** advertised (see below)
+- Dynamic Client Registration (RFC 7591) for public clients only.
+- Authorization code + PKCE S256 is mandatory; `state` is passed through.
+- `/oauth/token` accepts `application/x-www-form-urlencoded`. Refresh tokens rotate; an invalid one returns `invalid_grant`.
+- Revocation endpoint (RFC 7009).
+- Discovery, registration and token responses must be fast (< 1 s server-side); Anthropic gives them 10 s end to end.
+
+**No outbound requests:** only DCR is supported, not Client ID Metadata Documents. CIMD would make PMS fetch client metadata from the internet, and both Claude and Hermes fall back to DCR.
+
+**Redirect URIs allowed at registration**
+- `https://claude.ai/api/mcp/auth_callback`
+- `https://claude.com/api/mcp/auth_callback`
+- loopback `http://127.0.0.1:{any}/…` and `http://localhost:{any}/…` (Hermes, Claude Code)
+- any HTTPS host listed in `PM_OAUTH_EXTRA_REDIRECT_HOSTS` (comma-separated)
+
+Everything else is rejected at registration and again at authorize.
+
+**Key handling (keeps §5's promise)**
+- At consent the user is unlocked. PMS generates a refresh secret and an access secret and wraps the UMK under each, exactly like `pm_` tokens (`secret_kek`, AAD bound to the token id).
+- Access tokens live 1 hour. Refresh tokens live 30 days and are single-use: refreshing unlocks with the refresh secret, issues a new pair, and deletes the old rows.
+- The authorization code maps, in memory only, to the freshly minted pair for 60 s. It's single-use and bound to `client_id`, `redirect_uri` and the PKCE challenge.
+- Grant metadata (client id and name, scope, tag allow-list, timestamps) lives in the user's encrypted index DB, next to `pm_` token metadata.
+- `system.db` holds only token id → user id, the wrap, expiry, kind and grant id.
+
+**Abuse limits**
+- DCR is rate-limited per IP: 10 per hour.
+- At most 200 registered clients; clients without a grant are pruned after 24 h.
+- The authorize and consent pages require a session and CSRF, and cannot be framed.
+
 ## 14. Security hardening (required because the app is public)
 
 - Invite-only registration, with no other signup path.
