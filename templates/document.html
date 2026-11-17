@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ title }} · PMS{% endblock %}
 {% block content %}
-<p><a href="/documents">Back to documents</a></p>
+<p><a class="action-link" href="/documents">Back to documents</a></p>
 <h1>{{ title }}</h1>
 
 {% if preview_pdf -%}
@@ -24,7 +24,7 @@
 </dl>
 
 {% if full -%}
-<p><a class="button" href="/documents/{{ id }}/download">Download</a></p>
+<p><a class="button action-link" href="/documents/{{ id }}/download">Download</a></p>
 {% else -%}
 <p class="notice">The web view of this document is limited to its metadata. Change the access below to see more.</p>
 {% endif -%}

@@ -328,52 +328,37 @@ async fn non_standalone_layout_unchanged() {
     assert!(html.contains(header), "{html}");
     // The tab bar sits after <main>, so it cannot move the header or content.
     assert!(html.find("</main>").unwrap() < html.find("class=\"tabbar\"").unwrap());
-    // CSS: hidden by default, shown and the header hidden only when standalone.
+    // CSS: the shell is driven by custom properties declared on :root. The
+    // defaults keep the tab bar hidden and the header and nav shown; only the
+    // phone breakpoint, `.standalone` and the display-mode query switch them.
     let css = include_str!("../static/app.css");
-    let tab_rule = css.split(".tabbar {").nth(1).expect(".tabbar rule");
-    assert!(
-        tab_rule
-            .split('}')
-            .next()
-            .unwrap()
-            .contains("display: none")
-    );
-    let standalone: Vec<&str> = css
-        .split("@media (display-mode: standalone)")
-        .skip(1)
-        .collect();
-    assert!(!standalone.is_empty());
-    assert!(css.contains(".standalone .site-header"));
-    assert!(css.contains(".standalone .tabbar"));
-    // Outside the standalone media block, only `.standalone`-scoped rules may
-    // hide the header.
-    let mut plain = String::new();
-    let mut rest = css;
-    while let Some(i) = rest.find("@media (display-mode: standalone)") {
-        plain.push_str(&rest[..i]);
-        let mut depth = 0;
-        let mut end = rest.len();
-        for (k, ch) in rest[i..].char_indices() {
-            match ch {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i + k + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        rest = &rest[end..];
-    }
-    plain.push_str(rest);
-    for rule in plain.split('}') {
-        if rule.contains(".site-header") && rule.contains("display: none") {
-            assert!(rule.contains(".standalone"), "{rule}");
-        }
-    }
+    let root = css
+        .split(":root {\n  --tabbar-display")
+        .nth(1)
+        .expect("shell defaults");
+    let root = root.split('}').next().unwrap();
+    assert!(root.contains(": none"));
+    assert!(root.contains("--header-display: flex"));
+    assert!(root.contains("--nav-display: flex"));
+    assert!(root.contains("--account-display: none"));
+    assert!(css.contains("display: var(--tabbar-display)"));
+    assert!(css.contains("display: var(--header-display)"));
+    // The tab bar rules exist once: no per-mode copy of them.
+    assert_eq!(css.matches(".tabbar {").count(), 1);
+    assert!(css.contains(":root.standalone {"));
+    assert!(css.contains("@media (display-mode: standalone) {\n  :root {"));
+    // The phone browser keeps the header (brand only), so only standalone
+    // modes may set --header-display: none.
+    let phone = css
+        .split("@media (max-width: 40rem) {\n  :root {")
+        .nth(1)
+        .expect("phone shell")
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(phone.contains("--tabbar-display: flex"));
+    assert!(phone.contains("--nav-display: none"));
+    assert!(!phone.contains("--header-display"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -562,10 +547,10 @@ async fn standalone_settings_has_logout_and_admin_for_admins() {
         .unwrap();
     assert!(block.contains("action=\"/logout\""));
     assert!(block.contains("href=\"/admin\""));
-    // Only the installed app shows it; the header already has these links.
+    // Shown only where the header nav is not (installed app, phone browser).
     let css = include_str!("../static/app.css");
-    assert!(css.contains(".account-standalone {\n  display: none;"));
-    assert!(css.contains(".standalone .account-standalone"));
+    assert!(css.contains("--account-display: none;"));
+    assert!(css.contains("display: var(--account-display)"));
     // Signed-out: the browser header is unchanged.
     assert!(html.contains("class=\"site-header\""));
 }
