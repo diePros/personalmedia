@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Scan · PMS{% endblock %}
-{% block head %}<link rel="stylesheet" href="/static/scan.css">
-<script src="/static/scan.js" defer></script>
+{% block head %}<link rel="stylesheet" href="/static/scan.css?v={{ page.v() }}">
+<script src="/static/scan.js?v={{ page.v() }}" defer></script>
 {% endblock %}
 {% block content %}
 <div id="scan-app" class="scan">

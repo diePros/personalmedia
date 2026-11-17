@@ -51,9 +51,9 @@ async fn base_template_carries_csrf_meta_and_nav() {
     assert!(html.contains(
         r#"<meta name="htmx-config" content='{"includeIndicatorStyles":false,"allowEval":false,"historyCacheSize":0,"allowScriptTags":false}'>"#
     ));
-    assert!(html.contains(r#"href="/static/app.css""#));
-    assert!(html.contains(r#"src="/static/htmx.min.js""#));
-    assert!(html.contains(r#"src="/static/app.js""#));
+    assert!(html.contains(r#"href="/static/app.css?v="#));
+    assert!(html.contains(r#"src="/static/htmx.min.js?v="#));
+    assert!(html.contains(r#"src="/static/app.js?v="#));
     assert!(html.contains(r#"action="/logout""#));
     assert!(
         !html.contains(r#"href="/admin""#),

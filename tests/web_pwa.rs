@@ -273,10 +273,10 @@ async fn favicon_and_icons_served_with_correct_types() {
     // The pages link them.
     let html = body_string(t.get("/login", &Client::anon()).await).await;
     for needle in [
-        r#"rel="icon" type="image/svg+xml" href="/static/icons/favicon.svg""#,
-        r#"href="/static/icons/favicon-32.png""#,
-        r#"href="/static/icons/favicon-16.png""#,
-        r#"rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png""#,
+        r#"rel="icon" type="image/svg+xml" href="/static/icons/favicon.svg?v="#,
+        r#"href="/static/icons/favicon-32.png?v="#,
+        r#"href="/static/icons/favicon-16.png?v="#,
+        r#"rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png?v="#,
     ] {
         assert!(html.contains(needle), "{needle}");
     }

@@ -416,3 +416,51 @@ async fn scan_end_to_end_ocr_search() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_page_csp_allows_blob_images_only_there() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let scan = t.get("/scan", &c).await;
+    assert!(header_str(&scan, "content-security-policy").contains("img-src 'self' data: blob:"));
+    let docs = t.get("/documents", &c).await;
+    assert!(!header_str(&docs, "content-security-policy").contains("blob:"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn static_urls_are_versioned() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let v = &*personal_media::web::ASSET_VERSION;
+    for path in ["/documents", "/scan"] {
+        let html = body_string(t.get(path, &c).await).await;
+        for url in [
+            "/static/app.css",
+            "/static/htmx.min.js",
+            "/static/app.js",
+            "/static/icons/favicon.svg",
+            "/static/icons/apple-touch-icon.png",
+            "/manifest.webmanifest",
+        ] {
+            assert!(html.contains(&format!("\"{url}?v={v}\"")), "{path} {url}");
+        }
+        assert!(!html.contains("\"/static/app.css\""));
+    }
+    let scan = body_string(t.get("/scan", &c).await).await;
+    assert!(scan.contains(&format!("\"/static/scan.js?v={v}\"")));
+    assert!(scan.contains(&format!("\"/static/scan.css?v={v}\"")));
+    // The handlers ignore the query string.
+    for path in [
+        "/static/app.js",
+        "/static/icons/favicon.svg",
+        "/manifest.webmanifest",
+    ] {
+        let resp = t.get(&format!("{path}?v={v}"), &Client::anon()).await;
+        assert_eq!(resp.status(), 200, "{path}");
+    }
+    // The service worker matches precached assets by pathname, so versioned
+    // requests hit the unversioned PRECACHE entries.
+    let sw = include_str!("../static/sw.js");
+    assert!(sw.contains("PRECACHE.indexOf(url.pathname)"));
+    assert!(sw.contains("caches.match(url.pathname)"));
+}

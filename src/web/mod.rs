@@ -373,6 +373,11 @@ pub struct Page {
 }
 
 impl Page {
+    /// Cache-busting token for `/static` URLs (`?v=...`).
+    pub fn v(&self) -> &'static str {
+        ASSET_VERSION.as_str()
+    }
+
     /// A page for visitors without a session (login, signup, recover).
     pub fn anonymous() -> Page {
         Page {

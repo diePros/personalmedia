@@ -18,7 +18,7 @@ use zeroize::Zeroizing;
 
 use super::docs::{db, doc_error, json_error, now, parse_tags, read_text_field, web_filter};
 use super::session::{AuthRejection, CurrentUser};
-use super::{AppState, Page, render};
+use super::{AppState, CSP, CspOverride, Page, render};
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::pdf::jpegs_to_pdf;
 use crate::user_db::documents::list_documents;
@@ -77,10 +77,14 @@ async fn scan_page(user: Result<CurrentUser, AuthRejection>) -> Response {
         }
         Err(resp) => return resp,
     };
-    render(&ScanPage {
+    let mut resp = render(&ScanPage {
         page: Page::for_session(&session),
         tags,
-    })
+    });
+    // The page thumbnails are blob: URLs (in-memory photos).
+    resp.extensions_mut()
+        .insert(CspOverride(CSP.replace("data:", "data: blob:").into()));
+    resp
 }
 
 /// Distinct tags in order of first appearance (documents newest first),
