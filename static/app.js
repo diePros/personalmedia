@@ -15,6 +15,15 @@
     }
   });
 
+  // A 429 (a search by meaning already running) carries a message for the
+  // results area: show it instead of dropping the response.
+  document.addEventListener("htmx:beforeSwap", function (event) {
+    if (event.detail.xhr && event.detail.xhr.status === 429) {
+      event.detail.shouldSwap = true;
+      event.detail.isError = false;
+    }
+  });
+
   // fetch() with the CSRF token. Use this instead of fetch() for same-origin calls.
   window.pmFetch = function (url, options) {
     var opts = Object.assign({ credentials: "same-origin" }, options);

@@ -1,4 +1,6 @@
-{% if results.rows.is_empty() -%}
+{% if let Some(notice) = results.notice -%}
+<p class="muted">{{ notice|safe }}</p>
+{% else if results.rows.is_empty() -%}
 <p class="muted">{% if results.searching %}No documents match your search.{% else %}No documents yet.{% endif %}</p>
 {% else -%}
 <ul class="doc-list">
@@ -8,6 +10,7 @@
 <div class="muted doc-meta">
 {% if let Some(date) = row.date %}<span>{{ date }}</span>{% endif -%}
 {% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% endfor -%}
+{% if let Some(pct) = row.match_pct %}<span class="match" title="Relative match: compare results with each other">match {{ pct }}%</span>{% endif -%}
 {% if row.metadata_only %}<span>metadata only</span>{% endif -%}
 </div>
 {% if let Some(snippet) = row.snippet -%}

@@ -92,8 +92,26 @@ fn random_token() -> String {
 }
 
 /// In-memory sessions keyed by session id. A restart drops them all.
+/// Held while a session's search-by-meaning query runs.
+pub struct MeaningSlot {
+    store: Arc<SessionStore>,
+    id: String,
+}
+
+impl Drop for MeaningSlot {
+    fn drop(&mut self) {
+        self.store
+            .meaning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, Session>>,
+    /// Sessions with a search-by-meaning query running.
+    meaning: Mutex<HashSet<String>>,
     idle: Duration,
     max: Duration,
 }
@@ -103,9 +121,20 @@ impl SessionStore {
     pub fn new(idle: Duration, max: Duration) -> SessionStore {
         SessionStore {
             sessions: Mutex::new(HashMap::new()),
+            meaning: Mutex::new(HashSet::new()),
             idle,
             max,
         }
+    }
+
+    /// Claims the one search-by-meaning slot of session `id`; `None` when a
+    /// query of that session is already running. The slot frees on drop.
+    pub fn try_begin_meaning(self: &Arc<Self>, id: &str) -> Option<MeaningSlot> {
+        let mut set = self.meaning.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(id.to_owned()).then(|| MeaningSlot {
+            store: self.clone(),
+            id: id.to_owned(),
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Session>> {

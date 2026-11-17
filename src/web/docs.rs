@@ -34,7 +34,9 @@ use super::session::{AuthRejection, CsrfForm, CurrentUser, NoFields};
 use super::{AppState, CspOverride, Page, is_htmx, render};
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
+use crate::user_db::documents::get_document_text;
 use crate::user_db::vectors::embed_status_words;
+use crate::user_db::vectors::{has_candidates, search as vectors_search};
 use crate::user_db::{
     AccessFilter, Channel, Document, Level, ListFilter, TextStatus, document_overrides,
     effective_level, get_access_defaults, get_document, list_documents, list_tags_visible, search,
@@ -427,6 +429,8 @@ struct ListQuery {
     from: Option<String>,
     to: Option<String>,
     page: Option<String>,
+    /// `words` (default) or `meaning`.
+    mode: Option<String>,
 }
 
 fn non_empty(s: &Option<String>) -> Option<String> {
@@ -488,9 +492,13 @@ struct Row {
     /// Already HTML-escaped, with `<mark>` tags.
     snippet: Option<String>,
     metadata_only: bool,
+    /// Search by meaning only: the relative match, 0-100.
+    match_pct: Option<u32>,
 }
 
 struct ResultsView {
+    /// Replaces the list (search by meaning: model missing, nothing indexed).
+    notice: Option<&'static str>,
     rows: Vec<Row>,
     searching: bool,
     page_no: u32,
@@ -514,6 +522,36 @@ struct DocumentsPage {
     tag: String,
     from: String,
     to: String,
+    meaning: bool,
+}
+
+const MEANING_NO_MODEL: &str = "Search by meaning isn't available yet. Turn on the semantic index in Settings → Access defaults (or per document); the model downloads on first indexing.";
+const MEANING_NO_INDEX: &str = "No documents are indexed for meaning search yet.";
+const MEANING_BUSY: &str = "A search by meaning is already running. Try again in a moment.";
+/// Documents shown for a meaning query (no paging: every document has a score).
+const MEANING_LIMIT: usize = 20;
+/// Longest query embedded, in characters (as for the MCP tool).
+const MEANING_QUERY_MAX: usize = 1000;
+/// Longest passage shown, in characters.
+const MEANING_PASSAGE_MAX: usize = 300;
+
+/// `text[start..end]` by character offsets, cut to [`MEANING_PASSAGE_MAX`]
+/// characters (on a char boundary) with `…` appended when cut.
+fn passage_preview(text: &str, start: usize, end: usize) -> String {
+    let end = end.max(start);
+    let mut it = text.chars().skip(start).take(end - start);
+    let mut out: String = it.by_ref().take(MEANING_PASSAGE_MAX).collect();
+    if it.next().is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// A cosine score as a percentage. e5 scores are compressed (roughly
+/// 0.75-0.92 for related text), so this is only a relative indicator of how
+/// well results rank against each other, not a probability. Not rescaled.
+fn match_pct(score: f32) -> u32 {
+    (score * 100.0).round().clamp(0.0, 100.0) as u32
 }
 
 fn page_url(q: &ListQuery, page: u32) -> String {
@@ -535,7 +573,79 @@ fn page_url(q: &ListQuery, page: u32) -> String {
     )
 }
 
+/// Search by meaning: the results (or a notice) for `text`, never paged.
+async fn meaning_results(
+    state: &AppState,
+    session: &super::session::Session,
+    mut filter: ListFilter,
+    text: String,
+) -> Result<ResultsView, Response> {
+    let mut results = ResultsView {
+        notice: None,
+        rows: vec![],
+        searching: true,
+        page_no: 1,
+        prev_url: None,
+        next_url: None,
+    };
+    // Never download the model on a query.
+    let engine = state.engine.clone();
+    let probe = engine.clone();
+    let available = tokio::task::spawn_blocking(move || probe.is_available())
+        .await
+        .map_err(internal)?;
+    if !available {
+        results.notice = Some(MEANING_NO_MODEL);
+        return Ok(results);
+    }
+    filter.limit = 0;
+    filter.offset = 0;
+    // Nothing visible: answer without loading the model.
+    let f1 = filter.clone();
+    let any = db(&session.unlocked, move |c| has_candidates(c, &f1))
+        .await?
+        .map_err(internal)?;
+    if !any {
+        results.notice = Some(MEANING_NO_INDEX);
+        return Ok(results);
+    }
+    let text: String = text.chars().take(MEANING_QUERY_MAX).collect();
+    let qv = match tokio::task::spawn_blocking(move || engine.embed_query(&text))
+        .await
+        .map_err(internal)?
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "semantic query embedding failed");
+            results.notice = Some(MEANING_NO_MODEL);
+            return Ok(results);
+        }
+    };
+    let rows = db(&session.unlocked, move |c| -> anyhow::Result<Vec<Row>> {
+        let hits = vectors_search(c, &qv, &filter, MEANING_LIMIT)?;
+        let mut rows = Vec::with_capacity(hits.len());
+        for (doc, score, chunk) in hits {
+            let text = get_document_text(c, &doc.id)?.unwrap_or_default();
+            rows.push(Row {
+                snippet: Some(escape_html(&passage_preview(&text, chunk.start, chunk.end))),
+                match_pct: Some(match_pct(score)),
+                ..row_of(doc)
+            });
+        }
+        Ok(rows)
+    })
+    .await?
+    .map_err(internal)?;
+    if rows.is_empty() {
+        // Every document with vectors scores; none means nothing is indexed.
+        results.notice = Some(MEANING_NO_INDEX);
+    }
+    results.rows = rows;
+    Ok(results)
+}
+
 async fn list_page(
+    State(state): State<AppState>,
     CurrentUser(session): CurrentUser,
     headers: HeaderMap,
     Query(query): Query<ListQuery>,
@@ -556,7 +666,36 @@ async fn list_page(
     filter.offset = (page_no - 1) * PAGE_SIZE;
 
     let tag_filter = web_filter();
-    let search_text = q.clone();
+    let meaning = q.is_some() && query.mode.as_deref() == Some("meaning");
+    let mut meaning_view: Option<ResultsView> = None;
+    if meaning {
+        // One meaning query per session at a time.
+        let Some(_slot) = state.sessions.try_begin_meaning(&session.id) else {
+            let results = ResultsView {
+                notice: Some(MEANING_BUSY),
+                rows: vec![],
+                searching: true,
+                page_no: 1,
+                prev_url: None,
+                next_url: None,
+            };
+            let mut resp = render(&ResultsPartial { results });
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            return resp;
+        };
+        match meaning_results(
+            &state,
+            &session,
+            filter.clone(),
+            q.clone().unwrap_or_default(),
+        )
+        .await
+        {
+            Ok(v) => meaning_view = Some(v),
+            Err(r) => return r,
+        }
+    }
+    let search_text = if meaning { None } else { q.clone() };
     let loaded = db(&session.unlocked, move |c| {
         let rows: anyhow::Result<Vec<Row>> = match &search_text {
             Some(text) => search(c, text, &filter).map(|hits| {
@@ -568,6 +707,7 @@ async fn list_page(
                     })
                     .collect()
             }),
+            None if meaning => Ok(vec![]),
             None => list_documents(c, &filter).map(|d| d.into_iter().map(row_of).collect()),
         };
         let tags = list_tags_visible(c, &tag_filter);
@@ -581,13 +721,14 @@ async fn list_page(
     };
     let has_next = rows.len() > PAGE_SIZE as usize;
     rows.truncate(PAGE_SIZE as usize);
-    let results = ResultsView {
+    let results = meaning_view.unwrap_or_else(|| ResultsView {
+        notice: None,
         rows,
         searching: q.is_some(),
         page_no,
         prev_url: (page_no > 1).then(|| page_url(&query, page_no - 1)),
         next_url: has_next.then(|| page_url(&query, page_no + 1)),
-    };
+    });
     let mut resp = if is_htmx(&headers) {
         render(&ResultsPartial { results })
     } else {
@@ -599,6 +740,7 @@ async fn list_page(
             tag: non_empty(&query.tag).unwrap_or_default(),
             from: non_empty(&query.from).unwrap_or_default(),
             to: non_empty(&query.to).unwrap_or_default(),
+            meaning: query.mode.as_deref() == Some("meaning"),
         })
     };
     resp.headers_mut()
@@ -614,6 +756,7 @@ fn row_of(d: Document) -> Row {
         tags: d.tags,
         snippet: None,
         metadata_only: false,
+        match_pct: None,
     }
 }
 
@@ -1040,5 +1183,26 @@ async fn set_access(
         Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => internal(e),
         Err(r) => r,
+    }
+}
+
+#[cfg(test)]
+mod meaning_tests {
+    use super::*;
+
+    #[test]
+    fn passage_cut_on_char_boundary_with_ellipsis() {
+        let text = "ä".repeat(400);
+        let p = passage_preview(&text, 0, 400);
+        assert_eq!(p.chars().count(), MEANING_PASSAGE_MAX + 1);
+        assert!(p.ends_with('…'));
+        assert_eq!(passage_preview("abcdef", 1, 3), "bc");
+    }
+
+    #[test]
+    fn match_percentage_rounds_and_clamps() {
+        assert_eq!(match_pct(0.846), 85);
+        assert_eq!(match_pct(-0.2), 0);
+        assert_eq!(match_pct(1.0001), 100);
     }
 }

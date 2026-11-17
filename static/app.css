@@ -340,3 +340,24 @@ pre {
 section + section {
   margin-top: 2rem;
 }
+
+/* Search mode toggle and the match badge of a meaning result. */
+fieldset.mode {
+  border: 0;
+  margin: 0.5rem 0;
+  padding: 0;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+fieldset.mode legend {
+  float: left;
+  padding: 0;
+  margin-right: 0.5rem;
+}
+.match {
+  font-size: 0.85em;
+  border: 1px solid currentColor;
+  border-radius: 0.75rem;
+  padding: 0 0.5rem;
+}

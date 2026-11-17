@@ -36,6 +36,11 @@
 <input type="date" id="to" name="to" value="{{ to }}" hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
 </div>
 </div>
+<fieldset class="mode">
+<legend>Search</legend>
+<label><input type="radio" name="mode" value="words"{% if !meaning %} checked{% endif %} hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Words</label>
+<label><input type="radio" name="mode" value="meaning"{% if meaning %} checked{% endif %} hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Meaning</label>
+</fieldset>
 <button type="submit">Search</button>
 </form>
 

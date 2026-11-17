@@ -279,7 +279,7 @@ pub(crate) fn enforce_all(conn: &Connection) -> Result<()> {
 }
 
 /// Brute-force semantic search over the documents visible under `filter`
-/// (`access` must be `Some(Mcp, Full)`; effective `semantic_index` must also be
+/// (`access` must be `Some(Mcp | Web, Full)`: the channel is the caller's; effective `semantic_index` must also be
 /// full). Visibility is decided in SQL before any vector is read. Scores are
 /// the dot product of the (L2-normalised) vectors. Returns the best chunk per
 /// document, top `limit` documents by score (ties by document id).

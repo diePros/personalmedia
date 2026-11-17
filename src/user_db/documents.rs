@@ -383,16 +383,17 @@ pub fn list_documents(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>
     Ok(docs)
 }
 
-/// Documents a semantic search may read vectors of: effective `mcp` level
-/// `Full` under the filter's cap (which must itself be `Full`), effective
+/// Documents a semantic search may read vectors of: effective level of the
+/// filter's channel (`mcp` or `web`) `Full` under the filter's cap (which must itself be `Full`), effective
 /// `semantic_index` `Full`, plus the tag allow-list and date filters. Decided
-/// in SQL; no limit. `f.access` must be `Some(Mcp, Full)` or nothing matches.
-/// The documents come without tags (the caller loads them for the few it keeps).
+/// in SQL; no limit. `f.access` must be `Some(Mcp | Web, Full)` or nothing
+/// matches. The documents come without tags (the caller loads them for the few it keeps).
 pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>> {
     let Some(a) = f.access else {
         return Ok(vec![]);
     };
-    if a.channel != Channel::Mcp || a.cap != Level::Full {
+    // Only the content channels can search by meaning.
+    if !matches!(a.channel, Channel::Mcp | Channel::Web) || a.cap != Level::Full {
         return Ok(vec![]);
     }
     let defaults = get_access_defaults(conn)?;
@@ -403,7 +404,7 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
     );
     access_clause(conn, f, &mut sql, &mut params)?;
     sql.push_str(" AND COALESCE(a.level, ?) = 'full'");
-    params.push(Value::Text(defaults.level(Channel::Mcp).as_str().into()));
+    params.push(Value::Text(defaults.level(a.channel).as_str().into()));
     sql.push_str(" AND COALESCE(s.level, ?) = 'full'");
     params.push(Value::Text(
         defaults.level(Channel::SemanticIndex).as_str().into(),
