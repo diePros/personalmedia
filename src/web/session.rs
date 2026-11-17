@@ -7,6 +7,11 @@
 //! cookie once and, if the session is alive, puts a [`Session`] snapshot into
 //! the request extensions. The extractors below only read that extension.
 //!
+//! Without a live session but with a `__Host-pm_device` cookie (a device the
+//! user chose to remember), the layer resumes the login from the cookie and
+//! starts a new session; see `crate::devices`. That works for any method, and
+//! the CSRF rule below then applies to the new session as usual.
+//!
 //! # CSRF
 //!
 //! Every non-GET/HEAD request that carries a live session must present the
@@ -29,12 +34,13 @@
 //! Requests without a session (login, signup) carry no CSRF token.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{FromRequest, FromRequestParts, Request, State};
+use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
@@ -44,6 +50,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
 
+use super::ratelimit::{client_ip, ip_key};
 use super::{AppState, is_htmx};
 use crate::crypto::{RecoveryKey, fill_random};
 use crate::keyring::Unlocked;
@@ -76,6 +83,9 @@ pub struct Session {
     pub must_confirm_recovery: Option<RecoveryKey>,
     /// TOTP secret (base32) between "begin setup" and "confirm code".
     pub pending_totp_secret: Option<Zeroizing<String>>,
+    /// The remembered device this session belongs to, if it was started with
+    /// "Remember this device" or resumed from a device cookie.
+    pub device_id: Option<String>,
 }
 
 impl Session {
@@ -114,6 +124,9 @@ pub struct SessionStore {
     meaning: Mutex<HashSet<String>>,
     idle: Duration,
     max: Duration,
+    /// One gate per device id, so parallel resumes of the same device share
+    /// one session without making other users wait.
+    resume_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionStore {
@@ -124,6 +137,7 @@ impl SessionStore {
             meaning: Mutex::new(HashSet::new()),
             idle,
             max,
+            resume_gates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -153,6 +167,7 @@ impl SessionStore {
         user: &UserRow,
         unlocked: Arc<Unlocked>,
         must_confirm: Option<RecoveryKey>,
+        device_id: Option<String>,
     ) -> (String, String) {
         let now = Instant::now();
         let session = Session {
@@ -166,6 +181,7 @@ impl SessionStore {
             last_seen: now,
             must_confirm_recovery: must_confirm,
             pending_totp_secret: None,
+            device_id,
         };
         let out = (session.id.clone(), session.csrf.clone());
         self.lock().insert(session.id.clone(), session);
@@ -186,6 +202,27 @@ impl SessionStore {
         }
         s.last_seen = now;
         Some(s.clone())
+    }
+
+    /// A live session that belongs to remembered device `device_id`, with
+    /// `last_seen` refreshed.
+    pub fn live_for_device(&self, device_id: &str) -> Option<Session> {
+        let now = Instant::now();
+        let mut sessions = self.lock();
+        let s = sessions
+            .values_mut()
+            .find(|s| s.device_id.as_deref() == Some(device_id) && !self.expired(s, now))?;
+        s.last_seen = now;
+        Some(s.clone())
+    }
+
+    /// How many live sessions `user_id` has.
+    pub fn count_for_user(&self, user_id: &str) -> usize {
+        let now = Instant::now();
+        self.lock()
+            .values()
+            .filter(|s| s.user_id == user_id && !self.expired(s, now))
+            .count()
     }
 
     /// The user confirmed saving the recovery key: forget it and make the
@@ -214,10 +251,36 @@ impl SessionStore {
         }
     }
 
+    /// The session stops belonging to a remembered device (it was revoked).
+    pub fn clear_device(&self, id: &str) {
+        if let Some(s) = self.lock().get_mut(id) {
+            s.device_id = None;
+        }
+    }
+
     /// Logout.
     pub fn remove(&self, id: &str) {
-        let dead = self.lock().remove(id);
-        drop(dead);
+        drop(self.take(id));
+    }
+
+    /// Removes and returns the session, if any (it is not checked for expiry).
+    pub fn take(&self, id: &str) -> Option<Session> {
+        self.lock().remove(id)
+    }
+
+    /// The gate of device `id`; hold its lock while resuming that device.
+    fn resume_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.resume_gates.lock().unwrap_or_else(|e| e.into_inner());
+        gates.entry(id.to_owned()).or_default().clone()
+    }
+
+    /// Forgets the gate of device `id` once nobody else holds or awaits it.
+    fn release_gate(&self, id: &str, mine: Arc<tokio::sync::Mutex<()>>) {
+        let mut gates = self.resume_gates.lock().unwrap_or_else(|e| e.into_inner());
+        // The map's handle and `mine`: no other request is waiting.
+        if Arc::strong_count(&mine) == 2 {
+            gates.remove(id);
+        }
     }
 
     /// End every session of a user (disable, delete, password change).
@@ -228,6 +291,11 @@ impl SessionStore {
     /// End every session of a user except `keep` (password change).
     pub fn remove_user_except(&self, user_id: &str, keep: &str) {
         self.remove_where(|s| s.user_id == user_id && s.id != keep);
+    }
+
+    /// End every session that belongs to remembered device `device_id`.
+    pub fn remove_device(&self, device_id: &str) {
+        self.remove_where(|s| s.device_id.as_deref() == Some(device_id));
     }
 
     /// Drop expired sessions. Run every minute by a background task, so keys
@@ -264,6 +332,37 @@ pub fn clear_session_cookie() -> HeaderValue {
     HeaderValue::from_static(
         "__Host-pm_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
     )
+}
+
+/// The remembered-device cookie. `SameSite=Lax` (unlike the session cookie)
+/// so that a top-level navigation from another site, such as following a link
+/// or the OS share target, still finds the user logged in. State-changing
+/// requests keep their CSRF check, and the session it starts is `Strict`.
+pub const DEVICE_COOKIE: &str = "__Host-pm_device";
+
+pub fn device_cookie(token: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!(
+        "{DEVICE_COOKIE}={token}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
+        crate::devices::DEVICE_TTL_SECS
+    ))
+    .expect("device tokens are hex")
+}
+
+pub fn clear_device_cookie() -> HeaderValue {
+    HeaderValue::from_static("__Host-pm_device=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
+}
+
+/// The device id inside the device cookie, if it has the shape of a token.
+/// Not verified: it only names a candidate.
+pub fn device_cookie_id(headers: &HeaderMap) -> Option<&str> {
+    device_token(headers)
+        .and_then(|t| crate::tokens::split_token(t, "pmd_"))
+        .map(|(id, _)| id)
+}
+
+/// The raw value of the device cookie, if present.
+pub fn device_token(headers: &HeaderMap) -> Option<&str> {
+    cookie_value(headers, DEVICE_COOKIE).filter(|v| !v.is_empty())
 }
 
 fn cookie_value<'a>(headers: &'a HeaderMap, cookie: &str) -> Option<&'a str> {
@@ -332,6 +431,18 @@ pub fn check_csrf(
     }
 }
 
+/// [`check_csrf`] for a handler that read the urlencoded body itself.
+pub fn check_csrf_body(
+    session: &Session,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), StatusCode> {
+    let field = serde_urlencoded::from_bytes::<CsrfField>(body)
+        .ok()
+        .and_then(|f| f.csrf);
+    check_csrf(session, headers, field.as_deref())
+}
+
 fn is_urlencoded_form(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -346,12 +457,177 @@ fn is_urlencoded_form(headers: &HeaderMap) -> bool {
 /// Middleware: resolves the session cookie into a [`Session`] request
 /// extension and enforces the header half of the CSRF rule (see the module
 /// docs). Applied to the whole router, so it also covers routes added later.
-pub async fn session_layer(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    let session = session_id(req.headers()).and_then(|id| state.sessions.get(id));
+pub async fn session_layer(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let mut session = session_id(req.headers()).and_then(|id| state.sessions.get(id));
+    // Cookies to add to the response after the handler ran.
+    let mut extra: Vec<HeaderValue> = Vec::new();
+    // `POST /logout` never resumes: the page's CSRF token belongs to the
+    // session that ended, and `logout` handles the bare device cookie itself.
+    let is_logout = *req.method() == Method::POST && req.uri().path() == "/logout";
+    if session.is_none()
+        && !is_logout
+        && let Some(token) = device_token(req.headers()).map(str::to_owned)
+    {
+        let ip_key = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| ip_key(client_ip(c.0, req.headers(), state.cfg.trusted_proxy)));
+        match resume_from_device(&state, &token, ip_key).await {
+            Resume::Session(s) => {
+                extra.push(session_cookie(&s.id));
+                // Re-sent so the browser's Max-Age slides with the stored expiry.
+                extra.push(device_cookie(&token));
+                session = Some(*s);
+            }
+            Resume::Failed => extra.push(clear_device_cookie()),
+            Resume::Skipped => {}
+        }
+    }
+    let mut resp = run_with_session(session, req, next).await;
+    for c in extra {
+        // A handler that set the same cookie itself (login, logout) wins.
+        let name = c
+            .to_str()
+            .ok()
+            .and_then(|v| v.split_once('='))
+            .map_or("", |(n, _)| n);
+        if sets_cookie(&resp, name) {
+            continue;
+        }
+        resp.headers_mut().append(header::SET_COOKIE, c);
+    }
+    resp
+}
+
+fn sets_cookie(resp: &Response, name: &str) -> bool {
+    resp.headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .any(|v| v.split_once('=').is_some_and(|(n, _)| n == name))
+}
+
+enum Resume {
+    Session(Box<Session>),
+    /// The cookie did not resume a login: it should be cleared.
+    Failed,
+    /// Not attempted (rate limited, or an internal error): leave the cookie.
+    Skipped,
+}
+
+/// Resumes a login from the device cookie `token`. Parallel resumes of one
+/// device are serialised, and a device that already has a live session
+/// reuses it.
+async fn resume_from_device(state: &AppState, token: &str, ip_key: Option<String>) -> Resume {
+    // Reserve the IP slot first, so a flood cannot queue up on a gate.
+    let attempt = match &ip_key {
+        Some(k) => match state.limiter.begin(std::slice::from_ref(k)) {
+            Ok(a) => Some(a),
+            Err(_) => return Resume::Skipped,
+        },
+        None => None,
+    };
+    // A junk token gets no gate; it fails fast below.
+    let Some(id) = crate::tokens::split_token(token, "pmd_").map(|(id, _)| id.to_owned()) else {
+        return resume_gated(state, token, attempt).await;
+    };
+    let gate = state.sessions.resume_gate(&id);
+    let out = {
+        let _held = gate.lock().await;
+        resume_gated(state, token, attempt).await
+    };
+    state.sessions.release_gate(&id, gate);
+    out
+}
+
+async fn resume_gated(
+    state: &AppState,
+    token: &str,
+    attempt: Option<super::ratelimit::Attempt<'_>>,
+) -> Resume {
+    let st = state.clone();
+    let tok = token.to_owned();
+    let now = unix_now();
+    // HKDF only (no Argon2), so no KDF permit is needed.
+    //
+    // A device revoked elsewhere (its row is gone) counts as one non-genuine
+    // limiter failure below: without the row the secret cannot be verified, so
+    // the request looks the same as a guess. It is a single failure per
+    // request, and the cookie is cleared so it is not repeated.
+    let result = tokio::task::spawn_blocking(move || {
+        crate::devices::resume_device(&st, &tok, now).map(|r| {
+            let pending = st.accounts.pending_recovery(&r.unlocked);
+            (r, pending)
+        })
+    })
+    .await;
+    let (r, pending) = match result {
+        Ok(Ok(r)) => {
+            if let Some(a) = attempt {
+                a.success();
+            }
+            r
+        }
+        Ok(Err(fail)) => {
+            if let Some(a) = attempt {
+                // Only a wrong secret is a guess; an expired genuine device or
+                // an internal error is not.
+                if fail.genuine || fail.internal {
+                    a.success();
+                } else {
+                    a.failure();
+                }
+            }
+            return if fail.internal {
+                Resume::Skipped
+            } else {
+                Resume::Failed
+            };
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "device resume task failed");
+            if let Some(a) = attempt {
+                a.success();
+            }
+            return Resume::Skipped;
+        }
+    };
+    // Another request may have resumed the same device while this one waited.
+    if let Some(s) = state.sessions.live_for_device(&r.device_id) {
+        return Resume::Session(Box::new(s));
+    }
+    let pending = match pending {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "pending recovery check failed on resume");
+            return Resume::Skipped;
+        }
+    };
+    // The unlock may have raced an admin disabling the account.
+    match state.sys.user_by_id(&r.user.id) {
+        Ok(Some(u)) if !u.disabled => {}
+        Ok(_) => return Resume::Failed,
+        Err(e) => {
+            tracing::error!(error = %e, "user re-check failed on resume");
+            return Resume::Skipped;
+        }
+    }
+    let (id, _csrf) = state
+        .sessions
+        .create(&r.user, r.unlocked, pending, Some(r.device_id));
+    match state.sessions.get(&id) {
+        Some(s) => Resume::Session(Box::new(s)),
+        None => Resume::Skipped,
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+async fn run_with_session(session: Option<Session>, mut req: Request, next: Next) -> Response {
     if let Some(session) = session {
         // The OS share target posts multipart without our token, and the OAuth
         // register/token/revoke endpoints are called cross-origin by clients.

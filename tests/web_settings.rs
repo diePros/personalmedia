@@ -79,7 +79,7 @@ async fn change_password_flow() {
     let c = t.session_for("alice");
     let other = {
         let row = t.state.sys.user_by_name("alice").unwrap().unwrap();
-        let (cookie, csrf) = t.state.sessions.create(&row, unlocked(&t, &c), None);
+        let (cookie, csrf) = t.state.sessions.create(&row, unlocked(&t, &c), None, None);
         Client { cookie, csrf }
     };
     let new = "a brand new password";
@@ -329,19 +329,73 @@ async fn totp_enable_disable() {
     assert_eq!(again.status(), 409);
 
     let bad_off = t
-        .post_form("/settings/totp/disable", &[("code", "000000")], &c)
+        .post_form(
+            "/settings/totp/disable",
+            &[("code", "000000"), ("password", PASSWORD)],
+            &c,
+        )
         .await;
     assert_eq!(bad_off.status(), 401);
     assert!(t.state.accounts.totp_enabled(&uid));
     let off = t
         .post_form(
             "/settings/totp/disable",
-            &[("code", &totp_code(&secret))],
+            &[("code", &totp_code(&secret)), ("password", PASSWORD)],
             &c,
         )
         .await;
     assert_eq!(off.status(), 303);
     assert!(!t.state.accounts.totp_enabled(&uid));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn totp_disable_requires_password() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let uid = t.state.sessions.get(&c.cookie).unwrap().user_id;
+    t.post_form("/settings/totp/begin", &[], &c).await;
+    let secret = t
+        .state
+        .sessions
+        .get(&c.cookie)
+        .unwrap()
+        .pending_totp_secret
+        .unwrap()
+        .to_string();
+    let on = t
+        .post_form(
+            "/settings/totp/enable",
+            &[("code", &totp_code(&secret)), ("password", PASSWORD)],
+            &c,
+        )
+        .await;
+    assert_eq!(on.status(), 303);
+
+    // A correct code with a wrong or missing password leaves TOTP on.
+    let wrong = t
+        .post_form(
+            "/settings/totp/disable",
+            &[
+                ("code", &totp_code(&secret)),
+                ("password", "nope nope nope"),
+            ],
+            &c,
+        )
+        .await;
+    assert_eq!(wrong.status(), 401);
+    assert!(t.state.accounts.totp_enabled(&uid));
+    let missing = t
+        .post_form(
+            "/settings/totp/disable",
+            &[("code", &totp_code(&secret))],
+            &c,
+        )
+        .await;
+    assert_eq!(missing.status(), 401);
+    assert!(t.state.accounts.totp_enabled(&uid));
+    // The form asks for it.
+    let html = body_string(t.get("/settings", &c).await).await;
+    assert!(html.contains(r#"id="totp-disable-password""#));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1375,4 +1429,20 @@ fn ios_shortcut_url_validated() {
         "https://www.icloud.com/shortcuts/{}z",
         &id[..31]
     )));
+}
+
+/// Every password field in Settings has a hidden `autocomplete="username"`
+/// field with the account name, so password managers can fill it.
+#[tokio::test(flavor = "multi_thread")]
+async fn password_fields_carry_a_username_hint_for_password_managers() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let html = body_string(t.get("/settings", &c).await).await;
+    let hint = r#"name="pm_username_hint" value="alice" autocomplete="username""#;
+    let passwords = html.matches(r#"autocomplete="current-password""#).count();
+    assert!(
+        passwords >= 4,
+        "expected several password forms, got {passwords}"
+    );
+    assert_eq!(html.matches(hint).count(), passwords);
 }

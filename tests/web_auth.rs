@@ -577,7 +577,7 @@ async fn login_in_flight_does_not_survive_disable() {
     // Argon2 unwrap done, then the admin disables the account.
     let (unlocked, row) = app.state.accounts.login("alice", PASSWORD, None).unwrap();
     app.state.accounts.set_disabled(&row.id, true).unwrap();
-    let r = finish_login(&app.state, &headers, &row.id, unlocked, None);
+    let r = finish_login(&app.state, &headers, &row.id, unlocked, None, None);
     assert!(matches!(
         r,
         Err(personal_media::accounts::AccountError::Disabled)
@@ -587,7 +587,7 @@ async fn login_in_flight_does_not_survive_disable() {
     app.state.accounts.set_disabled(&row.id, false).unwrap();
     let (unlocked, row) = app.state.accounts.login("alice", PASSWORD, None).unwrap();
     app.state.accounts.delete_user(&row.id).unwrap();
-    let r = finish_login(&app.state, &headers, &row.id, unlocked, None);
+    let r = finish_login(&app.state, &headers, &row.id, unlocked, None, None);
     assert!(matches!(
         r,
         Err(personal_media::accounts::AccountError::InvalidCredentials)

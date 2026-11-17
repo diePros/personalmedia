@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 use crate::crypto::Key32;
 
 pub mod access;
+pub mod devices;
 pub mod documents;
 pub mod meta;
 pub mod vectors;
@@ -17,6 +18,10 @@ pub mod vectors;
 pub use access::{
     AccessDefaults, AccessFilter, Channel, Level, document_overrides, effective_level,
     get_access_defaults, set_access_defaults, set_document_access,
+};
+pub use devices::{
+    DeviceMeta, delete_all_device_meta, delete_device_meta, insert_device_meta, list_device_meta,
+    prune_device_meta, touch_device_meta,
 };
 pub use documents::{
     Document, ListFilter, NOTES_MAX_CHARS, NewDocument, SearchHit, TextSource, TextStatus,
@@ -97,7 +102,8 @@ PRAGMA user_version = 2;
 
 /// v3 (v1.5): per-document notes, the source of the text, and `documents_fts`
 /// with a `notes` column (rebuilt once, from the tables, in this transaction).
-const MIGRATION_V3: &str = "
+#[doc(hidden)]
+pub const MIGRATION_V3: &str = "
 ALTER TABLE documents ADD COLUMN notes TEXT NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN text_source TEXT NOT NULL DEFAULT 'ocr'
     CHECK (text_source IN ('ocr','transcription','none'));
@@ -120,6 +126,19 @@ ALTER TABLE documents_fts_new RENAME TO documents_fts;
 PRAGMA user_version = 3;
 ";
 
+/// v4 (v1.6): remembered devices (labels and last use; the secrets live in the
+/// system DB).
+#[doc(hidden)]
+pub const MIGRATION_V4: &str = "
+CREATE TABLE device_meta (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER
+);
+PRAGMA user_version = 4;
+";
+
 /// Open (creating if needed) the user's SQLCipher index with a raw key, and migrate.
 pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
     let conn = Connection::open(path).context("opening user db")?;
@@ -138,7 +157,7 @@ pub fn open_user_db(path: &Path, key: &Key32) -> Result<Connection> {
             "BEGIN; {SCHEMA_V1} PRAGMA user_version = 1; COMMIT;"
         ))?;
     }
-    for (target, sql) in [(2, MIGRATION_V2), (3, MIGRATION_V3)] {
+    for (target, sql) in [(2, MIGRATION_V2), (3, MIGRATION_V3), (4, MIGRATION_V4)] {
         if version >= target {
             continue;
         }

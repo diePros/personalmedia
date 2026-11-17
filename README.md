@@ -68,9 +68,18 @@ host allow-list. There is no SSE stream: `GET /mcp` is 405.
 - Semantic search (v1.2): an in-process multilingual embedding model (multilingual-e5-small, int8)
   downloaded on first use. Off by default; enable it in Settings. See
   [docs/setup.md](docs/setup.md) section 7c, including `fetch-model` and `embed-selftest`.
+- Remembered devices (v1.6): a "Remember this device" box on login and recovery keeps a browser
+  logged in for 90 days of inactivity; devices are listed and revocable under Settings.
+- Needs-transcription filter (v1.6): list documents that still lack a handwriting transcription.
+- `.env` deployment (v1.6): your settings live in an untracked `.env` next to
+  `docker-compose.yml`, so `git pull` never conflicts. See [docs/setup.md](docs/setup.md).
 
 ## Security notes
 
+- Device tokens (remembered devices) work like MCP and OAuth tokens: the UMK is wrapped at rest
+  under a key derived from the token secret in the `__Host-pm_device` cookie, so the server alone
+  cannot unlock a user. They expire after 90 days without use, are not valid MCP bearers, and
+  are revoked by logout of that device, password change, recovery, or an admin disabling the user.
 - OAuth access and refresh tokens unlock the user key exactly like static tokens (the UMK is
   wrapped under a key derived from the token secret). Refresh tokens are single-use and rotate; reuse
   of a consumed refresh token revokes the grant. That detection is memory-only, so it is lost on a

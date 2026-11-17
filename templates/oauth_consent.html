@@ -45,6 +45,7 @@
 <p class="muted">Creates the tag and adds it to the allow-list above. With no tag selected it can reach every document.</p>
 </div>
 <div>
+{% include "_username_hint.html" %}
 <label for="consent-password">Your password (to approve)</label>
 <input type="password" id="consent-password" name="password" required autocomplete="current-password">
 <p class="muted">Access outlives this session and password changes, so approving asks for it again.</p>

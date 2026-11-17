@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod config;
 pub mod crypto;
+pub mod devices;
 pub mod documents;
 pub mod embed;
 pub mod export;

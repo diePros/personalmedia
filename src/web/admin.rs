@@ -16,15 +16,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use askama::Template;
 use axum::Router;
-use axum::extract::{Path, Query, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Deserialize;
 
 use super::docs::format_date;
+use super::ratelimit::too_many_requests;
 use super::session::{AdminUser, CsrfForm, NoFields, Session};
+use super::settings::{check_password, limiter_keys};
 use super::{AppState, Page, redirect, render};
+use crate::accounts::AccountError;
 use crate::quota::human_bytes;
 use crate::system_db::{QuotaSetting, Role};
 
@@ -300,6 +305,22 @@ async fn set_disabled(
         Err(e) => return internal(e),
     }
     if disabled {
+        // Re-enabling must not revive remembered devices, so their system rows
+        // go. Their metadata lives in the user's encrypted DB, which an admin
+        // cannot open; stale entries are pruned on the user's next Settings load.
+        let sys = state.sys.clone();
+        let uid = row.id.clone();
+        match tokio::task::spawn_blocking(move || sys.delete_device_tokens(&uid)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                cut_off(&state, &row.id);
+                return internal(e);
+            }
+            Err(e) => {
+                cut_off(&state, &row.id);
+                return internal(e);
+            }
+        }
         cut_off(&state, &row.id);
         redirect(&headers, "/admin?notice=disabled")
     } else {
@@ -330,10 +351,13 @@ async fn enable(
 #[derive(Deserialize)]
 struct DeleteForm {
     confirm_username: Option<String>,
+    #[serde(default)]
+    password: String,
 }
 
 async fn delete(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     AdminUser(session): AdminUser,
     Path(id): Path<String>,
     headers: HeaderMap,
@@ -346,6 +370,23 @@ async fn delete(
     if form.confirm_username.as_deref() != Some(row.username.as_str()) {
         let msg = "Type the username exactly to confirm deletion.";
         return failure(&state, &session, StatusCode::BAD_REQUEST, msg).await;
+    }
+    // Deleting an account cannot be undone, and a remembered device can reach
+    // this page, so the admin's own password is required too.
+    let keys = limiter_keys(&state, peer, &headers, &session);
+    let attempt = match state.limiter.begin(&keys) {
+        Ok(a) => a,
+        Err(retry) => return too_many_requests(retry),
+    };
+    match check_password(&state, &session, form.password).await {
+        Err(resp) => return resp,
+        Ok(Err(AccountError::InvalidCredentials)) => {
+            attempt.failure();
+            let msg = "Your password is wrong.";
+            return failure(&state, &session, StatusCode::UNAUTHORIZED, msg).await;
+        }
+        Ok(Err(e)) => return internal(e),
+        Ok(Ok(())) => attempt.success(),
     }
     let accounts = state.accounts.clone();
     let uid = row.id.clone();

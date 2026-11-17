@@ -1,8 +1,13 @@
 services:
   personal-media:
+    # Your own settings live in `.env` next to this file (copy `.env.example`).
+    # `.env` is not tracked by git, so `git pull` never touches it: don't edit this
+    # file for local changes. For changes `.env` can't express, put them in a
+    # `docker-compose.override.yml` (also untracked; compose merges it automatically).
+    #
     # Prebuilt image from GitHub (see docs/setup.md "Updating"). `docker compose pull`
     # fetches it; `docker compose up -d --build` builds locally from this checkout instead.
-    image: ghcr.io/diepros/personalmedia:latest
+    image: ghcr.io/diepros/personalmedia:${IMAGE_TAG:-latest}
     build:
       context: .
       # ort-sys downloads its runtime from cdn.pyke.io during the build; the default
@@ -15,21 +20,22 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 1536m
+    mem_limit: ${MEM_LIMIT:-1536m}
     pids_limit: 256
     logging:
       driver: json-file
       options:
         max-size: 10m
         max-file: "3"
+    # App settings (PM_PUBLIC_URL, PM_MAX_UPLOAD_MB, PM_IOS_SHORTCUT_URL, ...) come from .env.
+    env_file: .env
     environment:
-      PM_BIND: 127.0.0.1:8080
-      PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
-      PM_TRUSTED_PROXY: 127.0.0.1
-      PM_MAX_UPLOAD_MB: "100"
-      # PM_IOS_SHORTCUT_URL: https://www.icloud.com/shortcuts/<32 hex chars>   # optional: iCloud link of the PMS Shortcut
+      # The app sits behind Tailscale Funnel on this host; override in .env if needed.
+      PM_BIND: ${PM_BIND:-127.0.0.1:8080}
+      PM_TRUSTED_PROXY: ${PM_TRUSTED_PROXY:-127.0.0.1}
+      PM_PUBLIC_URL: ${PM_PUBLIC_URL:?set PM_PUBLIC_URL in .env (copy .env.example)}
     volumes:
-      - /DATA/AppData/personal-media:/data
+      - ${DATA_DIR:-/DATA/AppData/personal-media}:/data
     tmpfs:
       # OCR scratch: plaintext never touches disk
       - /data/tmp:size=512m,mode=0700,uid=10001,gid=10001

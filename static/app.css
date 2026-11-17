@@ -531,3 +531,28 @@ fieldset.mode legend {
     padding-bottom: calc(var(--gap) + var(--tabbar-h));
   }
 }
+
+/* Hidden username next to "Your password" fields so password managers can fill them. */
+/* `input.` so it beats the shared `input[type="text"]` rule above. */
+input.pm-username-hint {
+  position: absolute;
+  width: 1px;
+  min-width: 0;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.device-badge {
+  margin-left: 0.5rem;
+  padding: 0.125rem 0.5rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: var(--accent);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}

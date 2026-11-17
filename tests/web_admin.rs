@@ -166,7 +166,7 @@ async fn disable_and_delete_kill_sessions_and_tokens() {
     let resp = t
         .post_form(
             &format!("/admin/users/{id}/delete"),
-            &[("confirm_username", "bob")],
+            &[("confirm_username", "bob"), ("password", PASSWORD)],
             &admin,
         )
         .await;
@@ -217,6 +217,7 @@ async fn delete_requires_username_confirmation() {
         vec![],
         vec![("confirm_username", "Bob")],
         vec![("confirm_username", "alice")],
+        vec![("confirm_username", "alice"), ("password", PASSWORD)],
     ] {
         let resp = t.post_form(&path, &fields, &admin).await;
         assert_eq!(resp.status(), 400);
@@ -227,9 +228,47 @@ async fn delete_requires_username_confirmation() {
     let resp = t
         .post_form(
             "/admin/users/not-a-uuid/delete",
-            &[("confirm_username", "x")],
+            &[("confirm_username", "x"), ("password", PASSWORD)],
             &admin,
         )
         .await;
     assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_requires_the_admins_password() {
+    let t = TestApp::new();
+    let admin = t.admin_session_for("root");
+    t.session_for("bob");
+    let id = user_id(&t, "bob");
+    let path = format!("/admin/users/{id}/delete");
+    // Missing and wrong passwords leave the user in place.
+    for fields in [
+        vec![("confirm_username", "bob")],
+        vec![("confirm_username", "bob"), ("password", "wrong password")],
+    ] {
+        let resp = t.post_form(&path, &fields, &admin).await;
+        assert_eq!(resp.status(), 401);
+        assert!(t.state.sys.user_by_id(&id).unwrap().is_some());
+    }
+    assert!(t.dir.path().join("users").join(&id).exists());
+    let resp = t
+        .post_form(
+            &path,
+            &[("confirm_username", "bob"), ("password", PASSWORD)],
+            &admin,
+        )
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(t.state.sys.user_by_id(&id).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_page_delete_form_asks_for_the_password() {
+    let t = TestApp::new();
+    let admin = t.admin_session_for("root");
+    t.session_for("bob");
+    let html = body_string(t.get("/admin", &admin).await).await;
+    assert!(html.contains(r#"name="password" autocomplete="current-password""#));
+    assert!(html.contains(r#"name="pm_username_hint" value="root""#));
 }

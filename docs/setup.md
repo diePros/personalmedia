@@ -50,43 +50,35 @@ Everything the app stores there is encrypted per user. You can back it up as-is 
 
 ## 3. Deploy the app
 
-`docker-compose.yml` in the repo root:
+`docker-compose.yml` in the repo root holds the fixed, hardened container setup (read-only root filesystem, no capabilities, memory limit, an in-memory `/data/tmp` for OCR scratch). **Don't edit it.** Your own settings go into a `.env` file next to it, which git does not track, so `git pull` never conflicts with them:
 
-```yaml
-services:
-  personal-media:
-    build:
-      context: .
-      network: host        # the build downloads from cdn.pyke.io; avoids IPv6-only build networks
-    image: personal-media
-    container_name: personal-media
-    restart: unless-stopped
-    network_mode: host
-    user: "10001:10001"
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 1536m
-    pids_limit: 256
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
-    environment:
-      PM_BIND: 127.0.0.1:8080
-      PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
-      PM_TRUSTED_PROXY: 127.0.0.1
-      PM_MAX_UPLOAD_MB: "100"
-      # PM_IOS_SHORTCUT_URL: https://www.icloud.com/shortcuts/<32 hex chars>   # optional: iCloud link of the PMS Shortcut
-    volumes:
-      - /DATA/AppData/personal-media:/data
-    tmpfs:
-      # OCR scratch: plaintext never touches disk
-      - /data/tmp:size=512m,mode=0700,uid=10001,gid=10001
+```bash
+cp .env.example .env
+nano .env        # at least PM_PUBLIC_URL; DATA_DIR if your data folder is elsewhere
 ```
 
-Edit `PM_PUBLIC_URL` to your real `https://<node>.<tailnet>.ts.net` address first; the app refuses to start (and `invite` refuses to run) unless it is an `https://host[:port]` URL. The root filesystem is read-only; only `/data` and the tmpfs are writable.
+| Variable | Default | Meaning |
+|---|---|---|
+| `PM_PUBLIC_URL` | (required) | Your Funnel URL, `https://<node>.<tailnet>.ts.net`. The app refuses to start (and `invite` refuses to run) unless it is an `https://host[:port]` URL. |
+| `DATA_DIR` | `/DATA/AppData/personal-media` | Host folder for the encrypted data, owned by uid/gid 10001. |
+| `IMAGE_TAG` | `latest` | Image version, e.g. `1.6` to pin. |
+| `MEM_LIMIT` | `1536m` | Container memory limit. |
+| `PM_MAX_UPLOAD_MB` | `100` | Largest upload. |
+| `PM_BIND` | `127.0.0.1:8080` | Address the app listens on. Change it only together with the Funnel target. |
+| `PM_TRUSTED_PROXY` | `127.0.0.1` | Address of the reverse proxy whose forwarded client IP is trusted. |
+| `PM_IOS_SHORTCUT_URL` | unset | iCloud link of the PMS Shortcut (section 7b). |
+
+Any other `PM_…` setting from this guide (e.g. `PM_SESSION_IDLE_MINUTES`) also goes into `.env`. For changes `.env` can't express (another volume, a different tmpfs size), create a `docker-compose.override.yml` next to the compose file; compose merges it automatically and git ignores it too. The root filesystem is read-only; only `/data` and the tmpfs are writable.
+
+**Upgrading from a checkout where you edited `docker-compose.yml` directly** (before v1.6): move your values into `.env` once, then drop the local edits:
+
+```bash
+git diff docker-compose.yml       # note your PM_PUBLIC_URL, data path, Shortcut URL, ...
+cp .env.example .env && nano .env # put them in here
+git checkout docker-compose.yml   # discard the local edits
+# if you had stashed them instead: `git stash show -p` shows them; once they are in .env, `git stash drop`
+git pull
+```
 
 Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` is unverified):
 
@@ -109,7 +101,7 @@ Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` i
   # on the dev machine
   docker build -t personal-media .
   docker save personal-media | ssh zima docker load
-  # on the ZimaBoard, with docker-compose.yml copied over
+  # on the ZimaBoard, with docker-compose.yml and your .env copied over
   docker compose up -d
   ```
 
@@ -123,7 +115,7 @@ The image installs German and English OCR data (`tesseract-ocr-deu`, `tesseract-
 
 ## 4. Enable Funnel on the existing Tailscale container
 
-> **Your ZimaOS setup:** the ZimaOS Tailscale app (`docs/tailscale.yaml`) overrides the entrypoint and runs `tailscaled` directly. Because of that, `TS_SERVE_CONFIG` (Option B) and `TS_EXTRA_ARGS` have no effect there. Use **`deploy/tailscale-funnel.yaml`** instead. It's the same config with one added line, `tailscale funnel --bg --yes --https=443 http://127.0.0.1:8080`, which runs before `tailscale web`. Paste it into the Tailscale app's compose settings in ZimaOS and restart the app. Then check with `docker exec tailscale tailscale funnel status`. If something else on the ZimaBoard already uses port 8080, change both `PM_BIND` and this line.
+> **Your ZimaOS setup:** the ZimaOS Tailscale app (`docs/tailscale.yaml`) overrides the entrypoint and runs `tailscaled` directly. Because of that, `TS_SERVE_CONFIG` (Option B) and `TS_EXTRA_ARGS` have no effect there. Use **`deploy/tailscale-funnel.yaml`** instead. It's the same config with one added line, `tailscale funnel --bg --yes --https=443 http://127.0.0.1:8080`, which runs before `tailscale web`. Paste it into the Tailscale app's compose settings in ZimaOS and restart the app. Then check with `docker exec tailscale tailscale funnel status`. If something else on the ZimaBoard already uses port 8080, set `PM_BIND` (and, if the proxy is elsewhere, `PM_TRUSTED_PROXY`) in `.env` and change the port in this line to match.
 
 Your Tailscale container already runs with `network_mode: host`. Pick **one** of the two ways below.
 
@@ -210,6 +202,12 @@ This prints a one-time invite URL. Open it, choose a username and password, and 
 
 Invite friends from the admin page. Each invite link is single-use and expires after 7 days.
 
+### Remembered devices
+
+The login and recovery forms have a "Remember this device" box, ticked by default. It keeps that browser logged in for 90 days (renewed when used) without asking for the password, even after the server restarts or the session times out. It works for every login method, and a second factor is not asked again on that browser.
+
+The risk: anyone holding a remembered device unlocked can open your documents, and a stolen device cookie works until you revoke it. Untick the box on shared computers. Logging out forgets only the current device. To revoke, open Settings, "Remembered devices": revoke one device, or "Sign out all other devices". Changing your password or logging in with the recovery key signs out every remembered device. Turning off two-factor authentication needs your password. On an admin account, a remembered device can also use the admin page, though destructive admin actions (deleting a user) ask for the password again. Disabling a user in the admin page forgets all of that user's remembered devices.
+
 ## 7. Connect Hermes (MCP)
 
 1. In the web UI: **Settings → Tokens → New token**. Choose the access (`read` / `read_write`), the content level (`metadata_only` / `full_text`) and optionally a tag allow-list. Copy the token (`pm_…`); it's shown only once.
@@ -294,13 +292,14 @@ PMS cannot read handwriting itself yet. Instead your own AI assistant (claude.ai
 2. Scan or upload the handwritten pages and tag them (for example `handwritten`). The document's own MCP setting must not be limited below `full`.
 3. Ask the assistant, for example in claude.ai:
 
-   > Find my documents tagged handwritten, read each page with get_page_image, and save a faithful transcription with set_transcription.
+   > Find my documents that need transcription (list_documents with needs_transcription), read each page with get_page_image, and save a faithful transcription with set_transcription.
 
 Tools involved:
 
-- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute.
+- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute; this limit is kept in memory, so it resets when the server restarts.
 - `set_transcription { id, text, mode? }` stores the text (`replace`, the default, or `append`). It becomes the searchable text, is marked "transcribed by an AI assistant" on the document page and is indexed for semantic search again if that is enabled for the document.
 - `set_notes { id, notes }` sets the document's notes (see below).
+- `list_documents { needs_transcription: true }` lists only documents tagged `handwritten` that have no transcription yet. The documents page has the same **Needs transcription** filter. If the token has a tag allow-list, it must include `handwritten`, otherwise the filter returns nothing.
 
 **Privacy:** page images leave your server and go to the AI provider of the assistant you connected, but only for documents that your token or app may read in full and whose MCP setting is `full`. Documents set to `metadata` or `off` for MCP, and tokens without full text access, never get page images. Images are rendered on demand in memory-backed scratch space, never cached and deleted right after.
 
@@ -347,17 +346,17 @@ Every release tag (`vX.Y.Z`) is built by GitHub Actions (`.github/workflows/imag
 **Each update** (seconds instead of a local Rust build):
 
 ```bash
-cd <source checkout>            # where docker-compose.yml lives
-git pull                        # picks up compose/doc changes
+cd <source checkout>            # where docker-compose.yml and .env live
+git pull                        # picks up compose/doc changes; .env stays as it is
 sudo DOCKER_CONFIG=/DATA/.docker docker compose pull
 sudo DOCKER_CONFIG=/DATA/.docker docker compose up -d
 ```
 
-To pin a version instead of `latest`, set `image: ghcr.io/diepros/personalmedia:1.1` in `docker-compose.yml`. A local build still works without the registry: `docker compose up -d --build`. A local build needs outbound access to crates.io, cdn.pyke.io (ONNX runtime) and huggingface.co (the test model); pulling the GHCR image avoids all of it.
+To pin a version instead of `latest`, set `IMAGE_TAG=1.6` in `.env`. A local build still works without the registry: `docker compose up -d --build`. A local build needs outbound access to crates.io, cdn.pyke.io (ONNX runtime) and huggingface.co (the test model); pulling the GHCR image avoids all of it.
 
 What an update does:
 - Documents, accounts, MCP tokens and the Funnel setup stay as they are.
-- Everyone is logged out once, because keys only live in memory.
+- Browsers without a remembered device are logged out once, because keys only live in memory. Remembered devices stay logged in across updates and restarts.
 - Pending OCR jobs resume at each user's next login.
 - Database changes ship as automatic migrations (schema frozen since v1.0.0).
 

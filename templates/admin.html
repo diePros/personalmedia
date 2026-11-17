@@ -101,6 +101,9 @@
 <input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
 <label for="confirm-{{ u.id }}" class="muted">Type "{{ u.username }}" to delete the account and all its documents</label>
 <input type="text" id="confirm-{{ u.id }}" name="confirm_username" autocomplete="off" required>
+{% include "_username_hint.html" %}
+<label for="pw-{{ u.id }}" class="muted">Your password</label>
+<input type="password" id="pw-{{ u.id }}" name="password" autocomplete="current-password" required>
 <button type="submit" class="danger">Delete</button>
 </form>
 {% endif -%}

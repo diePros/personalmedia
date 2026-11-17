@@ -112,6 +112,9 @@ pub struct ListFilter {
     pub tag_allow: Option<Vec<i64>>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
+    /// Only documents tagged `handwritten` whose text is not yet a
+    /// transcription (`text_source` is not `transcription`). On an index older than v3 every document counts as untranscribed.
+    pub needs_transcription: bool,
     /// `None` = no switchboard restrictions (export/recovery only).
     pub access: Option<AccessFilter>,
     /// 0 means 50.
@@ -397,7 +400,7 @@ fn access_clause(
 }
 
 /// Append filter conditions (each starting with " AND ") and their params.
-fn filter_conditions(f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) {
+fn filter_conditions(conn: &Connection, f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) {
     for tag in &f.tags_all {
         sql.push_str(
             " AND EXISTS (SELECT 1 FROM document_tags dt JOIN tags t ON t.id = dt.tag_id \
@@ -414,6 +417,16 @@ fn filter_conditions(f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) 
         sql.push_str(" AND d.document_date <= ?");
         params.push(Value::Text(to.clone()));
     }
+    if f.needs_transcription {
+        // An index older than v3 has no `text_source`: nothing is transcribed.
+        if doc_cols(conn) != DOC_COLS_PRE_V3 {
+            sql.push_str(" AND d.text_source != 'transcription'");
+        }
+        sql.push_str(
+            " AND EXISTS (SELECT 1 FROM document_tags dt JOIN tags t ON t.id = dt.tag_id \
+             WHERE dt.document_id = d.id AND t.name = 'handwritten')",
+        );
+    }
 }
 
 /// Raw (pre-cap) levels whose effective level is `target` under `cap`.
@@ -429,7 +442,7 @@ pub fn list_documents(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>
     let mut params: Vec<Value> = Vec::new();
     let mut sql = format!("SELECT {} FROM documents d", doc_cols(conn));
     access_clause(conn, f, &mut sql, &mut params)?;
-    filter_conditions(f, &mut sql, &mut params);
+    filter_conditions(conn, f, &mut sql, &mut params);
     sql.push_str(" ORDER BY d.created_at DESC, d.id LIMIT ? OFFSET ?");
     params.push(Value::Integer(f.limit()));
     params.push(Value::Integer(f.offset as i64));
@@ -469,7 +482,7 @@ pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<V
     params.push(Value::Text(
         base_default(conn, Channel::SemanticIndex)?.as_str().into(),
     ));
-    filter_conditions(f, &mut sql, &mut params);
+    filter_conditions(conn, f, &mut sql, &mut params);
     sql.push_str(" ORDER BY d.id");
     let mut stmt = conn.prepare(&sql)?;
     let docs: Vec<Document> = stmt
@@ -823,7 +836,7 @@ pub fn search(conn: &Connection, text: &str, f: &ListFilter) -> Result<Vec<Searc
             sql.push_str(" WHERE documents_fts MATCH ?");
             params.push(Value::Text(expr));
         }
-        filter_conditions(f, &mut sql, &mut params);
+        filter_conditions(conn, f, &mut sql, &mut params);
         sql.push_str(" ORDER BY bm25(documents_fts), d.id LIMIT ?");
         params.push(Value::Integer(want));
         let mut stmt = conn.prepare(&sql)?;

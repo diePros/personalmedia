@@ -788,3 +788,103 @@ async fn notes_edit_roundtrip_web() {
     let html = body_string(t.get(&path, &c).await).await;
     assert!(html.contains("transcribed by an AI assistant"), "{html}");
 }
+
+/// Whether the "Needs transcription" checkbox is rendered checked.
+fn checkbox_checked(html: &str) -> bool {
+    let at = html.find("name=\"needs_transcription\"").expect("checkbox");
+    let end = html[at..].find('>').unwrap();
+    html[at..at + end].contains(" checked")
+}
+
+#[tokio::test]
+async fn needs_transcription_filter_and_pagination_url() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let hw = upload(
+        &t,
+        &c,
+        "a.bin",
+        "application/octet-stream",
+        b"hand",
+        &[("tags", "handwritten")],
+    )
+    .await;
+    upload_id(&t, &c, "b.bin", "application/octet-stream", b"other").await;
+    let hw_id = hw["id"].as_str().unwrap();
+
+    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    assert_eq!(html.matches("doc-item").count(), 1, "{html}");
+    assert!(checkbox_checked(&html));
+    let all = body_string(t.get("/documents", &c).await).await;
+    assert_eq!(all.matches("doc-item").count(), 2);
+    assert!(!checkbox_checked(&all));
+
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    u.with_db(|conn| personal_media::user_db::set_transcription(conn, hw_id, "text", 5))
+        .unwrap();
+    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    assert_eq!(html.matches("doc-item").count(), 0);
+}
+
+#[tokio::test]
+async fn needs_transcription_kept_in_pagination() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    for i in 0..51 {
+        upload(
+            &t,
+            &c,
+            "f.bin",
+            "application/octet-stream",
+            format!("hw {i}").as_bytes(),
+            &[("tags", "handwritten")],
+        )
+        .await;
+        upload_id(
+            &t,
+            &c,
+            "g.bin",
+            "application/octet-stream",
+            format!("plain {i}").as_bytes(),
+        )
+        .await;
+    }
+    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    assert_eq!(html.matches("doc-item").count(), 50);
+    assert!(
+        html.contains("href=\"/documents?needs_transcription=1&#38;page=2\""),
+        "{html}"
+    );
+    // Page 2 holds the one remaining handwritten document, not plain ones.
+    let html = body_string(t.get("/documents?needs_transcription=1&page=2", &c).await).await;
+    assert_eq!(html.matches("doc-item").count(), 1);
+    assert!(!html.contains("rel=\"next\""));
+    // Any other value is off and not forwarded.
+    let html = body_string(t.get("/documents?needs_transcription=yes", &c).await).await;
+    assert!(!checkbox_checked(&html));
+    assert!(html.contains("href=\"/documents?page=2\""));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn needs_transcription_with_words_search() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    upload(
+        &t,
+        &c,
+        "hw.txt",
+        "text/plain",
+        b"zebra stripes",
+        &[("tags", "handwritten")],
+    )
+    .await;
+    upload_id(&t, &c, "plain.txt", "text/plain", b"zebra herd").await;
+    wait_extracted(&t, &c, "herd").await;
+    wait_extracted(&t, &c, "stripes").await;
+    let both = body_string(t.get("/documents?q=zebra", &c).await).await;
+    assert_eq!(both.matches("doc-item").count(), 2, "{both}");
+    let one = body_string(t.get("/documents?q=zebra&needs_transcription=1", &c).await).await;
+    assert_eq!(one.matches("doc-item").count(), 1, "{one}");
+    assert!(one.contains(">handwritten<"));
+    assert!(!one.contains("herd"));
+}

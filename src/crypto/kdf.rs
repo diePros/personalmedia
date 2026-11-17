@@ -21,6 +21,7 @@ impl Default for Argon2Params {
 
 pub const INFO_RECOVERY: &str = "pm/v1/kek/recovery";
 pub const INFO_TOKEN: &str = "pm/v1/kek/token";
+pub const INFO_DEVICE: &str = "pm/v1/kek/device";
 
 /// Derive a KEK from a password with Argon2id.
 pub fn password_kek(

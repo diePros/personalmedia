@@ -494,6 +494,7 @@ struct ListQuery {
     tag: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    needs_transcription: Option<String>,
     page: Option<String>,
     /// `words` (default) or `meaning`.
     mode: Option<String>,
@@ -588,6 +589,7 @@ struct DocumentsPage {
     tag: String,
     from: String,
     to: String,
+    needs_transcription: bool,
     meaning: bool,
 }
 
@@ -609,6 +611,10 @@ fn match_pct(score: f32) -> u32 {
     (score * 100.0).round().clamp(0.0, 100.0) as u32
 }
 
+fn needs_transcription_on(q: &ListQuery) -> bool {
+    non_empty(&q.needs_transcription).is_some_and(|v| v == "1")
+}
+
 fn page_url(q: &ListQuery, page: u32) -> String {
     let mut pairs: Vec<(&str, String)> = Vec::new();
     for (k, v) in [
@@ -620,6 +626,9 @@ fn page_url(q: &ListQuery, page: u32) -> String {
         if let Some(v) = non_empty(v) {
             pairs.push((k, v));
         }
+    }
+    if needs_transcription_on(q) {
+        pairs.push(("needs_transcription", "1".into()));
     }
     pairs.push(("page", page.to_string()));
     format!(
@@ -656,8 +665,10 @@ async fn meaning_results(
     filter.limit = 0;
     filter.offset = 0;
     // With a tag or date filter, "nothing indexed" would mislead.
-    let filtered =
-        !filter.tags_all.is_empty() || filter.date_from.is_some() || filter.date_to.is_some();
+    let filtered = !filter.tags_all.is_empty()
+        || filter.date_from.is_some()
+        || filter.date_to.is_some()
+        || filter.needs_transcription;
     // Nothing visible: answer without loading the model.
     let f1 = filter.clone();
     let any = db(&session.unlocked, move |c| has_candidates(c, &f1))
@@ -733,6 +744,7 @@ async fn list_page(
     filter.tags_all = non_empty(&query.tag).into_iter().collect();
     filter.date_from = non_empty(&query.from);
     filter.date_to = non_empty(&query.to);
+    filter.needs_transcription = needs_transcription_on(&query);
     filter.limit = PAGE_SIZE + 1; // one extra row tells whether there is a next page
     filter.offset = (page_no - 1) * PAGE_SIZE;
 
@@ -811,6 +823,7 @@ async fn list_page(
             tag: non_empty(&query.tag).unwrap_or_default(),
             from: non_empty(&query.from).unwrap_or_default(),
             to: non_empty(&query.to).unwrap_or_default(),
+            needs_transcription: needs_transcription_on(&query),
             meaning: query.mode.as_deref() == Some("meaning"),
         })
     };

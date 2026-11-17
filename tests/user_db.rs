@@ -642,13 +642,16 @@ fn raw_conn(path: &std::path::Path) -> Connection {
     conn
 }
 
-/// An index DB as v1.4 left it (`upto` = 1 or 2) with two documents.
+/// An index DB as an older release left it (`upto` = 1, 2 or 3) with two documents.
 fn old_db(path: &std::path::Path, upto: i64) {
     let conn = raw_conn(path);
     conn.execute_batch(SCHEMA_V1).unwrap();
     conn.execute_batch("PRAGMA user_version = 1;").unwrap();
     if upto >= 2 {
         conn.execute_batch(MIGRATION_V2).unwrap();
+    }
+    if upto >= 3 {
+        conn.execute_batch(MIGRATION_V3).unwrap();
     }
     for (id, title) in [("a1", "Rechnung"), ("b2", "Brief")] {
         conn.execute(
@@ -690,7 +693,7 @@ fn index_migration_v3_rebuilds_fts_once() {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3, "from v{from}");
+        assert_eq!(v, 4, "from v{from}");
 
         // Old content, title and tag are still searchable.
         for (q, id) in [
@@ -756,18 +759,12 @@ fn readonly_open_reads_v1_v2_and_v3_without_migrating() {
     for v in [1, 2, 3] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
-        if v == 3 {
-            let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
-            insert_document(&conn, &nd("a1", "Rechnung", "a1.pdf", &[], 100)).unwrap();
-            set_notes(&conn, "a1", "n", 1).unwrap();
-        } else {
-            old_db(&path, v);
-        }
+        old_db(&path, v);
         let conn = open_user_db_readonly(&path, &Key32::from_bytes([7; 32])).unwrap();
         let docs = list_documents(&conn, &all()).unwrap();
         assert!(!docs.is_empty(), "v{v}");
         let d = get_document(&conn, &docs[0].id).unwrap().unwrap();
-        assert_eq!(d.notes, if v == 3 { "n" } else { "" });
+        assert_eq!(d.notes, "");
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
@@ -859,4 +856,102 @@ fn metadata_and_notes_update_together() {
     );
     assert_eq!(ids(&search(&conn, "kochbuch", &all()).unwrap()), ["d1"]);
     assert_eq!(ids(&search(&conn, "neuer", &all()).unwrap()), ["d1"]);
+}
+
+#[test]
+fn needs_transcription_filter() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "tagged none", &["handwritten"], "x");
+    add(&conn, "b2", "tagged done", &["handwritten", "diary"], "x");
+    add(&conn, "c3", "untagged", &["diary"], "x");
+    add(&conn, "d4", "wrong case", &["Handwritten"], "x");
+    set_transcription(&conn, "b2", "typed text", 9).unwrap();
+
+    let f = ListFilter {
+        needs_transcription: true,
+        ..web()
+    };
+    let got: Vec<String> = list_documents(&conn, &f)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(got, ["a1"]);
+
+    // Combines with tags_all and the allow-list (only narrows).
+    let both = ListFilter {
+        tags_all: vec!["diary".into()],
+        ..f.clone()
+    };
+    assert!(list_documents(&conn, &both).unwrap().is_empty());
+    let allow_other = ListFilter {
+        tag_allow: Some(tag_ids(&conn, &["diary".to_string()]).unwrap()),
+        ..f.clone()
+    };
+    assert!(list_documents(&conn, &allow_other).unwrap().is_empty());
+    let allow_hw = ListFilter {
+        tag_allow: Some(tag_ids(&conn, &["handwritten".to_string()]).unwrap()),
+        ..f.clone()
+    };
+    assert_eq!(list_documents(&conn, &allow_hw).unwrap().len(), 1);
+
+    // Off by default; search honours it too.
+    assert_eq!(list_documents(&conn, &web()).unwrap().len(), 4);
+    let hits = search(&conn, "x", &f).unwrap();
+    assert_eq!(ids(&hits), ["a1"]);
+}
+
+// ---------------------------------------------------------------------------
+// v4: remembered devices
+// ---------------------------------------------------------------------------
+
+#[test]
+fn index_migration_v3_to_v4_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    {
+        // A real v3 database: v1 + v2 + v3 migrations, with data.
+        let conn = raw_conn(&path);
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute_batch(MIGRATION_V3).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, wrapped_dek, original_filename, title, mime, size, sha256,
+                created_at, updated_at, text_status)
+             VALUES ('a1', x'010203', 'a1.pdf', 'Rechnung', 'application/pdf', 1, x'00', 100, 100, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO token_meta(id, name, scope_json, created_at) VALUES ('t1','bot','{}',5)",
+            [],
+        )
+        .unwrap();
+    }
+    let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 4);
+    conn.execute(
+        "INSERT INTO device_meta(id, label, created_at) VALUES ('d1','Mac · Safari',9)",
+        [],
+    )
+    .unwrap();
+    let title: String = conn
+        .query_row("SELECT title FROM documents WHERE id='a1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(title, "Rechnung");
+    let name: String = conn
+        .query_row("SELECT name FROM token_meta WHERE id='t1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(name, "bot");
+    drop(conn);
+    // Reopening does not migrate again.
+    open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
 }

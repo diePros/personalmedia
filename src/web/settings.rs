@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use super::docs::{channel_body, format_date};
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
-use super::session::{CsrfForm, CurrentUser, NoFields, Session};
+use super::session::{CsrfForm, CurrentUser, NoFields, Session, clear_device_cookie};
 use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::{AccountError, TotpSetup};
 use crate::documents::{DocError, validate_meta};
@@ -58,6 +58,11 @@ pub fn routes() -> Router<AppState> {
         .route("/settings/tokens/{id}/revoke", post(revoke_token_route))
         .route("/settings/grants/{id}/revoke", post(revoke_grant_route))
         .route("/settings/export", post(export_zip))
+        .route("/settings/devices/{id}/revoke", post(revoke_device_route))
+        .route(
+            "/settings/devices/revoke-others",
+            post(revoke_other_devices),
+        )
 }
 
 fn now() -> i64 {
@@ -78,7 +83,7 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(f).await.map_err(internal)
 }
 
-fn limiter_keys(
+pub(super) fn limiter_keys(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
@@ -90,7 +95,7 @@ fn limiter_keys(
 
 /// Checks the account password under the KDF semaphore. `Err` is a ready
 /// response (503 or 500); `Ok(Err(..))` is the verification result.
-async fn check_password(
+pub(super) async fn check_password(
     state: &AppState,
     session: &Session,
     password: String,
@@ -145,6 +150,15 @@ struct GrantRow {
     last_used: String,
 }
 
+/// One remembered device.
+struct DeviceRow {
+    id: String,
+    label: String,
+    added: String,
+    last_used: String,
+    current: bool,
+}
+
 struct TagBox {
     id: i64,
     name: String,
@@ -165,6 +179,7 @@ struct SettingsPage {
     hidden: Vec<HiddenRow>,
     tokens: Vec<TokenRow>,
     grants: Vec<GrantRow>,
+    devices: Vec<DeviceRow>,
     tags: Vec<TagBox>,
     totp_enabled: bool,
     totp_setup: Option<SetupView>,
@@ -194,14 +209,53 @@ fn notice_text(key: &str) -> Option<&'static str> {
     Some(match key {
         "access" => "Access defaults saved.",
         "password" => {
-            "Password changed. Other sessions were logged out. Existing MCP tokens keep working; revoke them in Settings if needed."
+            "Password changed. Other sessions and all remembered devices were signed out. Existing MCP tokens keep working; revoke them in Settings if needed."
         }
+        "device_revoked" => "Device signed out.",
+        "devices_revoked" => "All other devices signed out.",
         "totp_on" => "Two-factor authentication is on.",
         "totp_off" => "Two-factor authentication is off.",
         "token_revoked" => "Token revoked.",
         "grant_revoked" => "App disconnected. Its access and refresh tokens no longer work.",
         _ => return None,
     })
+}
+
+/// "5 minutes ago", "2 days ago", for the device list.
+fn ago(ts: i64, now: i64) -> String {
+    let d = (now - ts).max(0);
+    let (n, unit) = match d {
+        0..=59 => return "just now".to_owned(),
+        60..=3599 => (d / 60, "minute"),
+        3600..=86399 => (d / 3600, "hour"),
+        _ => (d / 86400, "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+fn device_rows(
+    u: &crate::keyring::Unlocked,
+    sys: &crate::system_db::SystemDb,
+    current: Option<&str>,
+) -> anyhow::Result<Vec<DeviceRow>> {
+    // Only devices with a live system row count; stray metadata is tidied.
+    let live = sys.token_ids_for_user(&u.user_id)?;
+    let metas = u.with_db(|c| -> anyhow::Result<_> {
+        crate::user_db::prune_device_meta(c, &live)?;
+        crate::user_db::list_device_meta(c)
+    })?;
+    let t = now();
+    Ok(metas
+        .into_iter()
+        .filter(|d| live.contains(&d.id))
+        .map(|d| DeviceRow {
+            current: current == Some(d.id.as_str()),
+            added: format_date(d.created_at),
+            last_used: d.last_used_at.map_or("never".to_owned(), |ts| ago(ts, t)),
+            label: d.label,
+            id: d.id,
+        })
+        .collect())
 }
 
 const CHANNELS: [(Channel, &str); 3] = [
@@ -356,6 +410,7 @@ async fn settings_response(
     view: View,
 ) -> Response {
     let (u, accounts) = (session.unlocked.clone(), state.accounts.clone());
+    let (sys, current_device) = (state.sys.clone(), session.device_id.clone());
     let user_id = session.user_id.clone();
     let used = state.quotas.usage(&user_id).await;
     let storage = match state.quotas.limit_for_async(&user_id).await {
@@ -387,6 +442,7 @@ async fn settings_response(
                 let semantic = semantic_status(c)?;
                 Ok((defaults, hidden, tokens, grants, tags, semantic))
             })?;
+        let devices = device_rows(&u, &sys, current_device.as_deref())?;
         Ok((
             defaults,
             hidden,
@@ -395,10 +451,11 @@ async fn settings_response(
             tags,
             semantic,
             accounts.totp_enabled(&user_id),
+            devices,
         ))
     })
     .await;
-    let (defaults, hidden, tokens, grants, tags, semantic, totp_enabled) = match loaded {
+    let (defaults, hidden, tokens, grants, tags, semantic, totp_enabled, devices) = match loaded {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(r) => return r,
@@ -411,6 +468,7 @@ async fn settings_response(
         hidden,
         tokens,
         grants,
+        devices,
         tags: tags
             .into_iter()
             .map(|(id, name)| TagBox { id, name })
@@ -569,12 +627,36 @@ async fn change_password(
     match result {
         Ok(()) => {
             attempt.success();
-            // The password is the credential of the other browsers, so they go.
+            // Remembered devices were granted under the old password, this
+            // browser's included. They go first, so no resume can start a
+            // session after the other sessions are ended below.
+            let (sys, u) = (state.sys.clone(), session.unlocked.clone());
+            let revoked = match blocking(move || crate::devices::revoke_all_devices(&sys, &u)).await
+            {
+                Ok(r) => r.map(|_| ()),
+                Err(_) => Err(anyhow::anyhow!("device revocation task failed")),
+            };
+            // The password is the credential of the other browsers, so they
+            // go, whether or not the revoke worked.
             state
                 .sessions
                 .remove_user_except(&session.user_id, &session.id);
             state.tokens.evict_user(&session.user_id);
-            redirect(&headers, "/settings?notice=password")
+            if let Err(e) = revoked {
+                tracing::error!(error = %e, "could not revoke devices after password change");
+                return failure(
+                    &state,
+                    &session,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Password changed, but remembered devices could not be signed out. Revoke them under Remembered devices.",
+                )
+                .await;
+            }
+            state.sessions.clear_device(&session.id);
+            let mut resp = redirect(&headers, "/settings?notice=password");
+            resp.headers_mut()
+                .append(header::SET_COOKIE, clear_device_cookie());
+            resp
         }
         Err(AccountError::InvalidCredentials) => {
             attempt.failure();
@@ -660,11 +742,6 @@ async fn regenerate_recovery(
 // ---------------------------------------------------------------------------
 // TOTP
 // ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct CodeForm {
-    code: String,
-}
 
 #[derive(Deserialize)]
 struct TotpEnableForm {
@@ -820,18 +897,42 @@ async fn totp_enable(
     }
 }
 
+#[derive(Deserialize)]
+struct TotpDisableForm {
+    code: String,
+    /// A resumed session has not proven the password, so turning off the
+    /// second factor asks for it. Missing counts as wrong.
+    #[serde(default)]
+    password: String,
+}
+
 async fn totp_disable(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     CurrentUser(session): CurrentUser,
-    CsrfForm(form): CsrfForm<CodeForm>,
+    CsrfForm(form): CsrfForm<TotpDisableForm>,
 ) -> Response {
     let keys = limiter_keys(&state, peer, &headers, &session);
     let attempt = match state.limiter.begin(&keys) {
         Ok(a) => a,
         Err(retry) => return too_many_requests(retry),
     };
+    match check_password(&state, &session, form.password).await {
+        Err(r) => return r,
+        Ok(Err(AccountError::InvalidCredentials)) => {
+            attempt.failure();
+            return failure(
+                &state,
+                &session,
+                StatusCode::UNAUTHORIZED,
+                "The password is wrong",
+            )
+            .await;
+        }
+        Ok(Err(e)) => return internal(e),
+        Ok(Ok(())) => {}
+    }
     let accounts = state.accounts.clone();
     let (u, code) = (session.unlocked.clone(), form.code);
     let result = match blocking(move || accounts.totp_disable(&u, &code)).await {
@@ -1063,6 +1164,100 @@ async fn revoke_token_route(
         Ok(Err(e)) => internal(e),
         Err(r) => r,
     }
+}
+
+/// Signs out one remembered device. Revoking the one this browser uses also
+/// drops its cookie.
+async fn revoke_device_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    CurrentUser(session): CurrentUser,
+    Path(id): Path<String>,
+    CsrfForm(_): CsrfForm<NoFields>,
+) -> Response {
+    let (u, sys, id2) = (session.unlocked.clone(), state.sys.clone(), id.clone());
+    let is_current = session.device_id.as_deref() == Some(id.as_str());
+    match blocking(move || crate::devices::revoke_device(&sys, &u, &id2)).await {
+        Ok(Ok(true)) => {
+            // Revoking this browser's own device keeps its session going.
+            if is_current {
+                state.sessions.clear_device(&session.id);
+            }
+            state.sessions.remove_device(&id);
+        }
+        Ok(Ok(false)) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "could not revoke device");
+            // The row may already be gone: its sessions end regardless,
+            // except the one the user is working in.
+            if is_current {
+                state.sessions.clear_device(&session.id);
+            }
+            state.sessions.remove_device(&id);
+            return failure(
+                &state,
+                &session,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The device could not be fully revoked. Try again.",
+            )
+            .await;
+        }
+        Err(r) => return r,
+    }
+    let mut resp = redirect(&headers, "/settings?notice=device_revoked");
+    if is_current {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, clear_device_cookie());
+    }
+    resp
+}
+
+/// Signs out every remembered device except the one this session belongs to.
+async fn revoke_other_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    CurrentUser(session): CurrentUser,
+    CsrfForm(_): CsrfForm<NoFields>,
+) -> Response {
+    let (u, sys, keep) = (
+        session.unlocked.clone(),
+        state.sys.clone(),
+        session.device_id.clone(),
+    );
+    let result = blocking(move || {
+        // Based on the system rows: a device without metadata is revoked too.
+        let ids = match sys.delete_device_tokens_except(&u.user_id, keep.as_deref()) {
+            Ok(ids) => ids,
+            Err(e) => return (Vec::new(), Some((true, e))),
+        };
+        let meta = u.with_db(|c| {
+            ids.iter()
+                .try_for_each(|id| crate::user_db::delete_device_meta(c, id))
+        });
+        (ids, meta.err().map(|e| (false, e)))
+    })
+    .await;
+    let (ids, err) = match result {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    // Sessions end for every row that is gone, even if the meta cleanup failed.
+    for id in &ids {
+        state.sessions.remove_device(id);
+    }
+    state
+        .sessions
+        .remove_user_except(&session.user_id, &session.id);
+    if let Some((system_failed, e)) = err {
+        tracing::error!(error = %e, "could not fully revoke other devices");
+        let msg = if system_failed {
+            "Other devices could not be signed out. Try again."
+        } else {
+            "Other devices were signed out, but their list could not be fully cleaned up. Reload this page."
+        };
+        return failure(&state, &session, StatusCode::INTERNAL_SERVER_ERROR, msg).await;
+    }
+    redirect(&headers, "/settings?notice=devices_revoked")
 }
 
 /// Disconnects an OAuth app: deletes all its token rows, the grant metadata
