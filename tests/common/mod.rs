@@ -38,7 +38,7 @@ impl Client {
 }
 
 pub struct TestApp {
-    pub dir: tempfile::TempDir,
+    pub dir: std::sync::Arc<tempfile::TempDir>,
     pub state: AppState,
     pub app: Router,
 }
@@ -64,7 +64,23 @@ impl TestApp {
         adjust(&mut cfg);
         let state = AppState::build(cfg).unwrap();
         let app = build_app(state.clone());
-        TestApp { dir, state, app }
+        TestApp {
+            dir: std::sync::Arc::new(dir),
+            state,
+            app,
+        }
+    }
+
+    /// A second app on the same data dir and config, as after a server
+    /// restart: in-memory state (sessions, rate limits, unlocked keys) is gone.
+    pub fn restart(&self) -> TestApp {
+        let state = AppState::build((*self.state.cfg).clone()).unwrap();
+        let app = build_app(state.clone());
+        TestApp {
+            dir: self.dir.clone(),
+            state,
+            app,
+        }
     }
 
     /// Like [`TestApp::new`] with a ready-made embedding engine.
@@ -73,7 +89,11 @@ impl TestApp {
         let cfg = Config::for_tests(dir.path().to_path_buf());
         let state = AppState::build_with_engine(cfg, engine).unwrap();
         let app = build_app(state.clone());
-        TestApp { dir, state, app }
+        TestApp {
+            dir: std::sync::Arc::new(dir),
+            state,
+            app,
+        }
     }
 
     /// Send a request as if it arrived from [`PEER`] (unless the request
@@ -117,7 +137,10 @@ impl TestApp {
             .accounts
             .signup(token, username, PASSWORD, now())
             .unwrap();
-        let (cookie, csrf) = self.state.sessions.create(&user, unlocked, Some(recovery));
+        let (cookie, csrf) = self
+            .state
+            .sessions
+            .create(&user, unlocked, Some(recovery), None);
         Client { cookie, csrf }
     }
 

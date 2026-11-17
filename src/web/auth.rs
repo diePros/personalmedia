@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
 use super::session::{
-    CsrfForm, NoFields, PendingUser, clear_continue_cookie, clear_session_cookie, continue_id,
-    session_cookie,
+    CsrfForm, NoFields, PendingUser, clear_continue_cookie, clear_device_cookie,
+    clear_session_cookie, continue_id, device_cookie, session_cookie,
 };
 use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::AccountError;
@@ -64,6 +64,7 @@ fn start_session(
     user: &crate::system_db::UserRow,
     unlocked: std::sync::Arc<crate::keyring::Unlocked>,
     recovery: Option<crate::crypto::RecoveryKey>,
+    remember: Option<&str>,
 ) -> Response {
     let pending_key = recovery.is_some();
     let to = if pending_key {
@@ -90,7 +91,21 @@ fn start_session(
     let oauth = share.is_none()
         && recovery.is_none()
         && proof.is_some_and(|id| state.oauth.request(id).is_some());
-    let (cookie, _csrf) = state.sessions.create(user, unlocked, recovery);
+    // "Remember this device": a device token, kept in a second cookie.
+    let device = remember.and_then(|label| {
+        match crate::devices::create_device(&state.sys, &unlocked, label, now()) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                tracing::error!(error = %e, "could not remember device");
+                None
+            }
+        }
+    });
+    let device_id = device
+        .as_deref()
+        .and_then(|t| crate::tokens::split_token(t, "pmd_"))
+        .map(|(id, _)| id.to_owned());
+    let (cookie, _csrf) = state.sessions.create(user, unlocked, recovery, device_id);
     // The review and consent pages need the cookie as proof, and clear it themselves.
     let followed = share.is_some() || oauth;
     let mut resp = match share {
@@ -104,7 +119,22 @@ fn start_session(
         resp.headers_mut()
             .append(header::SET_COOKIE, clear_continue_cookie());
     }
+    if let Some(token) = device {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, device_cookie(&token));
+    }
     resp
+}
+
+/// The device label when the "Remember this device" box was ticked.
+fn remember_label(headers: &HeaderMap, remember: Option<&str>) -> Option<String> {
+    (remember == Some("on")).then(|| {
+        let ua = headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        crate::devices::device_label(ua)
+    })
 }
 
 /// The last step of login, signup and recover: re-reads the user row right
@@ -119,6 +149,7 @@ pub fn finish_login(
     user_id: &str,
     unlocked: std::sync::Arc<crate::keyring::Unlocked>,
     recovery: Option<crate::crypto::RecoveryKey>,
+    remember: Option<&str>,
 ) -> Result<Response, AccountError> {
     let row = state
         .sys
@@ -132,7 +163,9 @@ pub fn finish_login(
         Some(key) => Some(key),
         None => state.accounts.pending_recovery(&unlocked)?,
     };
-    Ok(start_session(state, headers, &row, unlocked, recovery))
+    Ok(start_session(
+        state, headers, &row, unlocked, recovery, remember,
+    ))
 }
 
 fn not_found() -> Response {
@@ -225,7 +258,7 @@ async fn signup(
     };
     match result {
         Ok((unlocked, user, recovery)) => {
-            match finish_login(&state, &headers, &user.id, unlocked, Some(recovery)) {
+            match finish_login(&state, &headers, &user.id, unlocked, Some(recovery), None) {
                 Ok(resp) => resp,
                 Err(AccountError::Disabled) => {
                     rerender(StatusCode::FORBIDDEN, DISABLED, token, form.username)
@@ -351,6 +384,8 @@ struct LoginForm {
     /// The only accepted value is `scan`; anything else is ignored.
     #[serde(default)]
     next: String,
+    /// "on" when "Remember this device" is ticked.
+    remember: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -420,6 +455,7 @@ async fn login(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let next_scan = form.next == "scan";
+    let label = remember_label(&headers, form.remember.as_deref());
     let keys = limiter_keys(&state, peer, &headers, &form.username);
     let attempt = match state.limiter.begin(&keys) {
         Ok(a) => a,
@@ -441,38 +477,40 @@ async fn login(
         Err(resp) => return resp,
     };
     match result {
-        Ok((unlocked, user)) => match finish_login(&state, &headers, &user.id, unlocked, None) {
-            Ok(mut resp) => {
-                attempt.success();
-                // Back to the scanner, but only where the login would have
-                // gone to the documents page (not the recovery key, a share
-                // or an OAuth consent that is waiting).
-                if next_scan
-                    && resp
-                        .headers()
-                        .get(header::LOCATION)
-                        .is_some_and(|l| l == "/documents")
-                {
-                    resp.headers_mut()
-                        .insert(header::LOCATION, HeaderValue::from_static("/scan"));
+        Ok((unlocked, user)) => {
+            match finish_login(&state, &headers, &user.id, unlocked, None, label.as_deref()) {
+                Ok(mut resp) => {
+                    attempt.success();
+                    // Back to the scanner, but only where the login would have
+                    // gone to the documents page (not the recovery key, a share
+                    // or an OAuth consent that is waiting).
+                    if next_scan
+                        && resp
+                            .headers()
+                            .get(header::LOCATION)
+                            .is_some_and(|l| l == "/documents")
+                    {
+                        resp.headers_mut()
+                            .insert(header::LOCATION, HeaderValue::from_static("/scan"));
+                    }
+                    resp
                 }
-                resp
+                Err(AccountError::Disabled) => {
+                    attempt.failure();
+                    login_error(StatusCode::FORBIDDEN, form.username, DISABLED, next_scan)
+                }
+                Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
+                Err(_) => {
+                    attempt.failure();
+                    login_error(
+                        StatusCode::UNAUTHORIZED,
+                        form.username,
+                        INVALID_LOGIN,
+                        next_scan,
+                    )
+                }
             }
-            Err(AccountError::Disabled) => {
-                attempt.failure();
-                login_error(StatusCode::FORBIDDEN, form.username, DISABLED, next_scan)
-            }
-            Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
-            Err(_) => {
-                attempt.failure();
-                login_error(
-                    StatusCode::UNAUTHORIZED,
-                    form.username,
-                    INVALID_LOGIN,
-                    next_scan,
-                )
-            }
-        },
+        }
         Err(AccountError::Disabled) => {
             attempt.failure();
             login_error(StatusCode::FORBIDDEN, form.username, DISABLED, next_scan)
@@ -497,9 +535,26 @@ async fn logout(
     CsrfForm(_): CsrfForm<NoFields>,
 ) -> Response {
     state.sessions.remove(&session.id);
+    // Only this device is forgotten; other remembered devices stay.
+    let revoked_device = session.device_id.is_some();
+    if let Some(device_id) = session.device_id.clone() {
+        let st = state.clone();
+        let unlocked = session.unlocked.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            crate::devices::revoke_device(&st.sys, &unlocked, &device_id)
+        })
+        .await;
+        if !matches!(res, Ok(Ok(_))) {
+            tracing::error!("could not revoke device on logout");
+        }
+    }
     let mut resp = redirect(&headers, "/login");
     resp.headers_mut()
         .insert(header::SET_COOKIE, clear_session_cookie());
+    if revoked_device {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, clear_device_cookie());
+    }
     resp
 }
 
@@ -521,6 +576,8 @@ struct RecoverForm {
     recovery_key: String,
     new_password: String,
     new_password_confirm: String,
+    /// "on" when "Remember this device" is ticked.
+    remember: Option<String>,
 }
 
 fn recover_error(status: StatusCode, username: String, msg: &str) -> Response {
@@ -573,7 +630,15 @@ async fn recover(
             // token unlock survives the recovery.
             state.sessions.remove_user(&user.id);
             state.tokens.evict_user(&user.id);
-            match finish_login(&state, &headers, &user.id, unlocked, Some(new_key)) {
+            let label = remember_label(&headers, form.remember.as_deref());
+            match finish_login(
+                &state,
+                &headers,
+                &user.id,
+                unlocked,
+                Some(new_key),
+                label.as_deref(),
+            ) {
                 Ok(resp) => {
                     attempt.success();
                     resp

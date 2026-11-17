@@ -79,7 +79,7 @@ async fn change_password_flow() {
     let c = t.session_for("alice");
     let other = {
         let row = t.state.sys.user_by_name("alice").unwrap().unwrap();
-        let (cookie, csrf) = t.state.sessions.create(&row, unlocked(&t, &c), None);
+        let (cookie, csrf) = t.state.sessions.create(&row, unlocked(&t, &c), None, None);
         Client { cookie, csrf }
     };
     let new = "a brand new password";

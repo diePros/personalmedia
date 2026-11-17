@@ -22,6 +22,11 @@
 <label for="code">Authenticator code (only if enabled)</label>
 <input type="text" id="code" name="code" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9 ]*">
 </div>
+<div class="check">
+<input type="checkbox" id="remember" name="remember" value="on" checked>
+<label for="remember">Remember this device</label>
+</div>
+<p class="muted">Stay logged in on this device for up to 90 days of inactivity. Don't use on shared computers.</p>
 <button type="submit">Log in</button>
 </form>
 <p><a href="/recover">Lost your password? Use your recovery key</a></p>
