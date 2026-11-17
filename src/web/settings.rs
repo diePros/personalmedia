@@ -1176,12 +1176,23 @@ async fn revoke_device_route(
     CsrfForm(_): CsrfForm<NoFields>,
 ) -> Response {
     let (u, sys, id2) = (session.unlocked.clone(), state.sys.clone(), id.clone());
+    let is_current = session.device_id.as_deref() == Some(id.as_str());
     match blocking(move || crate::devices::revoke_device(&sys, &u, &id2)).await {
-        Ok(Ok(true)) => state.sessions.remove_device(&id),
+        Ok(Ok(true)) => {
+            // Revoking this browser's own device keeps its session going.
+            if is_current {
+                state.sessions.clear_device(&session.id);
+            }
+            state.sessions.remove_device(&id);
+        }
         Ok(Ok(false)) => return StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "could not revoke device");
-            // The row may already be gone: its sessions end regardless.
+            // The row may already be gone: its sessions end regardless,
+            // except the one the user is working in.
+            if is_current {
+                state.sessions.clear_device(&session.id);
+            }
             state.sessions.remove_device(&id);
             return failure(
                 &state,
@@ -1194,8 +1205,7 @@ async fn revoke_device_route(
         Err(r) => return r,
     }
     let mut resp = redirect(&headers, "/settings?notice=device_revoked");
-    if session.device_id.as_deref() == Some(id.as_str()) {
-        state.sessions.clear_device(&session.id);
+    if is_current {
         resp.headers_mut()
             .append(header::SET_COOKIE, clear_device_cookie());
     }
@@ -1218,13 +1228,13 @@ async fn revoke_other_devices(
         // Based on the system rows: a device without metadata is revoked too.
         let ids = match sys.delete_device_tokens_except(&u.user_id, keep.as_deref()) {
             Ok(ids) => ids,
-            Err(e) => return (Vec::new(), Some(e)),
+            Err(e) => return (Vec::new(), Some((true, e))),
         };
         let meta = u.with_db(|c| {
             ids.iter()
                 .try_for_each(|id| crate::user_db::delete_device_meta(c, id))
         });
-        (ids, meta.err())
+        (ids, meta.err().map(|e| (false, e)))
     })
     .await;
     let (ids, err) = match result {
@@ -1238,15 +1248,14 @@ async fn revoke_other_devices(
     state
         .sessions
         .remove_user_except(&session.user_id, &session.id);
-    if let Some(e) = err {
+    if let Some((system_failed, e)) = err {
         tracing::error!(error = %e, "could not fully revoke other devices");
-        return failure(
-            &state,
-            &session,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Other devices were signed out, but their list could not be fully cleaned up. Reload this page.",
-        )
-        .await;
+        let msg = if system_failed {
+            "Other devices could not be signed out. Try again."
+        } else {
+            "Other devices were signed out, but their list could not be fully cleaned up. Reload this page."
+        };
+        return failure(&state, &session, StatusCode::INTERNAL_SERVER_ERROR, msg).await;
     }
     redirect(&headers, "/settings?notice=devices_revoked")
 }

@@ -786,3 +786,19 @@ async fn sign_out_others_ends_their_live_sessions() {
     }
     assert_eq!(session_status(&app, &client_b).await.0, 200);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_the_current_device_keeps_the_session() {
+    let (app, _) = setup().await;
+    let resp_b = login(&app, true).await;
+    let token_b = device_of(&resp_b).unwrap();
+    let (client_b, _) = settings_client(&app, &resp_b).await;
+    let id_b = device_id_of_token(&token_b);
+    let resp = app
+        .post_form(&format!("/settings/devices/{id_b}/revoke"), &[], &client_b)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(clears_device_cookie(&resp));
+    assert_eq!(session_status(&app, &client_b).await.0, 200);
+    assert!(!resumes(&app, &token_b).await);
+}
