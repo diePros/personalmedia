@@ -88,14 +88,24 @@ pub struct Resumed {
 }
 
 /// Why a resume failed. `genuine`: the secret was right but the row had
-/// expired (the normal end of a device's life, not a guess).
+/// expired (the normal end of a device's life, not a guess). `internal`: a
+/// database or unlock error, nothing to do with the token: callers keep the
+/// cookie and count no failure.
 #[derive(Debug)]
 pub struct ResumeFail {
     pub genuine: bool,
+    pub internal: bool,
 }
 
 impl ResumeFail {
-    const BAD: ResumeFail = ResumeFail { genuine: false };
+    const BAD: ResumeFail = ResumeFail {
+        genuine: false,
+        internal: false,
+    };
+    const INTERNAL: ResumeFail = ResumeFail {
+        genuine: false,
+        internal: true,
+    };
 }
 
 fn unwrap_with_secret(id: &str, secret_hex: &str, wrapped: &[u8]) -> Option<Key32> {
@@ -113,7 +123,7 @@ pub fn resume_device(state: &AppState, token: &str, now: i64) -> Result<Resumed,
         .token_full(id)
         .map_err(|e| {
             tracing::error!(error = %e, "device lookup failed");
-            ResumeFail::BAD
+            ResumeFail::INTERNAL
         })?
         .ok_or(ResumeFail::BAD)?;
     if row.kind != KIND_DEVICE {
@@ -126,6 +136,7 @@ pub fn resume_device(state: &AppState, token: &str, now: i64) -> Result<Resumed,
     if expires_at <= now {
         return Err(ResumeFail {
             genuine: umk.is_some(),
+            internal: false,
         });
     }
     let umk = umk.ok_or(ResumeFail::BAD)?;
@@ -134,7 +145,7 @@ pub fn resume_device(state: &AppState, token: &str, now: i64) -> Result<Resumed,
         .user_by_id(&row.user_id)
         .map_err(|e| {
             tracing::error!(error = %e, "user lookup failed");
-            ResumeFail::BAD
+            ResumeFail::INTERNAL
         })?
         .ok_or(ResumeFail::BAD)?;
     if user.disabled {
@@ -145,7 +156,7 @@ pub fn resume_device(state: &AppState, token: &str, now: i64) -> Result<Resumed,
         .unlock(&row.user_id, umk, &user.index_key_wrapped)
         .map_err(|e| {
             tracing::error!(error = %e, "device unlock failed");
-            ResumeFail::BAD
+            ResumeFail::INTERNAL
         })?;
 
     // Sliding expiry, written at most once a day.

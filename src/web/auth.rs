@@ -20,7 +20,8 @@ use sha2::{Digest, Sha256};
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
 use super::session::{
     CsrfForm, NoFields, PendingUser, clear_continue_cookie, clear_device_cookie,
-    clear_session_cookie, continue_id, device_cookie, session_cookie,
+    clear_session_cookie, continue_id, device_cookie, device_cookie_id, device_token,
+    session_cookie,
 };
 use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::AccountError;
@@ -73,8 +74,17 @@ fn start_session(
         "/documents"
     };
     // A previous session on this browser must not outlive the new login.
-    if let Some(old) = super::session::session_id(headers) {
-        state.sessions.remove(old);
+    if let Some(old) = super::session::session_id(headers).and_then(|id| state.sessions.take(id))
+        && let Some(device_id) = &old.device_id
+    {
+        // The old login's remembered device must not outlive it.
+        revoke_logged(state, &old.unlocked, device_id);
+    }
+    // So must the device named by this browser's cookie (it can be a different
+    // one than the session's, or there may be no session at all). Only a
+    // device of the user logging in can be revoked here.
+    if let Some(id) = device_cookie_id(headers) {
+        revoke_logged(state, &unlocked, id);
     }
     // A share staged before login (`POST /share` without a session) continues
     // on its review page, once. Not after signup/recovery, which first have to
@@ -122,8 +132,18 @@ fn start_session(
     if let Some(token) = device {
         resp.headers_mut()
             .append(header::SET_COOKIE, device_cookie(&token));
+    } else if device_token(headers).is_some() {
+        // Not remembering now: a cookie left over from before must go.
+        resp.headers_mut()
+            .append(header::SET_COOKIE, clear_device_cookie());
     }
     resp
+}
+
+fn revoke_logged(state: &AppState, unlocked: &crate::keyring::Unlocked, device_id: &str) {
+    if let Err(e) = crate::devices::revoke_device(&state.sys, unlocked, device_id) {
+        tracing::error!(error = %e, "could not revoke device");
+    }
 }
 
 /// The device label when the "Remember this device" box was ticked.
@@ -535,23 +555,35 @@ async fn logout(
     CsrfForm(_): CsrfForm<NoFields>,
 ) -> Response {
     state.sessions.remove(&session.id);
-    // Only this device is forgotten; other remembered devices stay.
-    let revoked_device = session.device_id.is_some();
-    if let Some(device_id) = session.device_id.clone() {
+    // Only this device is forgotten; other remembered devices stay. The
+    // cookie goes whether or not this session was started from it, so the
+    // browser cannot fall back into the account after logout.
+    let mut ids: Vec<String> = session.device_id.iter().cloned().collect();
+    if let Some(id) = device_cookie_id(&headers)
+        && !ids.iter().any(|i| i == id)
+    {
+        ids.push(id.to_owned());
+    }
+    if !ids.is_empty() {
         let st = state.clone();
         let unlocked = session.unlocked.clone();
         let res = tokio::task::spawn_blocking(move || {
-            crate::devices::revoke_device(&st.sys, &unlocked, &device_id)
+            for id in &ids {
+                // Revokes only devices of this user.
+                crate::devices::revoke_device(&st.sys, &unlocked, id)?;
+            }
+            anyhow::Ok(())
         })
         .await;
-        if !matches!(res, Ok(Ok(_))) {
+        if !matches!(res, Ok(Ok(()))) {
             tracing::error!("could not revoke device on logout");
         }
     }
+    let had_cookie = device_token(&headers).is_some() || session.device_id.is_some();
     let mut resp = redirect(&headers, "/login");
     resp.headers_mut()
         .insert(header::SET_COOKIE, clear_session_cookie());
-    if revoked_device {
+    if had_cookie {
         resp.headers_mut()
             .append(header::SET_COOKIE, clear_device_cookie());
     }

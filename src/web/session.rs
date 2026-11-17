@@ -124,8 +124,9 @@ pub struct SessionStore {
     meaning: Mutex<HashSet<String>>,
     idle: Duration,
     max: Duration,
-    /// Serialises device-cookie resumes so parallel requests share one session.
-    resume_gate: tokio::sync::Mutex<()>,
+    /// One gate per device id, so parallel resumes of the same device share
+    /// one session without making other users wait.
+    resume_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SessionStore {
@@ -136,7 +137,7 @@ impl SessionStore {
             meaning: Mutex::new(HashSet::new()),
             idle,
             max,
-            resume_gate: tokio::sync::Mutex::new(()),
+            resume_gates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -252,8 +253,27 @@ impl SessionStore {
 
     /// Logout.
     pub fn remove(&self, id: &str) {
-        let dead = self.lock().remove(id);
-        drop(dead);
+        drop(self.take(id));
+    }
+
+    /// Removes and returns the session, if any (it is not checked for expiry).
+    pub fn take(&self, id: &str) -> Option<Session> {
+        self.lock().remove(id)
+    }
+
+    /// The gate of device `id`; hold its lock while resuming that device.
+    fn resume_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.resume_gates.lock().unwrap_or_else(|e| e.into_inner());
+        gates.entry(id.to_owned()).or_default().clone()
+    }
+
+    /// Forgets the gate of device `id` once nobody else holds or awaits it.
+    fn release_gate(&self, id: &str, mine: Arc<tokio::sync::Mutex<()>>) {
+        let mut gates = self.resume_gates.lock().unwrap_or_else(|e| e.into_inner());
+        // The map's handle and `mine`: no other request is waiting.
+        if Arc::strong_count(&mine) == 2 {
+            gates.remove(id);
+        }
     }
 
     /// End every session of a user (disable, delete, password change).
@@ -318,6 +338,14 @@ pub fn device_cookie(token: &str) -> HeaderValue {
 
 pub fn clear_device_cookie() -> HeaderValue {
     HeaderValue::from_static("__Host-pm_device=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0")
+}
+
+/// The device id inside the device cookie, if it has the shape of a token.
+/// Not verified: it only names a candidate.
+pub fn device_cookie_id(headers: &HeaderMap) -> Option<&str> {
+    device_token(headers)
+        .and_then(|t| crate::tokens::split_token(t, "pmd_"))
+        .map(|(id, _)| id)
 }
 
 /// The raw value of the device cookie, if present.
@@ -419,6 +447,8 @@ pub async fn session_layer(State(state): State<AppState>, req: Request, next: Ne
         match resume_from_device(&state, &token, ip_key).await {
             Resume::Session(s) => {
                 extra.push(session_cookie(&s.id));
+                // Re-sent so the browser's Max-Age slides with the stored expiry.
+                extra.push(device_cookie(&token));
                 session = Some(*s);
             }
             Resume::Failed => extra.push(clear_device_cookie()),
@@ -427,11 +457,13 @@ pub async fn session_layer(State(state): State<AppState>, req: Request, next: Ne
     }
     let mut resp = run_with_session(session, req, next).await;
     for c in extra {
-        // A handler that started its own session (login) must keep its cookie.
-        let is_session = c
+        // A handler that set the same cookie itself (login, logout) wins.
+        let name = c
             .to_str()
-            .is_ok_and(|v| v.starts_with(SESSION_COOKIE) && !v.contains("Max-Age=0"));
-        if is_session && sets_session_cookie(&resp) {
+            .ok()
+            .and_then(|v| v.split_once('='))
+            .map_or("", |(n, _)| n);
+        if sets_cookie(&resp, name) {
             continue;
         }
         resp.headers_mut().append(header::SET_COOKIE, c);
@@ -439,12 +471,12 @@ pub async fn session_layer(State(state): State<AppState>, req: Request, next: Ne
     resp
 }
 
-fn sets_session_cookie(resp: &Response) -> bool {
+fn sets_cookie(resp: &Response, name: &str) -> bool {
     resp.headers()
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .any(|v| v.starts_with(SESSION_COOKIE))
+        .any(|v| v.split_once('=').is_some_and(|(n, _)| n == name))
 }
 
 enum Resume {
@@ -455,10 +487,11 @@ enum Resume {
     Skipped,
 }
 
-/// Resumes a login from the device cookie `token`. Parallel requests are
-/// serialised, and a device that already has a live session reuses it.
+/// Resumes a login from the device cookie `token`. Parallel resumes of one
+/// device are serialised, and a device that already has a live session
+/// reuses it.
 async fn resume_from_device(state: &AppState, token: &str, ip_key: Option<String>) -> Resume {
-    let _gate = state.sessions.resume_gate.lock().await;
+    // Reserve the IP slot first, so a flood cannot queue up on a gate.
     let attempt = match &ip_key {
         Some(k) => match state.limiter.begin(std::slice::from_ref(k)) {
             Ok(a) => Some(a),
@@ -466,38 +499,66 @@ async fn resume_from_device(state: &AppState, token: &str, ip_key: Option<String
         },
         None => None,
     };
+    // A junk token gets no gate; it fails fast below.
+    let Some(id) = crate::tokens::split_token(token, "pmd_").map(|(id, _)| id.to_owned()) else {
+        return resume_gated(state, token, attempt).await;
+    };
+    let gate = state.sessions.resume_gate(&id);
+    let out = {
+        let _held = gate.lock().await;
+        resume_gated(state, token, attempt).await
+    };
+    state.sessions.release_gate(&id, gate);
+    out
+}
+
+async fn resume_gated(
+    state: &AppState,
+    token: &str,
+    attempt: Option<super::ratelimit::Attempt<'_>>,
+) -> Resume {
     let st = state.clone();
-    let token = token.to_owned();
+    let tok = token.to_owned();
     let now = unix_now();
     // HKDF only (no Argon2), so no KDF permit is needed.
     let result = tokio::task::spawn_blocking(move || {
-        crate::devices::resume_device(&st, &token, now).map(|r| {
+        crate::devices::resume_device(&st, &tok, now).map(|r| {
             let pending = st.accounts.pending_recovery(&r.unlocked);
             (r, pending)
         })
     })
     .await;
-    let resumed = match result {
-        Ok(Ok(r)) => r,
+    let (r, pending) = match result {
+        Ok(Ok(r)) => {
+            if let Some(a) = attempt {
+                a.success();
+            }
+            r
+        }
         Ok(Err(fail)) => {
             if let Some(a) = attempt {
-                if fail.genuine {
+                // Only a wrong secret is a guess; an expired genuine device or
+                // an internal error is not.
+                if fail.genuine || fail.internal {
                     a.success();
                 } else {
                     a.failure();
                 }
             }
-            return Resume::Failed;
+            return if fail.internal {
+                Resume::Skipped
+            } else {
+                Resume::Failed
+            };
         }
         Err(e) => {
             tracing::error!(error = %e, "device resume task failed");
+            if let Some(a) = attempt {
+                a.success();
+            }
             return Resume::Skipped;
         }
     };
-    if let Some(a) = attempt {
-        a.success();
-    }
-    let (r, pending) = resumed;
     // Another request may have resumed the same device while this one waited.
     if let Some(s) = state.sessions.live_for_device(&r.device_id) {
         return Resume::Session(Box::new(s));
@@ -509,6 +570,15 @@ async fn resume_from_device(state: &AppState, token: &str, ip_key: Option<String
             return Resume::Skipped;
         }
     };
+    // The unlock may have raced an admin disabling the account.
+    match state.sys.user_by_id(&r.user.id) {
+        Ok(Some(u)) if !u.disabled => {}
+        Ok(_) => return Resume::Failed,
+        Err(e) => {
+            tracing::error!(error = %e, "user re-check failed on resume");
+            return Resume::Skipped;
+        }
+    }
     let (id, _csrf) = state
         .sessions
         .create(&r.user, r.unlocked, pending, Some(r.device_id));

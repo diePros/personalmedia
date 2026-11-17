@@ -323,3 +323,207 @@ async fn device_cookie_rejected_at_mcp() {
         .await;
     assert_eq!(resp.status(), 401);
 }
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+const LOGIN_FORM: &str = "username=alice&password=correct+horse+battery";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_resends_the_device_cookie() {
+    let (app, token) = setup().await;
+    let app = app.restart();
+    let resp = send(
+        &app,
+        Method::GET,
+        "/documents",
+        &device_cookie_header(&token),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let c = set_cookies(&resp)
+        .into_iter()
+        .find(|c| c.starts_with(&format!("__Host-pm_device={token};")))
+        .expect("device cookie re-sent");
+    assert!(c.contains("Max-Age=7776000"), "{c}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_remember_login_over_a_remembered_browser_forgets_the_device() {
+    let (app, token) = setup().await;
+    let app = app.restart();
+    // Resume (session S1 with the device), then log in again without remember.
+    let r1 = send(
+        &app,
+        Method::GET,
+        "/documents",
+        &device_cookie_header(&token),
+        None,
+    )
+    .await;
+    let s1 = session_of(&r1).unwrap();
+    let cookies = format!("__Host-pm_session={s1}; {}", device_cookie_header(&token));
+    let r2 = send(&app, Method::POST, "/login", &cookies, Some(LOGIN_FORM)).await;
+    assert_eq!(r2.status(), 303);
+    assert!(
+        device_of(&r2).is_some_and(|v| v.is_empty()),
+        "cookie cleared"
+    );
+    let s2 = session_of(&r2).unwrap();
+
+    // Log out of S2, even with the stale device cookie still sent.
+    let page = send(
+        &app,
+        Method::GET,
+        "/documents",
+        &format!("__Host-pm_session={s2}"),
+        None,
+    )
+    .await;
+    let csrf = csrf_from_html(&body_string(page).await);
+    let out = send(
+        &app,
+        Method::POST,
+        "/logout",
+        &format!("__Host-pm_session={s2}; {}", device_cookie_header(&token)),
+        Some(&format!("csrf={csrf}")),
+    )
+    .await;
+    assert_eq!(out.status(), 303);
+    assert!(
+        set_cookies(&out)
+            .iter()
+            .any(|c| c.starts_with("__Host-pm_device=;") && c.contains("Max-Age=0"))
+    );
+    let back = send(
+        &app,
+        Method::GET,
+        "/documents",
+        &device_cookie_header(&token),
+        None,
+    )
+    .await;
+    assert_eq!(back.status(), 303);
+    assert_eq!(header_str(&back, "location"), "/login");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remember_login_replaces_the_presented_device() {
+    let (app, old) = setup().await;
+    let resp = send(
+        &app,
+        Method::POST,
+        "/login",
+        &device_cookie_header(&old),
+        Some(&format!("{LOGIN_FORM}&remember=on")),
+    )
+    .await;
+    let new = device_of(&resp).unwrap();
+    assert_ne!(new, old);
+    let app2 = app.restart();
+    let gone = send(
+        &app2,
+        Method::GET,
+        "/documents",
+        &device_cookie_header(&old),
+        None,
+    )
+    .await;
+    assert_eq!(gone.status(), 303);
+    let ok = send(
+        &app2,
+        Method::GET,
+        "/documents",
+        &device_cookie_header(&new),
+        None,
+    )
+    .await;
+    assert_eq!(ok.status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_with_pending_recovery_key_goes_to_recovery_key() {
+    let app = TestApp::new();
+    let c = app.pending_session_for(USER);
+    let unlocked = app.state.sessions.get(&c.cookie).unwrap().unlocked;
+    let token =
+        personal_media::devices::create_device(&app.state.sys, &unlocked, "test", now()).unwrap();
+    let app = app.restart();
+    let resp = send(
+        &app,
+        Method::GET,
+        "/documents",
+        &device_cookie_header(&token),
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(header_str(&resp, "location"), "/recovery-key");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remember_on_recover_sets_device_cookie() {
+    let app = TestApp::new();
+    let url = app
+        .state
+        .accounts
+        .create_invite(personal_media::system_db::Role::User, now())
+        .unwrap();
+    let path = url.strip_prefix("https://test.example").unwrap();
+    let resp = app
+        .post_form(
+            path,
+            &[
+                ("username", USER),
+                ("password", PASSWORD),
+                ("password_confirm", PASSWORD),
+                ("understand", "on"),
+            ],
+            &Client::anon(),
+        )
+        .await;
+    let mut client = client_from_response(&resp);
+    let html = body_string(app.get("/recovery-key", &client).await).await;
+    let start = html.find("<code").unwrap();
+    let inner = &html[start..];
+    let key = inner[inner.find('>').unwrap() + 1..inner.find("</code>").unwrap()].trim();
+    client.csrf = csrf_from_html(&html);
+    app.post_form("/recovery-key", &[("saved", "on")], &client)
+        .await;
+
+    let pw = "a brand new passphrase";
+    let fields = |remember: bool| {
+        let mut f = vec![
+            ("username", USER),
+            ("recovery_key", key),
+            ("new_password", pw),
+            ("new_password_confirm", pw),
+        ];
+        if remember {
+            f.push(("remember", "on"));
+        }
+        f
+    };
+    let resp = app
+        .post_form("/recover", &fields(true), &Client::anon())
+        .await;
+    assert_eq!(resp.status(), 303);
+    let token = device_of(&resp).expect("device cookie after recover");
+    assert!(token.starts_with("pmd_"));
+    assert!(session_of(&resp).is_some());
+    // And it resumes (the recovery key is still pending, so /recovery-key).
+    let resumed = send(
+        &app.restart(),
+        Method::GET,
+        "/documents",
+        &device_cookie_header(&token),
+        None,
+    )
+    .await;
+    assert_eq!(header_str(&resumed, "location"), "/recovery-key");
+}
