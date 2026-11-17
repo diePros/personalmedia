@@ -109,10 +109,8 @@ impl AppState {
 
         let tmp = data_dir.join("tmp");
         wipe_tmp(&tmp)?;
-        let extract_cfg = ExtractConfig::new(tmp).with_embed(EmbedRuntime {
-            engine: engine.clone(),
-            hook: None,
-        });
+        let extract_cfg =
+            ExtractConfig::new(tmp).with_embed(EmbedRuntime::new(engine.clone(), None));
         start_workers(cfg.ocr_workers, extract_cfg, docs.clone(), rx);
 
         let sessions = Arc::new(SessionStore::new(cfg.session_idle, cfg.session_max));

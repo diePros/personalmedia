@@ -21,7 +21,8 @@ use personal_media::extract::{
 use personal_media::keyring::{Keyring, Unlocked, index_db_path};
 use personal_media::system_db::{Role, SYSTEM_DB_FILE, SystemDb};
 use personal_media::user_db::vectors::{
-    docs_needing_embedding, get_embed_status, get_vectors, replace_vectors, vector_count,
+    docs_needing_embedding, get_embed_status, get_vectors, replace_vectors,
+    replace_vectors_guarded, semantic_status, vector_count,
 };
 use personal_media::user_db::{
     AccessDefaults, Channel, Level, TextStatus, get_access_defaults, open_user_db,
@@ -61,6 +62,11 @@ struct Env {
 impl Env {
     /// `models` = Some starts workers with a real engine; None starts none.
     fn new(models: Option<(PathBuf, Option<Hook>)>) -> Env {
+        Env::build(models, None)
+    }
+
+    /// `max_chars` overrides the per-document embedding cap.
+    fn build(models: Option<(PathBuf, Option<Hook>)>, max_chars: Option<usize>) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().to_path_buf();
         let cfg_ = Config::for_tests(data.clone());
@@ -75,8 +81,11 @@ impl Env {
         ));
         if let Some((models, hook)) = models {
             let engine = Arc::new(Engine::new(models, Duration::from_secs(600)));
-            let cfg =
-                ExtractConfig::new(data.join("tmp")).with_embed(EmbedRuntime { engine, hook });
+            let mut rt = EmbedRuntime::new(engine, hook);
+            if let Some(m) = max_chars {
+                rt.max_chars = m;
+            }
+            let cfg = ExtractConfig::new(data.join("tmp")).with_embed(rt);
             start_workers(1, cfg, docs.clone(), rx);
         }
         let url = accounts.create_invite(Role::User, NOW).unwrap();
@@ -444,5 +453,74 @@ fn vectors_never_plaintext_on_disk() {
         assert!(!bytes.windows(marker.len()).any(|w| w == marker.as_bytes()));
     }
     assert!(total > 0);
+    drop(rt);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overlong_text_is_indexed_partially() {
+    let Some(models) = model_or_skip("overlong_text_is_indexed_partially") else {
+        return;
+    };
+    let e = Env::build(Some((models, None)), Some(3000));
+    e.set_default(Level::Full);
+    let long: String = (0..4000).map(|i| format!("Vertrag{i} Zahlung ")).collect();
+    assert!(long.chars().count() > 50_000);
+    let long_id = e.upload_text("long.txt", &long).await;
+    let short_id = e.upload_text("short.txt", SAMPLE).await;
+    e.wait("both indexed", |e| {
+        e.status(&long_id) == "partial" && e.status(&short_id) == "done"
+    });
+    let vs = e.u.with_db(|c| get_vectors(c, &long_id)).unwrap();
+    assert!(!vs.is_empty());
+    // Nothing beyond the cap was chunked.
+    assert!(vs.iter().all(|v| v.end <= 3000), "{:?}", vs.last());
+    assert_eq!(vs.last().unwrap().end, 3000);
+    let st = e.u.with_db(semantic_status).unwrap();
+    assert_eq!((st.eligible, st.indexed, st.partial), (2, 2, 1));
+    // Indexed once: nothing is left to do.
+    assert!(
+        e.u.with_db(|c| docs_needing_embedding(c, MODEL.name))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn partial_vectors_stay_valid_only_while_the_prefix_is_unchanged() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (e, id) = rt.block_on(async {
+        let e = Env::new(None);
+        let id = e.upload_text("a.txt", "x").await;
+        (e, id)
+    });
+    e.set_default(Level::Full);
+    let full = "abcdefghij".repeat(10); // 100 chars
+    e.u.with_db(|c| set_text(c, &id, TextStatus::Done, Some(&full), None, NOW))
+        .unwrap();
+    let items = vec![(Chunk { start: 0, end: 40 }, fake_vec(0.2))];
+    let prefix: String = full.chars().take(40).collect();
+    let store = |text: &str, partial: bool| {
+        e.u.with_db(|c| replace_vectors_guarded(c, &id, MODEL.name, text, partial, &items))
+            .unwrap()
+    };
+    // A prefix is not the whole text unless flagged as partial.
+    assert!(!store(&prefix, false));
+    assert_eq!(e.count(&id), 0);
+    assert!(store(&prefix, true));
+    assert_eq!(e.status(&id), "partial");
+    // The whole text, not flagged, is stored as done.
+    assert!(store(&full, false));
+    assert_eq!(e.status(&id), "done");
+    // Text changed beyond the prefix: partial vectors are still right ...
+    let tail_changed = format!("{prefix}{}", "z".repeat(80));
+    e.u.with_db(|c| set_text(c, &id, TextStatus::Done, Some(&tail_changed), None, NOW))
+        .unwrap();
+    assert!(store(&prefix, true));
+    // ... changed inside the prefix: discarded.
+    let head_changed = format!("Q{}", &tail_changed[1..]);
+    e.u.with_db(|c| set_text(c, &id, TextStatus::Done, Some(&head_changed), None, NOW))
+        .unwrap();
+    assert!(!store(&prefix, true));
+    assert_eq!(e.count(&id), 0);
     drop(rt);
 }

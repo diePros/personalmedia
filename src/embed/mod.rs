@@ -18,10 +18,15 @@ use ort::session::Session;
 use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
-pub use chunk::{CHUNK_OVERLAP, CHUNK_TOKENS, Chunk, chunk_text};
+pub use chunk::{CHUNK_OVERLAP, CHUNK_TOKENS, Chunk, Chunked, WINDOW_CHARS, chunk_text};
 pub use model::{MODEL, ModelSpec, ensure_model};
 
 const BATCH: usize = 16;
+
+/// At most this many characters of one document are embedded (about 600
+/// pages). Bounds tokenizer memory, embedding time and the vectors held per
+/// document. Longer documents are stored as `partial`.
+pub const MAX_EMBED_CHARS: usize = 2_000_000;
 
 struct Loaded {
     session: Session,
@@ -164,9 +169,18 @@ impl Engine {
     }
 
     /// Split `text` into chunks of [`CHUNK_TOKENS`] tokens with
-    /// [`CHUNK_OVERLAP`] overlap, as character ranges into `text`.
+    /// [`CHUNK_OVERLAP`] overlap, as character ranges into `text`. Only the
+    /// first [`MAX_EMBED_CHARS`] characters are chunked.
     pub fn chunk(&self, text: &str) -> Result<Vec<Chunk>> {
-        self.with_loaded(|l| chunk_text(text, &l.tokenizer, CHUNK_TOKENS, CHUNK_OVERLAP))
+        Ok(self.chunk_bounded(text, MAX_EMBED_CHARS)?.chunks)
+    }
+
+    /// [`Engine::chunk`] over at most the first `max_chars` characters,
+    /// tokenised in windows (see [`chunk::chunk_text_bounded`]).
+    pub fn chunk_bounded(&self, text: &str, max_chars: usize) -> Result<Chunked> {
+        self.with_loaded(|l| {
+            chunk::chunk_text_bounded(text, &l.tokenizer, CHUNK_TOKENS, CHUNK_OVERLAP, max_chars)
+        })
     }
 
     /// Embed document passages (`"passage: "` prefix); L2-normalised, 384 dims.

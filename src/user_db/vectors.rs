@@ -28,7 +28,7 @@ pub fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 
 pub fn set_embed_status(conn: &Connection, doc_id: &str, status: &str) -> Result<()> {
     ensure!(
-        matches!(status, "none" | "pending" | "done" | "failed"),
+        matches!(status, "none" | "pending" | "done" | "partial" | "failed"),
         "bad embed status"
     );
     conn.execute(
@@ -59,6 +59,7 @@ fn write_vectors(
     doc_id: &str,
     model: &str,
     items: &[(Chunk, Vec<f32>)],
+    partial: bool,
 ) -> Result<()> {
     conn.execute("DELETE FROM chunk_vectors WHERE document_id = ?1", [doc_id])?;
     let mut stmt = conn.prepare(
@@ -76,7 +77,7 @@ fn write_vectors(
         ])?;
     }
     drop(stmt);
-    set_embed_status(conn, doc_id, "done")
+    set_embed_status(conn, doc_id, if partial { "partial" } else { "done" })
 }
 
 /// Replace all vectors of a document in one transaction.
@@ -87,34 +88,61 @@ pub fn replace_vectors(
     items: &[(Chunk, Vec<f32>)],
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    write_vectors(&tx, doc_id, model, items)?;
+    write_vectors(&tx, doc_id, model, items, false)?;
     tx.commit()?;
     Ok(())
+}
+
+/// The first `max_chars` characters of a document's text and whether the text
+/// is longer. Reads the prefix in SQL so a huge text is not copied twice.
+pub fn get_document_text_prefix(
+    conn: &Connection,
+    doc_id: &str,
+    max_chars: usize,
+) -> Result<Option<(String, bool)>> {
+    let max = max_chars as i64;
+    Ok(conn
+        .query_row(
+            "SELECT substr(content, 1, ?2), length(content) > ?2
+             FROM document_text WHERE document_id = ?1",
+            params![doc_id, max],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
 }
 
 /// Race guard: inside ONE write transaction, re-check that the document still
 /// has the text the vectors were computed from and that its effective
 /// `semantic_index` is still `full`. Only then write. Returns whether the
 /// vectors were stored; otherwise they are discarded.
+///
+/// `text` is the whole text, or (when `partial`) its prefix: then the stored
+/// text must still start with it and the status becomes `partial`. All
+/// vectors of one document are written in this single transaction (that is
+/// what makes the guard atomic); the embed cap bounds their number.
 pub fn replace_vectors_guarded(
     conn: &Connection,
     doc_id: &str,
     model: &str,
     text: &str,
+    partial: bool,
     items: &[(Chunk, Vec<f32>)],
 ) -> Result<bool> {
     let tx = conn.unchecked_transaction()?;
-    let current: Option<String> = tx
+    let n = text.chars().count() as i64;
+    let current: Option<(String, bool)> = tx
         .query_row(
-            "SELECT content FROM document_text WHERE document_id = ?1",
-            [doc_id],
-            |r| r.get(0),
+            "SELECT substr(content, 1, ?2), length(content) > ?2
+             FROM document_text WHERE document_id = ?1",
+            params![doc_id, n],
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let ok = current.as_deref() == Some(text)
-        && effective_level(&tx, doc_id, Channel::SemanticIndex, Level::Full)? == Level::Full;
+    let same = current.is_some_and(|(head, longer)| head == text && (partial || !longer));
+    let ok =
+        same && effective_level(&tx, doc_id, Channel::SemanticIndex, Level::Full)? == Level::Full;
     if ok {
-        write_vectors(&tx, doc_id, model, items)?;
+        write_vectors(&tx, doc_id, model, items, partial)?;
         tx.commit()?;
     }
     Ok(ok)
@@ -305,28 +333,46 @@ pub fn search(
 pub struct SemanticStatus {
     /// Documents whose effective `semantic_index` is full.
     pub eligible: usize,
-    /// Of those, with finished vectors.
+    /// Of those, with finished vectors of the current model (this includes
+    /// the `partial` ones).
     pub indexed: usize,
+    /// Of the indexed ones, those embedded only up to the length cap.
+    pub partial: usize,
     pub failed: usize,
+    /// Waiting for (re-)embedding, also after a model change.
     pub pending: usize,
 }
 
 pub fn semantic_status(conn: &Connection) -> Result<SemanticStatus> {
-    let mut stmt = conn.prepare("SELECT id, embed_status FROM documents")?;
-    let rows: Vec<(String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let mut stmt = conn.prepare(
+        "SELECT d.id, d.embed_status,
+                EXISTS(SELECT 1 FROM chunk_vectors v WHERE v.document_id = d.id AND v.model = ?1),
+                EXISTS(SELECT 1 FROM chunk_vectors v WHERE v.document_id = d.id)
+         FROM documents d",
+    )?;
+    let rows: Vec<(String, String, bool, bool)> = stmt
+        .query_map([MODEL.name], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
     let mut st = SemanticStatus::default();
-    for (id, status) in rows {
+    for (id, status, has_model, has_any) in rows {
         if effective_level(conn, &id, Channel::SemanticIndex, Level::Full)? != Level::Full {
             continue;
         }
         st.eligible += 1;
         match status.as_str() {
-            "done" => st.indexed += 1,
+            // Old-model vectors are ignored by search: not indexed until
+            // re-embedded. A text without chunks has no vectors at all.
+            "done" | "partial" if has_model || !has_any => {
+                st.indexed += 1;
+                if status == "partial" {
+                    st.partial += 1;
+                }
+            }
+            "done" | "partial" | "pending" => st.pending += 1,
             "failed" => st.failed += 1,
-            "pending" => st.pending += 1,
             _ => {}
         }
     }
@@ -340,6 +386,9 @@ pub fn embed_status_words(conn: &Connection, doc_id: &str) -> Result<&'static st
     }
     Ok(match get_embed_status(conn, doc_id)?.as_deref() {
         Some("done") => "Indexed for semantic search",
+        Some("partial") => {
+            "Partially indexed for semantic search (only the first part of a very long text)"
+        }
         Some("failed") => "Indexing failed; it is retried the next time you log in",
         _ => "Waiting to be indexed",
     })

@@ -14,6 +14,22 @@ pub struct Chunk {
     pub end: usize,
 }
 
+/// Characters tokenised at once. Tokenizer memory (about 320 bytes per token
+/// at peak) is bounded by this, not by the document size.
+pub const WINDOW_CHARS: usize = 32 * 1024;
+
+/// What [`chunk_text_bounded`] did, for diagnostics and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunked {
+    pub chunks: Vec<Chunk>,
+    /// The text was longer than the limit; only a prefix was chunked.
+    pub truncated: bool,
+    /// Characters actually tokenised (<= the limit).
+    pub chars_tokenized: usize,
+    /// The largest window handed to the tokenizer, in characters.
+    pub max_window_chars: usize,
+}
+
 /// Split `text` into chunks of at most `max_tokens` tokens, consecutive chunks
 /// overlapping by `overlap` tokens. The chunks cover the whole text. `tok`
 /// must not truncate (the engine's tokenizer does not).
@@ -23,30 +39,89 @@ pub fn chunk_text(
     max_tokens: usize,
     overlap: usize,
 ) -> Result<Vec<Chunk>> {
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    let enc = tok
-        .encode(text, false)
-        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-    Ok(chunk_offsets(text, enc.get_offsets(), max_tokens, overlap))
+    Ok(chunk_text_bounded(text, tok, max_tokens, overlap, usize::MAX)?.chunks)
 }
 
-/// Core of [`chunk_text`] over token byte offsets (testable without a model).
-pub fn chunk_offsets(
+/// Like [`chunk_text`] but looks at no more than the first `max_chars`
+/// characters and tokenises in windows of [`WINDOW_CHARS`] characters (cut at
+/// whitespace), so memory does not grow with the text. Token spans are kept
+/// globally, so the chunk overlap carries across window borders.
+pub fn chunk_text_bounded(
     text: &str,
-    offsets: &[(usize, usize)],
+    tok: &Tokenizer,
     max_tokens: usize,
     overlap: usize,
-) -> Vec<Chunk> {
-    let n = offsets.len();
-    if n == 0 || text.trim().is_empty() {
-        return Vec::new();
+    max_chars: usize,
+) -> Result<Chunked> {
+    let (head, truncated) = char_prefix(text, max_chars);
+    let mut spans: Vec<(usize, usize)> = Vec::new(); // global char offsets
+    let (mut base, mut max_window) = (0usize, 0usize);
+    for window in windows(head, WINDOW_CHARS) {
+        let n_chars = window.chars().count();
+        max_window = max_window.max(n_chars);
+        if !window.trim().is_empty() {
+            let enc = tok
+                .encode(window, false)
+                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            let b2c = byte_to_char(window);
+            let last = window.len();
+            spans.extend(
+                enc.get_offsets()
+                    .iter()
+                    .map(|&(s, e)| (base + b2c[s.min(last)], base + b2c[e.min(last)])),
+            );
+        }
+        base += n_chars;
     }
-    let max_tokens = max_tokens.max(1);
-    let step = max_tokens.saturating_sub(overlap).max(1);
+    let chunks = if head.trim().is_empty() {
+        Vec::new()
+    } else {
+        chunk_spans(&spans, base, max_tokens, overlap)
+    };
+    Ok(Chunked {
+        chunks,
+        truncated,
+        chars_tokenized: base,
+        max_window_chars: max_window,
+    })
+}
 
-    // byte offset -> char offset
+/// The first `max_chars` characters of `text` and whether anything was cut.
+pub fn char_prefix(text: &str, max_chars: usize) -> (&str, bool) {
+    match text.char_indices().nth(max_chars) {
+        Some((i, _)) => (&text[..i], true),
+        None => (text, false),
+    }
+}
+
+/// Consecutive slices of `text` of at most `max_chars` characters each, cut
+/// after whitespace where possible. Concatenated they equal `text`.
+pub fn windows(text: &str, max_chars: usize) -> impl Iterator<Item = &str> {
+    let max_chars = max_chars.max(1);
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let Some((hard, _)) = rest.char_indices().nth(max_chars) else {
+            return Some(std::mem::take(&mut rest));
+        };
+        // Prefer the last whitespace in the second half of the window.
+        let cut = rest[..hard]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .filter(|&i| i > hard / 2)
+            .unwrap_or(hard);
+        let (head, tail) = rest.split_at(cut);
+        rest = tail;
+        Some(head)
+    })
+}
+
+/// byte offset -> char offset, for one (small) slice.
+fn byte_to_char(text: &str) -> Vec<usize> {
     let mut b2c = vec![0usize; text.len() + 1];
     let mut ci = 0;
     for (bi, ch) in text.char_indices() {
@@ -56,19 +131,50 @@ pub fn chunk_offsets(
         ci += 1;
     }
     b2c[text.len()] = ci;
-    let total_chars = ci;
-    let c = |b: usize| b2c[b.min(text.len())];
+    b2c
+}
 
+/// [`chunk_spans`] over token **byte** offsets into `text` (testable without a
+/// model; allocates a byte table, so for small texts).
+pub fn chunk_offsets(
+    text: &str,
+    offsets: &[(usize, usize)],
+    max_tokens: usize,
+    overlap: usize,
+) -> Vec<Chunk> {
+    if offsets.is_empty() || text.trim().is_empty() {
+        return Vec::new();
+    }
+    let b2c = byte_to_char(text);
+    let c = |b: usize| b2c[b.min(text.len())];
+    let spans: Vec<(usize, usize)> = offsets.iter().map(|&(s, e)| (c(s), c(e))).collect();
+    chunk_spans(&spans, b2c[text.len()], max_tokens, overlap)
+}
+
+/// Core chunker over token spans given as **character** offsets;
+/// `total_chars` is the length of the covered text.
+pub fn chunk_spans(
+    spans: &[(usize, usize)],
+    total_chars: usize,
+    max_tokens: usize,
+    overlap: usize,
+) -> Vec<Chunk> {
+    let n = spans.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let max_tokens = max_tokens.max(1);
+    let step = max_tokens.saturating_sub(overlap).max(1);
     let mut out: Vec<Chunk> = Vec::new();
     let mut i = 0;
     loop {
         let end_tok = (i + max_tokens).min(n);
         let last = end_tok == n;
-        let start = if i == 0 { 0 } else { c(offsets[i].0) };
+        let start = if i == 0 { 0 } else { spans[i].0 };
         let end = if last {
             total_chars
         } else {
-            c(offsets[end_tok - 1].1)
+            spans[end_tok - 1].1
         };
         let start = out.last().map_or(start, |p| start.min(p.end));
         out.push(Chunk {
@@ -154,6 +260,29 @@ mod tests {
             .count();
             assert!((49..=51).contains(&overlap), "overlap {overlap}");
         }
+    }
+
+    #[test]
+    fn windows_are_bounded_and_lossless() {
+        let text = numbered(5000);
+        let ws: Vec<&str> = windows(&text, 1000).collect();
+        assert!(ws.len() >= 5);
+        assert!(ws.iter().all(|w| w.chars().count() <= 1000));
+        assert_eq!(ws.concat(), text);
+        // cut after whitespace: no window ends inside a word
+        assert!(ws[..ws.len() - 1].iter().all(|w| w.ends_with(' ')));
+        // no whitespace at all: hard cut, still lossless
+        let blob = "日".repeat(2500);
+        let ws: Vec<&str> = windows(&blob, 1000).collect();
+        assert_eq!(ws.len(), 3);
+        assert_eq!(ws.concat(), blob);
+    }
+
+    #[test]
+    fn char_prefix_cuts_on_char_boundaries() {
+        assert_eq!(char_prefix("äöü€x", 3), ("äöü", true));
+        assert_eq!(char_prefix("äöü", 3), ("äöü", false));
+        assert_eq!(char_prefix("", 3), ("", false));
     }
 
     #[test]

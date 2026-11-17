@@ -12,12 +12,13 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, WeakUnboundedSender};
 
 use crate::documents::{Documents, Enqueue};
-use crate::embed::{Chunk, Engine, MODEL};
+use crate::embed::{Chunk, Engine, MAX_EMBED_CHARS, MODEL};
 use crate::keyring::{OnUnlock, Unlocked};
 use crate::user_db::vectors::{
-    docs_needing_embedding, needs_embedding, replace_vectors_guarded, set_embed_status,
+    docs_needing_embedding, get_document_text_prefix, needs_embedding, replace_vectors_guarded,
+    set_embed_status,
 };
-use crate::user_db::{TextStatus, get_document_text, pending_document_ids, set_text};
+use crate::user_db::{TextStatus, pending_document_ids, set_text};
 
 /// Chunks embedded per `embed_passages` call.
 pub const EMBED_BATCH: usize = 16;
@@ -29,6 +30,8 @@ pub enum EmbedEvent {
     Batch(usize),
     /// All vectors are computed; the guarded write comes next.
     BeforeCommit,
+    /// The embed job ended (stored, discarded, skipped or failed).
+    Finished,
 }
 
 pub type EmbedHookFn = dyn Fn(EmbedEvent) + Send + Sync;
@@ -38,6 +41,19 @@ pub type EmbedHookFn = dyn Fn(EmbedEvent) + Send + Sync;
 pub struct EmbedRuntime {
     pub engine: Arc<Engine>,
     pub hook: Option<Arc<EmbedHookFn>>,
+    /// Characters of one document that are embedded at most
+    /// ([`MAX_EMBED_CHARS`]); longer texts are indexed as `partial`.
+    pub max_chars: usize,
+}
+
+impl EmbedRuntime {
+    pub fn new(engine: Arc<Engine>, hook: Option<Arc<EmbedHookFn>>) -> EmbedRuntime {
+        EmbedRuntime {
+            engine,
+            hook,
+            max_chars: MAX_EMBED_CHARS,
+        }
+    }
 }
 
 impl std::fmt::Debug for EmbedRuntime {
@@ -596,6 +612,7 @@ async fn run_embed_job(cfg: &ExtractConfig, u: Arc<Unlocked>, id: String) {
     let Some(rt) = cfg.embed.clone() else {
         return;
     };
+    let rt2 = rt.clone();
     let started = Instant::now();
     let (u2, id2) = (u.clone(), id.clone());
     let res = tokio::task::spawn_blocking(move || embed_document(&rt, &u2, &id2))
@@ -614,38 +631,63 @@ async fn run_embed_job(cfg: &ExtractConfig, u: Arc<Unlocked>, id: String) {
             let _ = u.with_db(|c| set_embed_status(c, &id, "failed"));
         }
     }
+    if let Some(h) = &rt2.hook {
+        h(EmbedEvent::Finished);
+    }
 }
 
-/// Byte offset of every character boundary of `text` (plus the end).
-fn char_boundaries(text: &str) -> Vec<usize> {
-    let mut v: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    v.push(text.len());
-    v
+/// Walks forward through `text` to turn character ranges into byte ranges
+/// without a per-character table. Ranges must come in non-decreasing `start`
+/// order (the chunker's order).
+struct CharCursor {
+    chars: usize,
+    bytes: usize,
+}
+
+impl CharCursor {
+    fn slice<'a>(&mut self, text: &'a str, start: usize, end: usize) -> &'a str {
+        let advance = |chars: &mut usize, bytes: &mut usize, to: usize| {
+            for c in text[*bytes..].chars() {
+                if *chars >= to {
+                    break;
+                }
+                *chars += 1;
+                *bytes += c.len_utf8();
+            }
+        };
+        advance(&mut self.chars, &mut self.bytes, start);
+        let from = self.bytes;
+        let (mut c, mut b) = (self.chars, self.bytes);
+        advance(&mut c, &mut b, end);
+        &text[from..b]
+    }
 }
 
 /// Embeds one document and stores its vectors. Blocking.
 fn embed_document(rt: &EmbedRuntime, u: &Arc<Unlocked>, id: &str) -> anyhow::Result<&'static str> {
     // Eligibility is re-checked now, the job may have waited in the queue.
-    let text = u.with_db(|c| {
+    // Only a bounded prefix of the text is read and embedded.
+    let max_chars = rt.max_chars;
+    let loaded = u.with_db(|c| {
         if !needs_embedding(c, id, MODEL.name)? {
             return anyhow::Ok(None);
         }
-        let text = get_document_text(c, id)?;
+        let text = get_document_text_prefix(c, id, max_chars)?;
         if text.is_some() {
             set_embed_status(c, id, "pending")?;
         }
         anyhow::Ok(text)
     })?;
-    let Some(text) = text else {
+    let Some((text, partial)) = loaded else {
         return Ok("skipped");
     };
-    let chunks: Vec<Chunk> = rt.engine.chunk(&text)?;
-    let bounds = char_boundaries(&text);
+    let chunks: Vec<Chunk> = rt.engine.chunk_bounded(&text, max_chars)?.chunks;
+    let mut cursor = CharCursor { chars: 0, bytes: 0 };
     let mut items: Vec<(Chunk, Vec<f32>)> = Vec::with_capacity(chunks.len());
     for batch in chunks.chunks(EMBED_BATCH) {
         let passages: Vec<&str> = batch
             .iter()
-            .map(|c| &text[bounds[c.start]..bounds[c.end]])
+            .map(|c| cursor.slice(&text, c.start, c.end))
             .collect();
         let vectors = rt.engine.embed_passages(&passages)?;
         anyhow::ensure!(vectors.len() == batch.len(), "embedding count mismatch");
@@ -657,11 +699,12 @@ fn embed_document(rt: &EmbedRuntime, u: &Arc<Unlocked>, id: &str) -> anyhow::Res
     if let Some(h) = &rt.hook {
         h(EmbedEvent::BeforeCommit);
     }
-    let stored = u.with_db(|c| replace_vectors_guarded(c, id, MODEL.name, &text, &items))?;
+    let stored =
+        u.with_db(|c| replace_vectors_guarded(c, id, MODEL.name, &text, partial, &items))?;
     if !stored {
         // Level lowered, text changed or document gone: nothing is kept.
         // A raise that happened meanwhile enqueued its own job.
         return Ok("discarded");
     }
-    Ok("done")
+    Ok(if partial { "partial" } else { "done" })
 }
