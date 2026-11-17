@@ -642,13 +642,16 @@ fn raw_conn(path: &std::path::Path) -> Connection {
     conn
 }
 
-/// An index DB as v1.4 left it (`upto` = 1 or 2) with two documents.
+/// An index DB as an older release left it (`upto` = 1, 2 or 3) with two documents.
 fn old_db(path: &std::path::Path, upto: i64) {
     let conn = raw_conn(path);
     conn.execute_batch(SCHEMA_V1).unwrap();
     conn.execute_batch("PRAGMA user_version = 1;").unwrap();
     if upto >= 2 {
         conn.execute_batch(MIGRATION_V2).unwrap();
+    }
+    if upto >= 3 {
+        conn.execute_batch(MIGRATION_V3).unwrap();
     }
     for (id, title) in [("a1", "Rechnung"), ("b2", "Brief")] {
         conn.execute(
@@ -756,22 +759,16 @@ fn readonly_open_reads_v1_v2_and_v3_without_migrating() {
     for v in [1, 2, 3] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.db");
-        if v == 3 {
-            let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
-            insert_document(&conn, &nd("a1", "Rechnung", "a1.pdf", &[], 100)).unwrap();
-            set_notes(&conn, "a1", "n", 1).unwrap();
-        } else {
-            old_db(&path, v);
-        }
+        old_db(&path, v);
         let conn = open_user_db_readonly(&path, &Key32::from_bytes([7; 32])).unwrap();
         let docs = list_documents(&conn, &all()).unwrap();
         assert!(!docs.is_empty(), "v{v}");
         let d = get_document(&conn, &docs[0].id).unwrap().unwrap();
-        assert_eq!(d.notes, if v == 3 { "n" } else { "" });
+        assert_eq!(d.notes, "");
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, if v == 3 { 4 } else { v }, "recover must not migrate");
+        assert_eq!(ver, v, "recover must not migrate");
     }
 }
 

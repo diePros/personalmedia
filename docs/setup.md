@@ -64,6 +64,8 @@ nano .env        # at least PM_PUBLIC_URL; DATA_DIR if your data folder is elsew
 | `IMAGE_TAG` | `latest` | Image version, e.g. `1.6` to pin. |
 | `MEM_LIMIT` | `1536m` | Container memory limit. |
 | `PM_MAX_UPLOAD_MB` | `100` | Largest upload. |
+| `PM_BIND` | `127.0.0.1:8080` | Address the app listens on. Change it only together with the Funnel target. |
+| `PM_TRUSTED_PROXY` | `127.0.0.1` | Address of the reverse proxy whose forwarded client IP is trusted. |
 | `PM_IOS_SHORTCUT_URL` | unset | iCloud link of the PMS Shortcut (section 7b). |
 
 Any other `PM_…` setting from this guide (e.g. `PM_SESSION_IDLE_MINUTES`) also goes into `.env`. For changes `.env` can't express (another volume, a different tmpfs size), create a `docker-compose.override.yml` next to the compose file; compose merges it automatically and git ignores it too. The root filesystem is read-only; only `/data` and the tmpfs are writable.
@@ -73,7 +75,8 @@ Any other `PM_…` setting from this guide (e.g. `PM_SESSION_IDLE_MINUTES`) also
 ```bash
 git diff docker-compose.yml       # note your PM_PUBLIC_URL, data path, Shortcut URL, ...
 cp .env.example .env && nano .env # put them in here
-git checkout docker-compose.yml   # discard the local edits (or: git stash drop, if they are stashed)
+git checkout docker-compose.yml   # discard the local edits
+# if you had stashed them instead: `git stash show -p` shows them; once they are in .env, `git stash drop`
 git pull
 ```
 
@@ -112,7 +115,7 @@ The image installs German and English OCR data (`tesseract-ocr-deu`, `tesseract-
 
 ## 4. Enable Funnel on the existing Tailscale container
 
-> **Your ZimaOS setup:** the ZimaOS Tailscale app (`docs/tailscale.yaml`) overrides the entrypoint and runs `tailscaled` directly. Because of that, `TS_SERVE_CONFIG` (Option B) and `TS_EXTRA_ARGS` have no effect there. Use **`deploy/tailscale-funnel.yaml`** instead. It's the same config with one added line, `tailscale funnel --bg --yes --https=443 http://127.0.0.1:8080`, which runs before `tailscale web`. Paste it into the Tailscale app's compose settings in ZimaOS and restart the app. Then check with `docker exec tailscale tailscale funnel status`. If something else on the ZimaBoard already uses port 8080, change both `PM_BIND` and this line.
+> **Your ZimaOS setup:** the ZimaOS Tailscale app (`docs/tailscale.yaml`) overrides the entrypoint and runs `tailscaled` directly. Because of that, `TS_SERVE_CONFIG` (Option B) and `TS_EXTRA_ARGS` have no effect there. Use **`deploy/tailscale-funnel.yaml`** instead. It's the same config with one added line, `tailscale funnel --bg --yes --https=443 http://127.0.0.1:8080`, which runs before `tailscale web`. Paste it into the Tailscale app's compose settings in ZimaOS and restart the app. Then check with `docker exec tailscale tailscale funnel status`. If something else on the ZimaBoard already uses port 8080, set `PM_BIND` (and, if the proxy is elsewhere, `PM_TRUSTED_PROXY`) in `.env` and change the port in this line to match.
 
 Your Tailscale container already runs with `network_mode: host`. Pick **one** of the two ways below.
 
@@ -203,7 +206,7 @@ Invite friends from the admin page. Each invite link is single-use and expires a
 
 The login and recovery forms have a "Remember this device" box, ticked by default. It keeps that browser logged in for 90 days (renewed when used) without asking for the password, even after the server restarts or the session times out. It works for every login method, and a second factor is not asked again on that browser.
 
-The risk: anyone holding a remembered device unlocked can open your documents, and a stolen device cookie works until you revoke it. Untick the box on shared computers. Logging out forgets only the current device. To revoke, open Settings, "Remembered devices": revoke one device, or "Sign out all other devices". Changing your password or logging in with the recovery key signs out every remembered device. Turning off two-factor authentication needs your password.
+The risk: anyone holding a remembered device unlocked can open your documents, and a stolen device cookie works until you revoke it. Untick the box on shared computers. Logging out forgets only the current device. To revoke, open Settings, "Remembered devices": revoke one device, or "Sign out all other devices". Changing your password or logging in with the recovery key signs out every remembered device. Turning off two-factor authentication needs your password. On an admin account, a remembered device can also use the admin page, though destructive admin actions (deleting a user) ask for the password again. Disabling a user in the admin page forgets all of that user's remembered devices.
 
 ## 7. Connect Hermes (MCP)
 
@@ -353,7 +356,7 @@ To pin a version instead of `latest`, set `IMAGE_TAG=1.6` in `.env`. A local bui
 
 What an update does:
 - Documents, accounts, MCP tokens and the Funnel setup stay as they are.
-- Everyone is logged out once, because keys only live in memory.
+- Browsers without a remembered device are logged out once, because keys only live in memory. Remembered devices stay logged in across updates and restarts.
 - Pending OCR jobs resume at each user's next login.
 - Database changes ship as automatic migrations (schema frozen since v1.0.0).
 

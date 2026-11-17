@@ -431,6 +431,18 @@ pub fn check_csrf(
     }
 }
 
+/// [`check_csrf`] for a handler that read the urlencoded body itself.
+pub fn check_csrf_body(
+    session: &Session,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(), StatusCode> {
+    let field = serde_urlencoded::from_bytes::<CsrfField>(body)
+        .ok()
+        .and_then(|f| f.csrf);
+    check_csrf(session, headers, field.as_deref())
+}
+
 fn is_urlencoded_form(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
@@ -449,7 +461,11 @@ pub async fn session_layer(State(state): State<AppState>, req: Request, next: Ne
     let mut session = session_id(req.headers()).and_then(|id| state.sessions.get(id));
     // Cookies to add to the response after the handler ran.
     let mut extra: Vec<HeaderValue> = Vec::new();
+    // `POST /logout` never resumes: the page's CSRF token belongs to the
+    // session that ended, and `logout` handles the bare device cookie itself.
+    let is_logout = *req.method() == Method::POST && req.uri().path() == "/logout";
     if session.is_none()
+        && !is_logout
         && let Some(token) = device_token(req.headers()).map(str::to_owned)
     {
         let ip_key = req
@@ -533,6 +549,11 @@ async fn resume_gated(
     let tok = token.to_owned();
     let now = unix_now();
     // HKDF only (no Argon2), so no KDF permit is needed.
+    //
+    // A device revoked elsewhere (its row is gone) counts as one non-genuine
+    // limiter failure below: without the row the secret cannot be verified, so
+    // the request looks the same as a guess. It is a single failure per
+    // request, and the cookie is cleared so it is not repeated.
     let result = tokio::task::spawn_blocking(move || {
         crate::devices::resume_device(&st, &tok, now).map(|r| {
             let pending = st.accounts.pending_recovery(&r.unlocked);

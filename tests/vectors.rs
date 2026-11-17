@@ -727,7 +727,7 @@ fn readonly_open_works_on_v1_and_v2_databases() {
     assert_eq!(title, "Old doc");
     assert_eq!(user_version(&ro), 1);
 
-    // Current schema (v3): vectors and embed_status are readable.
+    // Current schema: vectors and embed_status are readable.
     let v2 = dir.path().join("v2.db");
     {
         let conn = open_user_db(&v2, &key).unwrap();

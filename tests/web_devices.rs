@@ -298,7 +298,7 @@ async fn post_after_idle_resumes_but_needs_fresh_csrf() {
     let resp = send(
         &app,
         Method::POST,
-        "/logout",
+        "/settings/password",
         &device_cookie_header(&token),
         Some(&format!("csrf={stale}")),
     )
@@ -801,4 +801,74 @@ async fn revoking_the_current_device_keeps_the_session() {
     assert!(clears_device_cookie(&resp));
     assert_eq!(session_status(&app, &client_b).await.0, 200);
     assert!(!resumes(&app, &token_b).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_after_session_expiry_forgets_device() {
+    let app = TestApp::with_config(|c| c.session_idle = Duration::from_secs(1));
+    app.signup_and_login(USER).await;
+    let resp = login(&app, true).await;
+    let token = device_of(&resp).unwrap();
+    let (client, _) = settings_client(&app, &resp).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The session is gone; the page still holds its CSRF token.
+    let cookies = format!("{}; {}", client.cookie, device_cookie_header(&token));
+    let resp = send(
+        &app,
+        Method::POST,
+        "/logout",
+        &cookies,
+        Some(&format!("csrf={}", client.csrf)),
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    assert_eq!(header_str(&resp, "location"), "/login");
+    assert!(clears_device_cookie(&resp));
+    assert!(!resumes(&app, &token).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn logout_after_restart_forgets_device() {
+    let (app, token) = setup().await;
+    let app = app.restart();
+    let resp = send(
+        &app,
+        Method::POST,
+        "/logout",
+        &device_cookie_header(&token),
+        Some("csrf=stale"),
+    )
+    .await;
+    assert_eq!(resp.status(), 303);
+    assert!(clears_device_cookie(&resp));
+    assert!(!resumes(&app, &token).await);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_login_keeps_remember_unticked() {
+    let app = TestApp::new();
+    app.signup_and_login(USER).await;
+    let bad = [("username", USER), ("password", "wrong password here")];
+    let html = body_string(app.post_form("/login", &bad, &Client::anon()).await).await;
+    assert!(html.contains(r#"name="remember" value="on">"#), "{html}");
+    let mut ticked = bad.to_vec();
+    ticked.push(("remember", "on"));
+    let html = body_string(app.post_form("/login", &ticked, &Client::anon()).await).await;
+    assert!(html.contains(r#"name="remember" value="on" checked>"#));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabling_a_user_revokes_devices_for_good() {
+    let (app, token) = setup().await;
+    let admin = app.admin_session_for("root");
+    let id = app.state.sys.user_by_name(USER).unwrap().unwrap().id;
+    let resp = app
+        .post_form(&format!("/admin/users/{id}/disable"), &[], &admin)
+        .await;
+    assert_eq!(resp.status(), 303);
+    let resp = app
+        .post_form(&format!("/admin/users/{id}/enable"), &[], &admin)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(!resumes(&app, &token).await);
 }

@@ -83,7 +83,7 @@ async fn blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(f).await.map_err(internal)
 }
 
-fn limiter_keys(
+pub(super) fn limiter_keys(
     state: &AppState,
     peer: SocketAddr,
     headers: &HeaderMap,
@@ -95,7 +95,7 @@ fn limiter_keys(
 
 /// Checks the account password under the KDF semaphore. `Err` is a ready
 /// response (503 or 500); `Ok(Err(..))` is the verification result.
-async fn check_password(
+pub(super) async fn check_password(
     state: &AppState,
     session: &Session,
     password: String,

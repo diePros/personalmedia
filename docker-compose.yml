@@ -30,9 +30,9 @@ services:
     # App settings (PM_PUBLIC_URL, PM_MAX_UPLOAD_MB, PM_IOS_SHORTCUT_URL, ...) come from .env.
     env_file: .env
     environment:
-      # Fixed: the app sits behind Tailscale Funnel on this host.
-      PM_BIND: 127.0.0.1:8080
-      PM_TRUSTED_PROXY: 127.0.0.1
+      # The app sits behind Tailscale Funnel on this host; override in .env if needed.
+      PM_BIND: ${PM_BIND:-127.0.0.1:8080}
+      PM_TRUSTED_PROXY: ${PM_TRUSTED_PROXY:-127.0.0.1}
       PM_PUBLIC_URL: ${PM_PUBLIC_URL:?set PM_PUBLIC_URL in .env (copy .env.example)}
     volumes:
       - ${DATA_DIR:-/DATA/AppData/personal-media}:/data

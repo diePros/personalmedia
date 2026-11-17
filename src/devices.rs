@@ -54,7 +54,7 @@ pub fn create_device(
         id: id.clone(),
         label: label.to_owned(),
         created_at: now,
-        last_used_at: None,
+        last_used_at: Some(now),
     };
     if let Err(e) = u.with_db(|c| insert_device_meta(c, &meta)) {
         if let Err(e2) = sys.delete_token(&id) {

@@ -19,9 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::ratelimit::{client_ip, ip_key, too_many_requests, user_key};
 use super::session::{
-    CsrfForm, NoFields, PendingUser, clear_continue_cookie, clear_device_cookie,
-    clear_session_cookie, continue_id, device_cookie, device_cookie_id, device_token,
-    session_cookie,
+    CsrfForm, PendingUser, clear_continue_cookie, clear_device_cookie, clear_session_cookie,
+    continue_id, device_cookie, device_cookie_id, device_token, session_cookie,
 };
 use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::AccountError;
@@ -79,12 +78,14 @@ fn start_session(
     {
         // The old login's remembered device must not outlive it.
         revoke_logged(state, &old.unlocked, device_id);
+        state.sessions.remove_device(device_id);
     }
     // So must the device named by this browser's cookie (it can be a different
     // one than the session's, or there may be no session at all). Only a
     // device of the user logging in can be revoked here.
     if let Some(id) = device_cookie_id(headers) {
         revoke_logged(state, &unlocked, id);
+        state.sessions.remove_device(id);
     }
     // A share staged before login (`POST /share` without a session) continues
     // on its review page, once. Not after signup/recovery, which first have to
@@ -393,6 +394,8 @@ struct LoginPage {
     error: Option<String>,
     /// Return to `/scan` after logging in (`?next=scan`).
     next_scan: bool,
+    /// Whether "Remember this device" is ticked.
+    remember: bool,
 }
 
 #[derive(Deserialize)]
@@ -414,12 +417,19 @@ struct LoginQuery {
     next: String,
 }
 
-fn login_error(status: StatusCode, username: String, msg: &str, next_scan: bool) -> Response {
+fn login_error(
+    status: StatusCode,
+    username: String,
+    msg: &str,
+    next_scan: bool,
+    remember: bool,
+) -> Response {
     let mut resp = render(&LoginPage {
         page: Page::anonymous(),
         username,
         error: Some(msg.to_owned()),
         next_scan,
+        remember,
     });
     if resp.status() == StatusCode::OK {
         *resp.status_mut() = status;
@@ -455,6 +465,7 @@ async fn login_page(
         username: String::new(),
         error: None,
         next_scan: q.next == "scan",
+        remember: true,
     })
 }
 
@@ -475,6 +486,7 @@ async fn login(
     Form(form): Form<LoginForm>,
 ) -> Response {
     let next_scan = form.next == "scan";
+    let remember = form.remember.as_deref() == Some("on");
     let label = remember_label(&headers, form.remember.as_deref());
     let keys = limiter_keys(&state, peer, &headers, &form.username);
     let attempt = match state.limiter.begin(&keys) {
@@ -517,7 +529,13 @@ async fn login(
                 }
                 Err(AccountError::Disabled) => {
                     attempt.failure();
-                    login_error(StatusCode::FORBIDDEN, form.username, DISABLED, next_scan)
+                    login_error(
+                        StatusCode::FORBIDDEN,
+                        form.username,
+                        DISABLED,
+                        next_scan,
+                        remember,
+                    )
                 }
                 Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
                 Err(_) => {
@@ -527,13 +545,20 @@ async fn login(
                         form.username,
                         INVALID_LOGIN,
                         next_scan,
+                        remember,
                     )
                 }
             }
         }
         Err(AccountError::Disabled) => {
             attempt.failure();
-            login_error(StatusCode::FORBIDDEN, form.username, DISABLED, next_scan)
+            login_error(
+                StatusCode::FORBIDDEN,
+                form.username,
+                DISABLED,
+                next_scan,
+                remember,
+            )
         }
         Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
         Err(_) => {
@@ -543,6 +568,7 @@ async fn login(
                 form.username,
                 INVALID_LOGIN,
                 next_scan,
+                remember,
             )
         }
     }
@@ -551,9 +577,40 @@ async fn login(
 async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
-    PendingUser(session): PendingUser,
-    CsrfForm(_): CsrfForm<NoFields>,
+    session: Option<axum::Extension<super::session::Session>>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let mut resp = redirect(&headers, "/login");
+    resp.headers_mut()
+        .insert(header::SET_COOKIE, clear_session_cookie());
+    let Some(axum::Extension(session)) = session else {
+        // No live session (idle, the 12 h maximum, a restart), so the page the
+        // user is on carries a CSRF token that no longer exists. `session_layer`
+        // does not resume for this request. The device cookie itself proves the
+        // right to forget the device; it is SameSite=Lax, so a cross-site POST
+        // cannot carry it, and that is why no CSRF token is needed here.
+        if let Some(token) = device_token(&headers).map(str::to_owned) {
+            let st = state.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                let r = crate::devices::resume_device(&st, &token, now())
+                    .map_err(|_| anyhow::anyhow!("device cookie did not verify"))?;
+                crate::devices::revoke_device(&st.sys, &r.unlocked, &r.device_id)?;
+                anyhow::Ok(r.device_id)
+            })
+            .await;
+            match res {
+                Ok(Ok(id)) => state.sessions.remove_device(&id),
+                Ok(Err(e)) => tracing::warn!(error = %e, "could not forget device on logout"),
+                Err(e) => tracing::error!(error = %e, "device logout task failed"),
+            }
+            resp.headers_mut()
+                .append(header::SET_COOKIE, clear_device_cookie());
+        }
+        return resp;
+    };
+    if let Err(status) = super::session::check_csrf_body(&session, &headers, &body) {
+        return status.into_response();
+    }
     state.sessions.remove(&session.id);
     // Only this device is forgotten; other remembered devices stay. The
     // cookie goes whether or not this session was started from it, so the
@@ -569,21 +626,20 @@ async fn logout(
         let unlocked = session.unlocked.clone();
         let res = tokio::task::spawn_blocking(move || {
             for id in &ids {
-                // Revokes only devices of this user.
-                crate::devices::revoke_device(&st.sys, &unlocked, id)?;
+                // Revokes only devices of this user. Try every id.
+                match crate::devices::revoke_device(&st.sys, &unlocked, id) {
+                    Ok(true) => st.sessions.remove_device(id),
+                    Ok(false) => {}
+                    Err(e) => tracing::error!(error = %e, "could not revoke device on logout"),
+                }
             }
-            anyhow::Ok(())
         })
         .await;
-        if !matches!(res, Ok(Ok(()))) {
-            tracing::error!("could not revoke device on logout");
+        if let Err(e) = res {
+            tracing::error!(error = %e, "device logout task failed");
         }
     }
-    let had_cookie = device_token(&headers).is_some() || session.device_id.is_some();
-    let mut resp = redirect(&headers, "/login");
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, clear_session_cookie());
-    if had_cookie {
+    if device_token(&headers).is_some() || session.device_id.is_some() {
         resp.headers_mut()
             .append(header::SET_COOKIE, clear_device_cookie());
     }
@@ -600,6 +656,8 @@ struct RecoverPage {
     page: Page,
     username: String,
     error: Option<String>,
+    /// Whether "Remember this device" is ticked.
+    remember: bool,
 }
 
 #[derive(Deserialize)]
@@ -612,11 +670,12 @@ struct RecoverForm {
     remember: Option<String>,
 }
 
-fn recover_error(status: StatusCode, username: String, msg: &str) -> Response {
+fn recover_error(status: StatusCode, username: String, msg: &str, remember: bool) -> Response {
     let mut resp = render(&RecoverPage {
         page: Page::anonymous(),
         username,
         error: Some(msg.to_owned()),
+        remember,
     });
     if resp.status() == StatusCode::OK {
         *resp.status_mut() = status;
@@ -629,6 +688,7 @@ async fn recover_page() -> Response {
         page: Page::anonymous(),
         username: String::new(),
         error: None,
+        remember: true,
     })
 }
 
@@ -638,11 +698,13 @@ async fn recover(
     headers: HeaderMap,
     Form(form): Form<RecoverForm>,
 ) -> Response {
+    let remember = form.remember.as_deref() == Some("on");
     if form.new_password != form.new_password_confirm {
         return recover_error(
             StatusCode::BAD_REQUEST,
             form.username,
             "The passwords do not match",
+            remember,
         );
     }
     let keys = limiter_keys(&state, peer, &headers, &form.username);
@@ -676,6 +738,7 @@ async fn recover(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     form.username,
                     "Your password was changed, but remembered devices could not be signed out. Log in and revoke them under Remembered devices.",
+                    remember,
                 );
             }
             let label = remember_label(&headers, form.remember.as_deref());
@@ -693,7 +756,7 @@ async fn recover(
                 }
                 Err(AccountError::Disabled) => {
                     attempt.failure();
-                    recover_error(StatusCode::FORBIDDEN, form.username, DISABLED)
+                    recover_error(StatusCode::FORBIDDEN, form.username, DISABLED, remember)
                 }
                 Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
                 Err(_) => {
@@ -702,6 +765,7 @@ async fn recover(
                         StatusCode::UNAUTHORIZED,
                         form.username,
                         "Invalid username or recovery key",
+                        remember,
                     )
                 }
             }
@@ -713,11 +777,12 @@ async fn recover(
                 StatusCode::BAD_REQUEST,
                 form.username,
                 "The password must be at least 10 characters",
+                remember,
             )
         }
         Err(AccountError::Disabled) => {
             attempt.failure();
-            recover_error(StatusCode::FORBIDDEN, form.username, DISABLED)
+            recover_error(StatusCode::FORBIDDEN, form.username, DISABLED, remember)
         }
         Err(AccountError::Internal(e)) => internal(&AccountError::Internal(e)),
         Err(_) => {
@@ -726,6 +791,7 @@ async fn recover(
                 StatusCode::UNAUTHORIZED,
                 form.username,
                 "Invalid username or recovery key",
+                remember,
             )
         }
     }
