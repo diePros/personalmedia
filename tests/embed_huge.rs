@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use personal_media::embed::model::{MODEL_FILE, TOKENIZER_FILE};
-use personal_media::embed::{Engine, MAX_EMBED_CHARS, MODEL, WINDOW_CHARS};
+use personal_media::embed::{
+    Engine, MAX_EMBED_CHARS, MAX_VECTORS_PER_DOCUMENT, MODEL, WINDOW_CHARS,
+};
 
 fn model_or_skip(test: &str) -> Option<PathBuf> {
     let root =
@@ -50,6 +52,8 @@ fn huge_text_embeds_in_bounded_memory() {
     assert_eq!(out.chars_tokenized, MAX_EMBED_CHARS);
     assert_eq!(out.chunks.last().unwrap().end, MAX_EMBED_CHARS);
     assert!(out.chunks.len() > 1000, "{} chunks", out.chunks.len());
+    // ... which bounds the vectors one document holds (Ruling AB).
+    assert!(out.chunks.len() <= MAX_VECTORS_PER_DOCUMENT);
     // ... in windows, never the whole text at once ...
     assert!(out.max_window_chars <= WINDOW_CHARS);
     // ... and consecutive chunks still overlap across window borders.

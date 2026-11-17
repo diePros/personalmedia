@@ -30,6 +30,12 @@ const BATCH: usize = 16;
 /// document. Longer documents are stored as `partial`.
 pub const MAX_EMBED_CHARS: usize = 2_000_000;
 
+/// Upper bound of vectors one document can have: every chunk adds at least
+/// `CHUNK_TOKENS - CHUNK_OVERLAP` tokens and a token spans at least one
+/// character. All of them are held until the single guarded write (typically
+/// about 3,000 for a capped document, ~4.5 MiB).
+pub const MAX_VECTORS_PER_DOCUMENT: usize = MAX_EMBED_CHARS.div_ceil(CHUNK_TOKENS - CHUNK_OVERLAP);
+
 struct Loaded {
     session: Session,
     /// No truncation or padding configured: the chunker needs raw offsets.
