@@ -69,10 +69,18 @@ pub fn routes(state: &AppState) -> Router<AppState> {
     )
 }
 
-fn unauthorized() -> Response {
+/// `401` with an empty body and a pointer to the protected-resource metadata
+/// (RFC 9728), so OAuth clients can discover how to authenticate.
+fn unauthorized(state: &AppState) -> Response {
+    let challenge = format!(
+        "Bearer resource_metadata=\"{}\"",
+        crate::oauth::resource_metadata_url(&state.cfg.public_url)
+    );
+    let value =
+        HeaderValue::from_str(&challenge).unwrap_or_else(|_| HeaderValue::from_static("Bearer"));
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
+        [(header::WWW_AUTHENTICATE, value)],
     )
         .into_response()
 }
@@ -98,7 +106,7 @@ pub async fn bearer_principal(
     let keys = [mcp_ip_key(ip)];
     state.limiter.check(&keys).map_err(too_many_requests)?;
     let Some(token) = bearer_token(headers).map(str::to_owned) else {
-        return Err(unauthorized());
+        return Err(unauthorized(state));
     };
     let well_formed = parse_bearer(&token).is_some();
     let st = state.clone();
@@ -111,7 +119,7 @@ pub async fn bearer_principal(
             if well_formed {
                 state.limiter.record_failure(&keys);
             }
-            Err(unauthorized())
+            Err(unauthorized(state))
         }
     }
 }

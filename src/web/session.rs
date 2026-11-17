@@ -353,12 +353,12 @@ pub async fn session_layer(
 ) -> Response {
     let session = session_id(req.headers()).and_then(|id| state.sessions.get(id));
     if let Some(session) = session {
-        // The OS share target posts multipart without our token. That one
-        // route only stages the files in server memory; saving them needs the
-        // CSRF-protected form on the review page. Exact path, POST only.
-        let share_target =
-            *req.method() == Method::POST && req.uri().path() == super::pwa::SHARE_PATH;
-        if !matches!(*req.method(), Method::GET | Method::HEAD) && !share_target {
+        // The OS share target posts multipart without our token, and the OAuth
+        // register/token/revoke endpoints are called cross-origin by clients.
+        // See `ORIGIN_EXEMPT_PATHS`. Exact paths, POST only.
+        let exempt =
+            *req.method() == Method::POST && super::ORIGIN_EXEMPT_PATHS.contains(&req.uri().path());
+        if !matches!(*req.method(), Method::GET | Method::HEAD) && !exempt {
             let headers = req.headers();
             let allowed = if headers.contains_key(CSRF_HEADER) {
                 check_csrf(&session, headers, None).is_ok()

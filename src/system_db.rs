@@ -124,7 +124,8 @@ CREATE TABLE tokens (
 CREATE INDEX tokens_user ON tokens(user_id);
 ";
 
-const MIGRATION_V2: &str = "
+#[doc(hidden)]
+pub const MIGRATION_V2: &str = "
 CREATE TABLE system_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT INTO system_settings (key, value) VALUES ('default_quota_bytes', '10737418240');
 ALTER TABLE users ADD COLUMN quota_mode TEXT NOT NULL DEFAULT 'default'
@@ -132,6 +133,33 @@ ALTER TABLE users ADD COLUMN quota_mode TEXT NOT NULL DEFAULT 'default'
 ALTER TABLE users ADD COLUMN quota_bytes INTEGER;
 PRAGMA user_version = 2;
 ";
+
+/// OAuth for MCP: token kind, expiry and grant, plus dynamically registered
+/// clients. Existing `pm_` tokens become `kind='static'` with no expiry.
+#[doc(hidden)]
+pub const MIGRATION_V3: &str = "
+ALTER TABLE tokens ADD COLUMN kind TEXT NOT NULL DEFAULT 'static';
+ALTER TABLE tokens ADD COLUMN expires_at INTEGER;
+ALTER TABLE tokens ADD COLUMN grant_id TEXT;
+CREATE TABLE oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    client_name TEXT NOT NULL,
+    redirect_uris_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_grant_at INTEGER
+);
+PRAGMA user_version = 3;
+";
+
+/// A dynamically registered OAuth client (RFC 7591), public (no secret).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OauthClient {
+    pub client_id: String,
+    pub client_name: String,
+    pub redirect_uris: Vec<String>,
+    pub created_at: i64,
+    pub last_grant_at: Option<i64>,
+}
 
 const USER_COLS: &str = "id, username, role, disabled, created_at, salt, argon2_m, argon2_t, \
      argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed, \
@@ -197,14 +225,17 @@ impl SystemDb {
             tx.pragma_update(None, "user_version", 1)?;
             tx.commit()?;
         }
-        if version < 2 {
+        for (target, sql) in [(2, MIGRATION_V2), (3, MIGRATION_V3)] {
+            if version >= target {
+                continue;
+            }
             // Re-checked inside the write transaction so two openers cannot
             // both apply the migration.
             conn.execute_batch("BEGIN IMMEDIATE;")?;
             let res = (|| -> anyhow::Result<()> {
                 let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-                if v < 2 {
-                    conn.execute_batch(MIGRATION_V2)?;
+                if v < target {
+                    conn.execute_batch(sql)?;
                 }
                 Ok(())
             })();
@@ -212,7 +243,7 @@ impl SystemDb {
                 Ok(()) => conn.execute_batch("COMMIT;")?,
                 Err(e) => {
                     let _ = conn.execute_batch("ROLLBACK;");
-                    return Err(e.context("migrating system db to v2"));
+                    return Err(e.context(format!("migrating system db to v{target}")));
                 }
             }
         }
@@ -423,6 +454,73 @@ impl SystemDb {
     pub fn delete_user(&self, id: &str) -> anyhow::Result<()> {
         self.lock().execute("DELETE FROM users WHERE id=?1", [id])?;
         Ok(())
+    }
+
+    /// Registers an OAuth client unless `max_clients` exist already
+    /// (`Ok(false)`: full). The check and the insert are one statement.
+    pub fn insert_oauth_client(&self, c: &OauthClient, max_clients: usize) -> anyhow::Result<bool> {
+        let uris = serde_json::to_string(&c.redirect_uris)?;
+        let n = self.lock().execute(
+            "INSERT INTO oauth_clients (client_id, client_name, redirect_uris_json, created_at, \
+             last_grant_at) SELECT ?1,?2,?3,?4,?5 WHERE (SELECT count(*) FROM oauth_clients) < ?6",
+            params![
+                c.client_id,
+                c.client_name,
+                uris,
+                c.created_at,
+                c.last_grant_at,
+                max_clients as i64
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn oauth_client(&self, client_id: &str) -> anyhow::Result<Option<OauthClient>> {
+        let row = self
+            .lock()
+            .query_row(
+                "SELECT client_id, client_name, redirect_uris_json, created_at, last_grant_at \
+                 FROM oauth_clients WHERE client_id=?1",
+                [client_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(
+            |(client_id, client_name, uris, created_at, last_grant_at)| {
+                Ok(OauthClient {
+                    client_id,
+                    client_name,
+                    redirect_uris: serde_json::from_str(&uris)?,
+                    created_at,
+                    last_grant_at,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    pub fn oauth_client_count(&self) -> anyhow::Result<usize> {
+        let n: i64 = self
+            .lock()
+            .query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    /// Deletes clients that never received a grant and were created before
+    /// `created_before`. Returns how many went.
+    pub fn prune_oauth_clients(&self, created_before: i64) -> anyhow::Result<usize> {
+        Ok(self.lock().execute(
+            "DELETE FROM oauth_clients WHERE last_grant_at IS NULL AND created_at < ?1",
+            [created_before],
+        )?)
     }
 
     pub fn create_invite(

@@ -25,6 +25,9 @@ pub struct Config {
     pub trusted_proxy: IpAddr,
     pub ocr_workers: usize,
     pub argon2: Argon2Params,
+    /// Extra hosts (lowercase) whose `https://` redirect URIs OAuth clients may
+    /// register (`PM_OAUTH_EXTRA_REDIRECT_HOSTS`, comma separated).
+    pub oauth_extra_redirect_hosts: Vec<String>,
 }
 
 fn var(name: &str) -> Option<String> {
@@ -94,7 +97,7 @@ impl Config {
             data_dir,
             bind: parse_var("PM_BIND", "127.0.0.1:8080")?,
             public_url: var("PM_PUBLIC_URL")
-                .map(|u| u.trim_end_matches('/').to_string())
+                .map(|u| u.trim_end_matches('/').to_ascii_lowercase())
                 .unwrap_or_default(),
             max_upload_bytes: max_upload_mb * 1024 * 1024,
             session_idle: Duration::from_secs(idle_min * 60),
@@ -103,6 +106,14 @@ impl Config {
             trusted_proxy: parse_var("PM_TRUSTED_PROXY", "127.0.0.1")?,
             ocr_workers: parse_var("PM_OCR_WORKERS", "1")?,
             argon2: Argon2Params::default(),
+            oauth_extra_redirect_hosts: var("PM_OAUTH_EXTRA_REDIRECT_HOSTS")
+                .map(|v| {
+                    v.split(',')
+                        .map(|h| h.trim().to_ascii_lowercase())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 
@@ -131,6 +142,7 @@ impl Config {
                 t: 1,
                 p: 1,
             },
+            oauth_extra_redirect_hosts: Vec::new(),
         }
     }
 }

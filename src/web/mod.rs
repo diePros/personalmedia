@@ -79,6 +79,8 @@ pub struct AppState {
     /// Bounds concurrent MCP `upload_document` calls (each holds the base64
     /// text and the decoded bytes in memory).
     pub mcp_write_permits: Arc<Semaphore>,
+    /// OAuth registration counters (memory only).
+    pub oauth: Arc<crate::oauth::OAuthState>,
     /// Bodies of `POST /share` being read at once (try-acquire, 503 when full).
     pub share_permits: Arc<Semaphore>,
 }
@@ -136,7 +138,8 @@ impl AppState {
         ));
         let limiter = Arc::new(RateLimiter::new());
         let tokens = Arc::new(TokenCache::default());
-        spawn_sweeper(&sessions, &shared, &limiter, &tokens);
+        let oauth = Arc::new(crate::oauth::OAuthState::default());
+        spawn_sweeper(&sessions, &shared, &limiter, &tokens, &oauth, &sys);
 
         Ok(AppState {
             cfg: Arc::new(cfg),
@@ -151,11 +154,18 @@ impl AppState {
             shared,
             limiter,
             tokens,
+            oauth,
             kdf_permits: Arc::new(Semaphore::new(KDF_PERMITS)),
             mcp_write_permits: Arc::new(Semaphore::new(MCP_WRITE_PERMITS)),
             share_permits: Arc::new(Semaphore::new(SHARE_PERMITS)),
         })
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Background task that ends when the state it sweeps is dropped.
@@ -164,22 +174,28 @@ fn spawn_sweeper(
     shared: &Arc<SharedStaging>,
     limiter: &Arc<RateLimiter>,
     tokens: &Arc<TokenCache>,
+    oauth: &Arc<crate::oauth::OAuthState>,
+    sys: &Arc<SystemDb>,
 ) {
-    let (sessions, shared, limiter, tokens) = (
+    let (sessions, shared, limiter, tokens, oauth, sys) = (
         Arc::downgrade(sessions),
         Arc::downgrade(shared),
         Arc::downgrade(limiter),
         Arc::downgrade(tokens),
+        Arc::downgrade(oauth),
+        Arc::downgrade(sys),
     );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             tick.tick().await;
-            let (Some(sessions), Some(shared), Some(limiter), Some(tokens)) = (
+            let (Some(sessions), Some(shared), Some(limiter), Some(tokens), Some(oauth), Some(sys)) = (
                 sessions.upgrade(),
                 shared.upgrade(),
                 limiter.upgrade(),
                 tokens.upgrade(),
+                oauth.upgrade(),
+                sys.upgrade(),
             ) else {
                 break;
             };
@@ -187,6 +203,16 @@ fn spawn_sweeper(
             shared.sweep();
             limiter.sweep();
             tokens.sweep();
+            oauth.sweep();
+            let cutoff = unix_now() - crate::oauth::UNUSED_CLIENT_TTL_SECS;
+            let sys = sys.clone();
+            // SQLite is blocking; keep it off the async worker.
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = sys.prune_oauth_clients(cutoff) {
+                    tracing::error!(error = %e, "pruning unused oauth clients failed");
+                }
+            })
+            .await;
         }
     });
 }
@@ -202,6 +228,7 @@ pub fn build_app(state: AppState) -> Router {
         .merge(settings::routes())
         .merge(pwa::routes(&state))
         .merge(crate::mcp::routes(&state))
+        .merge(crate::oauth::routes())
         .route("/static/{file}", get(static_file))
         .route("/static/icons/{file}", get(icon_file))
         // Container health probe: no body, no auth, not access-logged.
@@ -379,10 +406,20 @@ pub fn render(template: &impl Template) -> Response {
 // Layers
 // ---------------------------------------------------------------------------
 
-/// Paths that may receive cross-origin state-changing requests: the OS share
-/// target. Only `POST /share` (exact path), which merely stages files in
-/// memory; saving them (`POST /share/{id}`) stays guarded and needs CSRF.
-const ORIGIN_EXEMPT_PATHS: &[&str] = &[pwa::SHARE_PATH];
+/// Paths that may receive cross-origin state-changing requests, POST only
+/// (the CSRF middleware honours the same list):
+///
+/// * The OS share target, exact `POST /share`, which merely stages files in
+///   memory; saving them (`POST /share/{id}`) stays guarded and needs CSRF.
+/// * The OAuth `register`, `token` and `revoke` endpoints, which claude.ai's
+///   servers and CLI clients call cross-origin and which grant nothing from
+///   ambient cookies. The consent POST (`/oauth/authorize`) is NOT exempt.
+const ORIGIN_EXEMPT_PATHS: &[&str] = &[
+    pwa::SHARE_PATH,
+    "/oauth/register",
+    "/oauth/token",
+    "/oauth/revoke",
+];
 
 /// The only paths that accept bearer-token authentication. A bearer header on
 /// any other path gets no origin-guard exemption.

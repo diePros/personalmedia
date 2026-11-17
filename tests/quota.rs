@@ -113,7 +113,7 @@ fn system_migration_v2_upgrades_once() {
     assert_eq!(version(&path), 1);
 
     let db = SystemDb::open(&path).unwrap();
-    assert_eq!(version(&path), 2);
+    assert_eq!(version(&path), 3);
     assert_eq!(db.default_quota().unwrap(), Some(10 * GIB));
     assert_eq!(
         db.user_by_id("u1").unwrap().unwrap().quota,
@@ -124,7 +124,7 @@ fn system_migration_v2_upgrades_once() {
 
     // A second open neither re-runs the migration nor reseeds the default.
     let db = SystemDb::open(&path).unwrap();
-    assert_eq!(version(&path), 2);
+    assert_eq!(version(&path), 3);
     assert_eq!(db.default_quota().unwrap(), Some(5 * GIB));
     drop(db);
     // Read-only also works on a v2 database.
