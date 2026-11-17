@@ -50,43 +50,32 @@ Everything the app stores there is encrypted per user. You can back it up as-is 
 
 ## 3. Deploy the app
 
-`docker-compose.yml` in the repo root:
+`docker-compose.yml` in the repo root holds the fixed, hardened container setup (read-only root filesystem, no capabilities, memory limit, an in-memory `/data/tmp` for OCR scratch). **Don't edit it.** Your own settings go into a `.env` file next to it, which git does not track, so `git pull` never conflicts with them:
 
-```yaml
-services:
-  personal-media:
-    build:
-      context: .
-      network: host        # the build downloads from cdn.pyke.io; avoids IPv6-only build networks
-    image: personal-media
-    container_name: personal-media
-    restart: unless-stopped
-    network_mode: host
-    user: "10001:10001"
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    mem_limit: 1536m
-    pids_limit: 256
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
-    environment:
-      PM_BIND: 127.0.0.1:8080
-      PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
-      PM_TRUSTED_PROXY: 127.0.0.1
-      PM_MAX_UPLOAD_MB: "100"
-      # PM_IOS_SHORTCUT_URL: https://www.icloud.com/shortcuts/<32 hex chars>   # optional: iCloud link of the PMS Shortcut
-    volumes:
-      - /DATA/AppData/personal-media:/data
-    tmpfs:
-      # OCR scratch: plaintext never touches disk
-      - /data/tmp:size=512m,mode=0700,uid=10001,gid=10001
+```bash
+cp .env.example .env
+nano .env        # at least PM_PUBLIC_URL; DATA_DIR if your data folder is elsewhere
 ```
 
-Edit `PM_PUBLIC_URL` to your real `https://<node>.<tailnet>.ts.net` address first; the app refuses to start (and `invite` refuses to run) unless it is an `https://host[:port]` URL. The root filesystem is read-only; only `/data` and the tmpfs are writable.
+| Variable | Default | Meaning |
+|---|---|---|
+| `PM_PUBLIC_URL` | (required) | Your Funnel URL, `https://<node>.<tailnet>.ts.net`. The app refuses to start (and `invite` refuses to run) unless it is an `https://host[:port]` URL. |
+| `DATA_DIR` | `/DATA/AppData/personal-media` | Host folder for the encrypted data, owned by uid/gid 10001. |
+| `IMAGE_TAG` | `latest` | Image version, e.g. `1.6` to pin. |
+| `MEM_LIMIT` | `1536m` | Container memory limit. |
+| `PM_MAX_UPLOAD_MB` | `100` | Largest upload. |
+| `PM_IOS_SHORTCUT_URL` | unset | iCloud link of the PMS Shortcut (section 7b). |
+
+Any other `PM_…` setting from this guide (e.g. `PM_SESSION_IDLE_MINUTES`) also goes into `.env`. For changes `.env` can't express (another volume, a different tmpfs size), create a `docker-compose.override.yml` next to the compose file; compose merges it automatically and git ignores it too. The root filesystem is read-only; only `/data` and the tmpfs are writable.
+
+**Upgrading from a checkout where you edited `docker-compose.yml` directly** (before v1.6): move your values into `.env` once, then drop the local edits:
+
+```bash
+git diff docker-compose.yml       # note your PM_PUBLIC_URL, data path, Shortcut URL, ...
+cp .env.example .env && nano .env # put them in here
+git checkout docker-compose.yml   # discard the local edits (or: git stash drop, if they are stashed)
+git pull
+```
 
 Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` is unverified):
 
@@ -109,7 +98,7 @@ Get the code onto the ZimaBoard in one of two ways (whether ZimaOS ships `git` i
   # on the dev machine
   docker build -t personal-media .
   docker save personal-media | ssh zima docker load
-  # on the ZimaBoard, with docker-compose.yml copied over
+  # on the ZimaBoard, with docker-compose.yml and your .env copied over
   docker compose up -d
   ```
 
@@ -348,13 +337,13 @@ Every release tag (`vX.Y.Z`) is built by GitHub Actions (`.github/workflows/imag
 **Each update** (seconds instead of a local Rust build):
 
 ```bash
-cd <source checkout>            # where docker-compose.yml lives
-git pull                        # picks up compose/doc changes
+cd <source checkout>            # where docker-compose.yml and .env live
+git pull                        # picks up compose/doc changes; .env stays as it is
 sudo DOCKER_CONFIG=/DATA/.docker docker compose pull
 sudo DOCKER_CONFIG=/DATA/.docker docker compose up -d
 ```
 
-To pin a version instead of `latest`, set `image: ghcr.io/diepros/personalmedia:1.1` in `docker-compose.yml`. A local build still works without the registry: `docker compose up -d --build`. A local build needs outbound access to crates.io, cdn.pyke.io (ONNX runtime) and huggingface.co (the test model); pulling the GHCR image avoids all of it.
+To pin a version instead of `latest`, set `IMAGE_TAG=1.6` in `.env`. A local build still works without the registry: `docker compose up -d --build`. A local build needs outbound access to crates.io, cdn.pyke.io (ONNX runtime) and huggingface.co (the test model); pulling the GHCR image avoids all of it.
 
 What an update does:
 - Documents, accounts, MCP tokens and the Funnel setup stay as they are.
