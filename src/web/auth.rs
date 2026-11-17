@@ -666,6 +666,10 @@ async fn recover(
                 tokio::task::spawn_blocking(move || crate::devices::revoke_all_devices(&sys, &u2))
                     .await
                     .unwrap_or_else(|e| Err(anyhow::anyhow!("device revocation task failed: {e}")));
+            // The old password may be compromised: no other session or cached
+            // token unlock survives the recovery, whether or not the revoke worked.
+            state.sessions.remove_user(&user.id);
+            state.tokens.evict_user(&user.id);
             if let Err(e) = revoked {
                 tracing::error!(error = %e, "could not revoke devices after recovery");
                 return recover_error(
@@ -674,10 +678,6 @@ async fn recover(
                     "Your password was changed, but remembered devices could not be signed out. Log in and revoke them under Remembered devices.",
                 );
             }
-            // The old password may be compromised: no other session or cached
-            // token unlock survives the recovery.
-            state.sessions.remove_user(&user.id);
-            state.tokens.evict_user(&user.id);
             let label = remember_label(&headers, form.remember.as_deref());
             match finish_login(
                 &state,
