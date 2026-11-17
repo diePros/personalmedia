@@ -146,6 +146,16 @@ async fn recovery_key_shown_only_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn viewport_allows_safe_area_insets() {
+    let app = TestApp::new();
+    let page = body_string(app.get("/login", &Client::anon()).await).await;
+    assert!(
+        page.contains("width=device-width, initial-scale=1, viewport-fit=cover"),
+        "{page}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn login_logout() {
     let app = TestApp::new();
     app.signup_and_login("alice").await;

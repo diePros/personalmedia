@@ -57,7 +57,7 @@
 <label for="default-gib">Default quota (GiB)</label>
 <input type="text" id="default-gib" name="gib" inputmode="decimal" value="{{ default_gib }}">
 </div>
-<div>
+<div class="check">
 <label><input type="checkbox" name="unlimited" value="on"{% if default_unlimited %} checked{% endif %}> Unlimited</label>
 </div>
 <button type="submit">Save default</button>

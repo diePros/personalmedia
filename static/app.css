@@ -45,6 +45,16 @@ a {
   color: var(--accent);
 }
 
+h1,
+h2,
+.doc-title,
+.doc-meta,
+.tag,
+.upload-name,
+code {
+  overflow-wrap: anywhere;
+}
+
 h1 {
   font-size: 1.5rem;
   line-height: 1.25;
@@ -61,19 +71,23 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem var(--gap);
-  padding: 0.75rem var(--gap);
+  padding: max(0.75rem, env(safe-area-inset-top, 0px))
+    max(var(--gap), env(safe-area-inset-right, 0px)) 0.75rem
+    max(var(--gap), env(safe-area-inset-left, 0px));
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
   font-weight: 600;
   color: var(--text);
   text-decoration: none;
 }
 
 .site-nav {
-  display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.25rem var(--gap);
@@ -94,7 +108,10 @@ h1 {
 main {
   max-width: 60rem;
   margin: 0 auto;
-  padding: var(--gap);
+  padding: calc(var(--gap) + var(--main-top-inset))
+    max(var(--gap), env(safe-area-inset-right, 0px))
+    calc(var(--gap) + var(--tabbar-h))
+    max(var(--gap), env(safe-area-inset-left, 0px));
 }
 
 label {
@@ -174,7 +191,10 @@ button.danger {
   }
 
   main {
-    padding: calc(var(--gap) * 1.5);
+    padding: calc(var(--gap) * 1.5 + var(--main-top-inset))
+      max(calc(var(--gap) * 1.5), env(safe-area-inset-right, 0px))
+      calc(var(--gap) * 1.5 + var(--tabbar-h))
+      max(calc(var(--gap) * 1.5), env(safe-area-inset-left, 0px));
   }
 }
 
@@ -198,15 +218,35 @@ button.danger {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  min-height: 2.75rem;
 }
 
 .check label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1;
+  min-height: 2.75rem;
   margin: 0;
 }
 
 .check input {
+  flex: none;
   width: 1.25rem;
   height: 1.25rem;
+}
+
+/* Text links used as actions get a 44px tall hit area. */
+.action-link,
+a.doc-title,
+.pager a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+}
+
+input[type="file"] {
+  min-height: 2.75rem;
 }
 
 code.recovery-key {
@@ -292,6 +332,7 @@ mark {
   display: block;
   width: 100%;
   max-height: 80vh;
+  max-height: 80dvh;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   margin-bottom: var(--gap);
@@ -299,6 +340,7 @@ mark {
 
 iframe.preview {
   height: 70vh;
+  height: 70dvh;
 }
 
 .facts {
@@ -331,6 +373,8 @@ fieldset {
 pre {
   overflow-x: auto;
   max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   padding: 0.75rem;
   background: var(--surface);
   border: 1px solid var(--border);
@@ -411,40 +455,70 @@ fieldset.mode legend {
   }
 }
 
-/* App shell. The bottom tab bar exists in the markup of every signed-in page
-   but is hidden; it only shows (and the site header goes away) when the app is
-   installed and running standalone. `app.js` adds the `standalone` class for
-   iOS, which has no display-mode media query. */
-.tabbar {
-  display: none;
+/* App shell. The bottom tab bar exists in the markup of every signed-in page.
+   One rule set serves every mode that shows it; the modes only switch the
+   custom properties declared on :root:
+   - installed app on iOS: `app.js` adds the `standalone` class (iOS has no
+     display-mode media query);
+   - installed app elsewhere: `@media (display-mode: standalone)`, which works
+     before the script has run, so no flash of the header;
+   - phone browser (up to 40rem): tab bar shows, the header keeps only the
+     brand, and the Account block (Admin, Logout) shows on Settings. */
+:root {
+  --tabbar-display: none;
+  --header-display: flex;
+  --nav-display: flex;
+  --account-display: none;
+  --tabbar-h: 0px;
+  /* Inset already covered by the tab bar; scan.css reads it. */
+  --covered-bottom-inset: env(safe-area-inset-bottom, 0px);
+  --main-top-inset: 0px;
 }
 
-/* Account actions on the Settings page: the site header carries them in a
-   browser, so they show only in the installed app. */
-.account-standalone {
-  display: none;
-}
-
-.standalone .account-standalone {
-  display: block;
-}
-
-@media (display-mode: standalone) {
-  .account-standalone {
-    display: block;
+@media (width < 40rem) {
+  :root {
+    --tabbar-display: flex;
+    --nav-display: none;
+    --account-display: block;
+    --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+    --covered-bottom-inset: 0px;
   }
 }
 
-.standalone {
+:root.standalone {
+  --tabbar-display: flex;
+  --header-display: none;
+  --account-display: block;
   --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+  --covered-bottom-inset: 0px;
+  --main-top-inset: env(safe-area-inset-top, 0px);
 }
 
-.standalone .site-header {
-  display: none;
+@media (display-mode: standalone) {
+  :root {
+    --tabbar-display: flex;
+    --header-display: none;
+    --account-display: block;
+    --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+    --covered-bottom-inset: 0px;
+    --main-top-inset: env(safe-area-inset-top, 0px);
+  }
 }
 
-.standalone .tabbar {
-  display: flex;
+.site-header {
+  display: var(--header-display);
+}
+
+.site-nav {
+  display: var(--nav-display);
+}
+
+.account-standalone {
+  display: var(--account-display);
+}
+
+.tabbar {
+  display: var(--tabbar-display);
   position: fixed;
   left: 0;
   right: 0;
@@ -457,7 +531,7 @@ fieldset.mode legend {
   border-top: 1px solid var(--border);
 }
 
-.standalone .tab {
+.tab {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -472,64 +546,13 @@ fieldset.mode legend {
   text-decoration: none;
 }
 
-.standalone .tab[aria-current="page"] {
+.tab[aria-current="page"] {
   color: var(--accent);
   font-weight: 600;
 }
 
-.standalone .tab:focus-visible {
+.tab:focus-visible {
   outline-offset: -4px;
-}
-
-.standalone main {
-  padding-top: calc(var(--gap) + env(safe-area-inset-top, 0px));
-  padding-bottom: calc(var(--gap) + var(--tabbar-h));
-}
-
-/* Same rules before the script has run (Android Chrome and others that
-   support the media query): no flash of the header. */
-@media (display-mode: standalone) {
-  :root {
-    --tabbar-h: calc(3.5rem + env(safe-area-inset-bottom, 0px));
-  }
-
-  .site-header {
-    display: none;
-  }
-
-  .tabbar {
-    display: flex;
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 20;
-    height: var(--tabbar-h);
-    padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px)
-      env(safe-area-inset-left, 0px);
-    background: var(--surface);
-    border-top: 1px solid var(--border);
-  }
-
-  .tab {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 0.125rem;
-    min-width: 44px;
-    min-height: 44px;
-    color: var(--muted);
-    font-size: 0.6875rem;
-    line-height: 1.2;
-    text-decoration: none;
-  }
-
-  main {
-    padding-top: calc(var(--gap) + env(safe-area-inset-top, 0px));
-    padding-bottom: calc(var(--gap) + var(--tabbar-h));
-  }
 }
 
 /* Hidden username next to "Your password" fields so password managers can fill them. */

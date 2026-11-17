@@ -11,23 +11,12 @@
   border: 0;
 }
 
+/* The tab bar (see app.css) is a fixed bar at the bottom in every shell mode;
+   the fixed bars below sit above it. */
 .scan {
-  --scan-tabbar: 0px;
-  --scan-savebar: 5rem;
-  --scan-inset: env(safe-area-inset-bottom, 0px);
-}
-
-/* With the tab bar the inset is already inside it. */
-.standalone .scan {
   --scan-tabbar: var(--tabbar-h);
-  --scan-inset: 0px;
-}
-
-@media (display-mode: standalone) {
-  .scan {
-    --scan-tabbar: var(--tabbar-h);
-    --scan-inset: 0px;
-  }
+  --scan-savebar: 5rem;
+  --scan-inset: var(--covered-bottom-inset);
 }
 
 .scan [hidden] {
@@ -142,7 +131,7 @@
 
 /* Page strip: 3:4 thumbnails in a horizontal scroller. */
 .scan-pages-wrap {
-  padding-bottom: calc(var(--scan-savebar) + var(--scan-tabbar));
+  padding-bottom: var(--scan-savebar);
 }
 
 .strip {
@@ -335,6 +324,7 @@
   gap: 1rem;
   max-width: 36rem;
   max-height: 90vh;
+  max-height: 90dvh;
   margin: 0 auto;
   padding: 0.75rem var(--gap) calc(var(--gap) + env(safe-area-inset-bottom, 0px));
   overflow-y: auto;

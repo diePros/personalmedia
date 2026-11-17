@@ -74,6 +74,23 @@ async fn settings_page_needs_login_and_lists_sections() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn settings_shows_account_actions_markup() {
+    let t = TestApp::new();
+    let user = body_string(t.get("/settings", &t.session_for("alice")).await).await;
+    let block = &user[user
+        .find("class=\"account-standalone\"")
+        .expect("account block")..];
+    let block = &block[..block.find("</section>").unwrap()];
+    assert!(block.contains("action=\"/logout\""));
+    assert!(!block.contains("href=\"/admin\""));
+    let admin = body_string(t.get("/settings", &t.admin_session_for("root")).await).await;
+    let block = &admin[admin.find("class=\"account-standalone\"").unwrap()..];
+    let block = &block[..block.find("</section>").unwrap()];
+    assert!(block.contains("action=\"/logout\""));
+    assert!(block.contains("<a class=\"action-link\" href=\"/admin\">"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn change_password_flow() {
     let t = TestApp::new();
     let c = t.session_for("alice");

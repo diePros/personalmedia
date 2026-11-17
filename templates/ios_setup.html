@@ -8,7 +8,7 @@
 <p><strong>Get the Shortcut</strong></p>
 {% match shortcut_url -%}
 {% when Some with (url) -%}
-<p><a class="button" href="{{ url }}">Get the Shortcut</a></p>
+<p><a class="button action-link" href="{{ url }}">Get the Shortcut</a></p>
 {% when None -%}
 <p>Ask the admin for the Shortcut link. The admin finds how to build it in <code>docs/ios-shortcut.md</code>.</p>
 {% endmatch -%}
@@ -26,5 +26,5 @@
 </li>
 </ol>
 <p class="muted">This created a token named "iPhone Shortcut". It can add documents (tagged <code>inbox</code>), and AI assistants using it can list and search the metadata of your <code>inbox</code> documents and edit their title, tags and notes. If you set this up before, you can revoke the previous iPhone tokens in the Tokens list in Settings.</p>
-<p><a href="/settings#tokens">Back to settings</a></p>
+<p><a class="action-link" href="/settings#tokens">Back to settings</a></p>
 {% endblock %}
