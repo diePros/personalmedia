@@ -1,22 +1,23 @@
 //! Text extraction (pdftotext, tesseract) and the background workers that run it.
 
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, WeakUnboundedSender};
+use tokio::sync::Notify;
 
 use crate::documents::{Documents, Enqueue};
 use crate::embed::{Chunk, Engine, MAX_EMBED_CHARS, MODEL};
 use crate::keyring::{OnUnlock, Unlocked};
 use crate::user_db::vectors::{
-    docs_needing_embedding, get_document_text_prefix, needs_embedding, replace_vectors_guarded,
-    set_embed_status,
+    docs_needing_embedding, enforce_all, get_document_text_prefix, needs_embedding,
+    replace_vectors_guarded, set_embed_status,
 };
 use crate::user_db::{TextStatus, pending_document_ids, set_text};
 
@@ -456,66 +457,105 @@ pub fn extract_text(
     res.map_err(ExtractError::Failed)
 }
 
-enum Job {
-    Extract(Arc<Unlocked>, String),
-    Embed(Arc<Unlocked>, String),
+/// What a queued job does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum JobKind {
+    /// Text extraction (pdftotext / OCR) of a new upload.
+    Extract,
+    /// Embedding the text of one document.
+    Embed,
 }
 
-#[derive(Clone)]
-pub struct ExtractQueue {
-    tx: UnboundedSender<Job>,
+type QueuedJob = (Arc<Unlocked>, String);
+
+#[derive(Default)]
+struct Queues {
+    extract: VecDeque<QueuedJob>,
+    embed: VecDeque<QueuedJob>,
+    /// Jobs waiting in either queue, by (user, document, kind).
+    pending: HashSet<(String, String, JobKind)>,
+    closed: bool,
 }
 
-pub struct ExtractReceiver {
-    rx: Arc<tokio::sync::Mutex<UnboundedReceiver<Job>>>,
-    /// Weak so workers still end when every queue handle is dropped.
-    tx: WeakUnboundedSender<Job>,
+/// Two FIFO queues behind one lock. Extraction always goes first, so a
+/// backlog of embed jobs never delays a new upload's OCR; identical pending
+/// jobs are queued once.
+struct Shared {
+    q: Mutex<Queues>,
+    notify: Notify,
 }
 
-impl ExtractQueue {
-    pub fn channel() -> (ExtractQueue, ExtractReceiver) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let weak = tx.downgrade();
-        (
-            ExtractQueue { tx },
-            ExtractReceiver {
-                rx: Arc::new(tokio::sync::Mutex::new(rx)),
-                tx: weak,
-            },
-        )
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queues> {
+        self.q.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Enqueue embedding of one document if it needs it (effective
-    /// `semantic_index` full, text done, no vectors for the current model).
-    pub fn enqueue_embed_if_needed(&self, u: &Arc<Unlocked>, doc_id: &str) {
-        match u.with_db(|c| {
-            let need = needs_embedding(c, doc_id, MODEL.name)?;
-            if need {
-                set_embed_status(c, doc_id, "pending")?;
+    /// Queue a job unless an identical one is already waiting. Returns
+    /// whether it was added.
+    fn push(&self, kind: JobKind, u: &Arc<Unlocked>, id: &str) -> bool {
+        let mut q = self.lock();
+        if !q.pending.insert((u.user_id.clone(), id.to_string(), kind)) {
+            return false;
+        }
+        let job = (u.clone(), id.to_string());
+        match kind {
+            JobKind::Extract => q.extract.push_back(job),
+            JobKind::Embed => q.embed.push_back(job),
+        }
+        drop(q);
+        self.notify.notify_one();
+        true
+    }
+
+    /// The next job: extraction before embedding, re-decided on every call
+    /// (so between any two embed jobs).
+    fn take(&self) -> Option<(JobKind, Arc<Unlocked>, String)> {
+        let mut q = self.lock();
+        let (kind, (u, id)) = match q.extract.pop_front() {
+            Some(j) => (JobKind::Extract, j),
+            None => (JobKind::Embed, q.embed.pop_front()?),
+        };
+        q.pending.remove(&(u.user_id.clone(), id.clone(), kind));
+        Some((kind, u, id))
+    }
+
+    /// Waits for a job; `None` once the queue is closed and empty.
+    async fn next(&self) -> Option<(JobKind, Arc<Unlocked>, String)> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Registered before looking, so a push in between is not missed.
+            notified.as_mut().enable();
+            if let Some(j) = self.take() {
+                return Some(j);
             }
-            anyhow::Ok(need)
-        }) {
+            if self.lock().closed {
+                return None;
+            }
+            notified.await;
+        }
+    }
+
+    fn enqueue_embed_if_needed(&self, u: &Arc<Unlocked>, doc_id: &str) {
+        match u.with_db(|c| needs_embedding(c, doc_id, MODEL.name)) {
             Ok(true) => {
-                let _ = self.tx.send(Job::Embed(u.clone(), doc_id.to_string()));
+                if self.push(JobKind::Embed, u, doc_id) {
+                    mark_pending(u, doc_id);
+                }
             }
             Ok(false) => {}
             Err(e) => tracing::warn!(doc_id, error = %e, "could not check embedding need"),
         }
     }
 
-    /// Enqueue every document that needs vectors. Call after anything that
-    /// may raise `semantic_index` (overrides, defaults) and on unlock.
-    pub fn enqueue_embeds_needed(&self, u: &Arc<Unlocked>) {
-        match u.with_db(|c| {
-            let ids = docs_needing_embedding(c, MODEL.name)?;
-            for id in &ids {
-                set_embed_status(c, id, "pending")?;
-            }
-            anyhow::Ok(ids)
-        }) {
+    fn enqueue_embeds_needed(&self, u: &Arc<Unlocked>) {
+        match u.with_db(|c| docs_needing_embedding(c, MODEL.name)) {
             Ok(ids) => {
                 for id in ids {
-                    let _ = self.tx.send(Job::Embed(u.clone(), id));
+                    // Already waiting: leave it (and its status) alone.
+                    if self.push(JobKind::Embed, u, &id) {
+                        mark_pending(u, &id);
+                    }
                 }
             }
             Err(e) => tracing::warn!(error = %e, "could not list documents needing embedding"),
@@ -523,14 +563,89 @@ impl ExtractQueue {
     }
 }
 
+fn mark_pending(u: &Arc<Unlocked>, doc_id: &str) {
+    if let Err(e) = u.with_db(|c| set_embed_status(c, doc_id, "pending")) {
+        tracing::warn!(doc_id, error = %e, "could not mark document pending");
+    }
+}
+
+/// Closes the queues when the last [`ExtractQueue`] handle is dropped, so
+/// workers end (they only hold [`Shared`]).
+struct Closer(Arc<Shared>);
+
+impl Drop for Closer {
+    fn drop(&mut self) {
+        self.0.lock().closed = true;
+        self.0.notify.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+pub struct ExtractQueue {
+    shared: Arc<Shared>,
+    _closer: Arc<Closer>,
+}
+
+pub struct ExtractReceiver {
+    shared: Arc<Shared>,
+}
+
+impl ExtractReceiver {
+    /// Pops the next job in priority order without running it (extraction
+    /// before embedding). Workers use the same order; this is for tests.
+    pub fn try_next(&self) -> Option<(JobKind, String)> {
+        self.shared.take().map(|(k, _, id)| (k, id))
+    }
+}
+
+impl ExtractQueue {
+    pub fn channel() -> (ExtractQueue, ExtractReceiver) {
+        let shared = Arc::new(Shared {
+            q: Mutex::new(Queues::default()),
+            notify: Notify::new(),
+        });
+        (
+            ExtractQueue {
+                shared: shared.clone(),
+                _closer: Arc::new(Closer(shared.clone())),
+            },
+            ExtractReceiver { shared },
+        )
+    }
+
+    /// Queue embedding of `doc_id` without checking eligibility (the job
+    /// re-checks it). Ignored while an identical job is already waiting.
+    pub fn enqueue_embed(&self, u: &Arc<Unlocked>, doc_id: &str) {
+        self.shared.push(JobKind::Embed, u, doc_id);
+    }
+
+    /// Enqueue embedding of one document if it needs it (effective
+    /// `semantic_index` full, text done, no vectors for the current model).
+    pub fn enqueue_embed_if_needed(&self, u: &Arc<Unlocked>, doc_id: &str) {
+        self.shared.enqueue_embed_if_needed(u, doc_id);
+    }
+
+    /// Enqueue every document that needs vectors. Call after anything that
+    /// may raise `semantic_index` (overrides, defaults) and on unlock.
+    /// Documents already waiting in the queue are not queued again.
+    pub fn enqueue_embeds_needed(&self, u: &Arc<Unlocked>) {
+        self.shared.enqueue_embeds_needed(u);
+    }
+}
+
 impl Enqueue for ExtractQueue {
     fn enqueue(&self, u: Arc<Unlocked>, doc_id: String) {
-        let _ = self.tx.send(Job::Extract(u, doc_id));
+        self.shared.push(JobKind::Extract, &u, &doc_id);
     }
 }
 
 impl OnUnlock for ExtractQueue {
     fn unlocked(&self, u: &Arc<Unlocked>) {
+        // Vectors exist only for documents at semantic_index = full. A
+        // downgrade/upgrade cycle (or an older version) may have left others.
+        if let Err(e) = u.with_db(enforce_all) {
+            tracing::warn!(error = %e, "could not enforce semantic index levels");
+        }
         match u.with_db(pending_document_ids) {
             Ok(ids) => {
                 for id in ids {
@@ -555,20 +670,16 @@ pub fn start_workers(n: usize, cfg: ExtractConfig, docs: Arc<Documents>, rx: Ext
     for _ in 0..n.max(1) {
         let cfg = cfg.clone();
         let docs = docs.clone();
-        let (rx, weak_tx) = (rx.rx.clone(), rx.tx.clone());
+        let shared = rx.shared.clone();
         tokio::spawn(async move {
-            loop {
-                let job = rx.lock().await.recv().await;
-                match job {
-                    None => break,
-                    Some(Job::Extract(u, id)) => {
-                        if run_job(&docs, &cfg, u.clone(), id.clone()).await
-                            && let Some(tx) = weak_tx.upgrade()
-                        {
-                            ExtractQueue { tx }.enqueue_embed_if_needed(&u, &id);
+            while let Some((kind, u, id)) = shared.next().await {
+                match kind {
+                    JobKind::Extract => {
+                        if run_job(&docs, &cfg, u.clone(), id.clone()).await {
+                            shared.enqueue_embed_if_needed(&u, &id);
                         }
                     }
-                    Some(Job::Embed(u, id)) => run_embed_job(&cfg, u, id).await,
+                    JobKind::Embed => run_embed_job(&cfg, u, id).await,
                 }
             }
         });

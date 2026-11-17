@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use personal_media::accounts::Accounts;
 use personal_media::config::Config;
-use personal_media::documents::{Documents, OnDuplicate, StoreOutcome, UploadMeta};
+use personal_media::documents::{Documents, Enqueue, OnDuplicate, StoreOutcome, UploadMeta};
 use personal_media::embed::model::{MODEL_FILE, TOKENIZER_FILE};
 use personal_media::embed::{Chunk, Engine, MODEL};
 use personal_media::extract::{
-    EMBED_BATCH, EmbedEvent, EmbedRuntime, ExtractConfig, ExtractQueue, start_workers,
+    EMBED_BATCH, EmbedEvent, EmbedRuntime, ExtractConfig, ExtractQueue, ExtractReceiver, JobKind,
+    start_workers,
 };
 use personal_media::keyring::{Keyring, Unlocked, index_db_path};
 use personal_media::system_db::{Role, SYSTEM_DB_FILE, SystemDb};
@@ -56,6 +57,8 @@ struct Env {
     data: PathBuf,
     docs: Arc<Documents>,
     queue: ExtractQueue,
+    /// Without workers the jobs stay queued and can be inspected.
+    rx: Option<ExtractReceiver>,
     u: Arc<Unlocked>,
 }
 
@@ -79,6 +82,7 @@ impl Env {
             100 << 20,
             Arc::new(queue.clone()),
         ));
+        let mut rx = Some(rx);
         if let Some((models, hook)) = models {
             let engine = Arc::new(Engine::new(models, Duration::from_secs(600)));
             let mut rt = EmbedRuntime::new(engine, hook);
@@ -86,7 +90,7 @@ impl Env {
                 rt.max_chars = m;
             }
             let cfg = ExtractConfig::new(data.join("tmp")).with_embed(rt);
-            start_workers(1, cfg, docs.clone(), rx);
+            start_workers(1, cfg, docs.clone(), rx.take().unwrap());
         }
         let url = accounts.create_invite(Role::User, NOW).unwrap();
         let token = url.rsplit('/').next().unwrap().to_string();
@@ -96,6 +100,7 @@ impl Env {
             data,
             docs,
             queue,
+            rx,
             u,
         }
     }
@@ -522,5 +527,86 @@ fn partial_vectors_stay_valid_only_while_the_prefix_is_unchanged() {
         .unwrap();
     assert!(!store(&prefix, true));
     assert_eq!(e.count(&id), 0);
+    drop(rt);
+}
+
+/// Drains the queue the way a worker would.
+fn drain(rx: &ExtractReceiver) -> Vec<(JobKind, String)> {
+    std::iter::from_fn(|| rx.try_next()).collect()
+}
+
+#[test]
+fn ocr_jobs_preempt_embed_backlog() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let e = rt.block_on(async { Env::new(None) });
+    let rx = e.rx.as_ref().unwrap();
+    // The upload's own extraction job is queued by the store; clear it.
+    drain(rx);
+    for i in 0..1000 {
+        e.queue.enqueue_embed(&e.u, &format!("backlog-{i}"));
+    }
+    // A new upload arrives behind 1000 pending embeds ...
+    e.queue.enqueue(e.u.clone(), "new-upload".into());
+    // ... and is the very next job.
+    assert_eq!(
+        rx.try_next(),
+        Some((JobKind::Extract, "new-upload".to_string()))
+    );
+    // Embeds then run in FIFO order.
+    assert_eq!(
+        rx.try_next(),
+        Some((JobKind::Embed, "backlog-0".to_string()))
+    );
+    // Another upload while embedding is under way jumps ahead again (the
+    // decision is re-made before every job).
+    e.queue.enqueue(e.u.clone(), "second-upload".into());
+    assert_eq!(
+        rx.try_next(),
+        Some((JobKind::Extract, "second-upload".to_string()))
+    );
+    assert_eq!(
+        rx.try_next(),
+        Some((JobKind::Embed, "backlog-1".to_string()))
+    );
+    assert_eq!(drain(rx).len(), 998);
+    drop(rt);
+}
+
+#[test]
+fn duplicate_enqueue_is_ignored() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (e, id) = rt.block_on(async {
+        let e = Env::new(None);
+        let id = e.upload_text("a.txt", SAMPLE).await;
+        (e, id)
+    });
+    let rx = e.rx.as_ref().unwrap();
+    drain(rx);
+    for _ in 0..3 {
+        e.queue.enqueue_embed(&e.u, "doc-x");
+        e.queue.enqueue(e.u.clone(), "doc-y".into());
+    }
+    assert_eq!(
+        drain(rx),
+        vec![
+            (JobKind::Extract, "doc-y".to_string()),
+            (JobKind::Embed, "doc-x".to_string())
+        ]
+    );
+    // Once taken, the same job can be queued again.
+    e.queue.enqueue_embed(&e.u, "doc-x");
+    assert_eq!(drain(rx).len(), 1);
+
+    // Saving the defaults twice does not queue a pending document twice.
+    e.u.with_db(|c| set_text(c, &id, TextStatus::Done, Some(SAMPLE), None, NOW))
+        .unwrap();
+    drain(rx);
+    e.set_default(Level::Full);
+    e.queue.enqueue_embeds_needed(&e.u);
+    e.set_default(Level::Full);
+    e.queue.enqueue_embeds_needed(&e.u);
+    e.queue.enqueue_embed_if_needed(&e.u, &id);
+    assert_eq!(drain(rx), vec![(JobKind::Embed, id.clone())]);
+    assert_eq!(e.status(&id), "pending");
     drop(rt);
 }
