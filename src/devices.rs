@@ -63,13 +63,21 @@ pub fn create_device(
         return Err(e.context("storing device metadata"));
     }
 
-    // Over the cap: evict the least recently used (the list is newest first).
+    // Over the cap: evict the least recently used (the list is newest first),
+    // never the device just created. A failure here must not lose the token.
+    if let Err(e) = evict_over_cap(sys, u, &id) {
+        tracing::error!(error = %e, "could not evict old devices");
+    }
+    Ok(format!("{PREFIX}{id}_{}", secret_hex.as_str()))
+}
+
+fn evict_over_cap(sys: &SystemDb, u: &Unlocked, keep: &str) -> anyhow::Result<()> {
     let all = u.with_db(list_device_meta)?;
-    for old in all.iter().skip(MAX_DEVICES) {
+    for old in all.iter().skip(MAX_DEVICES).filter(|d| d.id != keep) {
         sys.delete_token(&old.id)?;
         u.with_db(|c| delete_device_meta(c, &old.id))?;
     }
-    Ok(format!("{PREFIX}{id}_{}", secret_hex.as_str()))
+    Ok(())
 }
 
 /// A successfully resumed device login.
@@ -205,7 +213,14 @@ pub fn device_label(user_agent: &str) -> String {
         "Edge"
     } else if has("Chrome/") || has("CriOS") {
         "Chrome"
-    } else if has("Safari") {
+    } else if has("Safari")
+        || ((has("iPhone") || has("iPad"))
+            && has("AppleWebKit")
+            && !has("CriOS")
+            && !has("FxiOS")
+            && !has("EdgiOS"))
+    {
+        // An installed iOS web app sends no "Safari/" token.
         "Safari"
     } else {
         "Browser"

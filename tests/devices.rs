@@ -183,7 +183,7 @@ fn device_label_table() {
         ),
         (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
-            "iPhone · Browser",
+            "iPhone · Safari",
         ),
         (
             "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
@@ -213,4 +213,24 @@ fn device_label_table() {
             .count()
             <= 60
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_after_restart_unlocks_a_locked_user() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let token = {
+        let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+        create_device(&t.state.sys, &u, "x", NOW).unwrap()
+    };
+    t.state.sessions.remove(&c.cookie);
+    assert!(
+        t.state.keyring.get(&user_id(&t)).is_none(),
+        "still unlocked"
+    );
+    let r = resume_device(&t.state, &token, NOW + 5).unwrap();
+    assert_eq!(r.user.id, user_id(&t));
+    let metas = r.unlocked.with_db(list_device_meta).unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].last_used_at, Some(NOW + 5));
 }
