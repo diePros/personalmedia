@@ -53,6 +53,14 @@ fn corrupt_model_file_rejected() {
 
 #[test]
 fn fetch_model_downloads_verifies_and_is_idempotent() {
+    // Opt-in: depends on huggingface.co response times and was flaky in CI. The
+    // Docker build stage already exercises the real download via `fetch-model`.
+    if std::env::var_os("PM_NETWORK_TESTS").is_none() {
+        eprintln!(
+            "skipped (set PM_NETWORK_TESTS=1): fetch_model_downloads_verifies_and_is_idempotent"
+        );
+        return;
+    }
     let online = "huggingface.co:443"
         .to_socket_addrs()
         .ok()
