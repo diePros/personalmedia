@@ -1143,8 +1143,11 @@ async fn documents_list_grouped_by_day() {
     let c = t.session_for("alice");
     let fresh = upload_at(&t, &c, "fresh.txt", b"fresh", "").await;
     let old = upload_at(&t, &c, "old.txt", b"old", "").await;
-    set_created(&t, &c, &fresh, now_secs());
-    let old_ts = now_secs() - 40 * 86_400;
+    // Midnight-relative, so the groups do not depend on the time of day.
+    let now = now_secs();
+    let midnight = now - now.rem_euclid(86_400);
+    set_created(&t, &c, &fresh, midnight);
+    let old_ts = midnight - 40 * 86_400;
     set_created(&t, &c, &old, old_ts);
     let html = body_string(t.get("/documents", &c).await).await;
     let old_month = {
@@ -1175,31 +1178,62 @@ async fn documents_list_grouped_by_day() {
 async fn day_groups_ignore_bad_tz_cookie() {
     let t = TestApp::new();
     let c = t.session_for("alice");
-    // 23:30 UTC yesterday is "Yesterday" in UTC but "Today" at +30.
     let id = upload_at(&t, &c, "late.txt", b"late", "").await;
+    // Half an hour either side of UTC midnight, with a +-60 minute cookie that
+    // moves it across the boundary: every case is far from the real midnights.
     let now = now_secs();
-    let ts = now - now.rem_euclid(86_400) - 1_800;
+    let midnight = now - now.rem_euclid(86_400);
+    let (ts, cookie, utc_label, local_label) = if now.rem_euclid(86_400) < 23 * 3600 {
+        (midnight - 1_800, "pm_tz=60", "Yesterday", "Today")
+    } else {
+        (midnight + 1_800, "pm_tz=-60", "Today", "Yesterday")
+    };
     set_created(&t, &c, &id, ts);
-    let get = |cookie: &'static str| {
+    let get = |cookie: Option<&'static str>| {
         let t = &t;
         let c = &c;
         async move {
+            let mut value = format!("__Host-pm_session={}", c.cookie);
+            if let Some(extra) = cookie {
+                value = format!("{value}; {extra}");
+            }
             let req = builder(Method::GET, "/documents", c)
-                .header(
-                    header::COOKIE,
-                    format!("__Host-pm_session={}; {cookie}", c.cookie),
-                )
+                .header(header::COOKIE, value)
                 .body(Body::empty())
                 .unwrap();
             let resp = t.request(req).await;
-            assert_eq!(resp.status(), 200, "{cookie}");
+            assert_eq!(resp.status(), 200, "{cookie:?}");
             body_string(resp).await
         }
     };
+    let none = get(None).await;
+    assert!(none.contains(&format!(">{utc_label}</h2>")), "{none}");
     for bad in ["pm_tz=abc", "pm_tz=999999"] {
-        let html = get(bad).await;
-        assert!(html.contains(">Yesterday</h2>"), "{bad}: {html}");
+        let html = get(Some(bad)).await;
+        assert!(
+            html.contains(&format!(">{utc_label}</h2>")),
+            "{bad}: {html}"
+        );
+        let heading = |h: &str| h[h.find("<h2").unwrap()..h.find("</h2>").unwrap()].to_owned();
+        assert_eq!(heading(&html), heading(&none), "{bad}");
     }
-    let html = get("pm_tz=30").await;
-    assert!(html.contains(">Today</h2>"), "{html}");
+    let html = get(Some(cookie)).await;
+    assert!(html.contains(&format!(">{local_label}</h2>")), "{html}");
+}
+
+#[tokio::test]
+async fn day_groups_use_separate_lists_and_search_has_one() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let a = upload_at(&t, &c, "a.txt", b"aaa", "red").await;
+    let b = upload_at(&t, &c, "b.txt", b"bbb", "red").await;
+    let now = now_secs();
+    let midnight = now - now.rem_euclid(86_400);
+    set_created(&t, &c, &a, midnight);
+    set_created(&t, &c, &b, midnight - 40 * 86_400);
+    let html = body_string(t.get("/documents", &c).await).await;
+    assert_eq!(html.matches("<ul class=\"doc-list\">").count(), 2, "{html}");
+    assert!(!html.contains("<li class=\"day-heading"), "{html}");
+    let s = body_string(t.get("/search?tag=red", &c).await).await;
+    assert_eq!(s.matches("<ul class=\"doc-list\">").count(), 1, "{s}");
 }

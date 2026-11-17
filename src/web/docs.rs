@@ -610,6 +610,31 @@ struct ResultsView {
     next_url: Option<String>,
 }
 
+/// Consecutive rows under one day heading (`None`: ungrouped results).
+struct Group<'a> {
+    heading: Option<&'a str>,
+    rows: &'a [Row],
+}
+
+impl ResultsView {
+    /// The rows split into runs, one per heading; each starts at a row that
+    /// carries a heading. Without headings, a single group.
+    fn groups(&self) -> Vec<Group<'_>> {
+        let mut groups: Vec<Group<'_>> = Vec::new();
+        let mut start = 0;
+        for i in 1..=self.rows.len() {
+            if i == self.rows.len() || self.rows[i].heading.is_some() {
+                groups.push(Group {
+                    heading: self.rows[start].heading.as_deref(),
+                    rows: &self.rows[start..i],
+                });
+                start = i;
+            }
+        }
+        groups
+    }
+}
+
 #[derive(Template)]
 #[template(path = "_results.html")]
 struct ResultsPartial {
@@ -870,7 +895,12 @@ async fn run_query(
             None if meaning => Ok(vec![]),
             None => list_documents(c, &filter).map(|d| d.into_iter().map(row_of).collect()),
         };
-        let tags = list_tags_visible(c, &tag_filter);
+        // Only the Search page has a tag filter.
+        let tags = if surface == Surface::Search {
+            list_tags_visible(c, &tag_filter)
+        } else {
+            Ok(vec![])
+        };
         rows.and_then(|r| tags.map(|t| (r, t)))
     })
     .await;
@@ -980,7 +1010,8 @@ fn row_of(d: Document) -> Row {
 
 /// The browser's UTC offset in minutes east of UTC, from the `pm_tz` cookie.
 /// Anything that is not an integer within +-840 (UTC+14 / UTC-14 and a bit
-/// more) counts as UTC.
+/// more) counts as UTC. On the first visit the page renders in UTC: app.js sets
+/// the cookie only after that page has loaded.
 fn tz_offset_from(headers: &HeaderMap) -> i32 {
     headers
         .get_all(header::COOKIE)

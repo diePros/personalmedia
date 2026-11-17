@@ -283,16 +283,16 @@ code.recovery-key {
   margin: var(--gap) 0;
 }
 
-.day-heading {
-  list-style: none;
-}
-
 .day-group {
   margin: var(--gap) 0 0;
   font-size: 0.875rem;
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--muted);
+}
+
+.day-group + .doc-list {
+  margin-top: 0.25rem;
 }
 
 .doc-item {

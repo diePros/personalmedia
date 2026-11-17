@@ -3,11 +3,12 @@
 {% else if results.rows.is_empty() -%}
 <p class="muted">{% if results.searching %}No documents match your search.{% else %}No documents yet.{% endif %}</p>
 {% else -%}
-<ul class="doc-list">
-{% for row in results.rows -%}
-{% if let Some(h) = row.heading -%}
-<li class="day-heading"><h2 class="day-group">{{ h }}</h2></li>
+{% for group in results.groups() -%}
+{% if let Some(h) = group.heading -%}
+<h2 class="day-group">{{ h }}</h2>
 {% endif -%}
+<ul class="doc-list">
+{% for row in group.rows -%}
 <li class="doc-item">
 <a class="doc-title" href="/documents/{{ row.id }}">{{ row.title }}</a>
 <div class="muted doc-meta">
@@ -22,6 +23,7 @@
 </li>
 {% endfor -%}
 </ul>
+{% endfor -%}
 {% endif -%}
 {% if results.prev_url.is_some() || results.next_url.is_some() -%}
 <nav class="pager" aria-label="Pages">
