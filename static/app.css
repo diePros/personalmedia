@@ -45,6 +45,16 @@ a {
   color: var(--accent);
 }
 
+h1,
+h2,
+.doc-title,
+.doc-meta,
+.tag,
+.upload-name,
+code {
+  overflow-wrap: anywhere;
+}
+
 h1 {
   font-size: 1.5rem;
   line-height: 1.25;
@@ -67,6 +77,9 @@ h1 {
 }
 
 .brand {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
   font-weight: 600;
   color: var(--text);
   text-decoration: none;
@@ -198,15 +211,35 @@ button.danger {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  min-height: 2.75rem;
 }
 
 .check label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex: 1;
+  min-height: 2.75rem;
   margin: 0;
 }
 
 .check input {
+  flex: none;
   width: 1.25rem;
   height: 1.25rem;
+}
+
+/* Text links used as actions get a 44px tall hit area. */
+main p > a:only-child,
+a.doc-title,
+.pager a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.75rem;
+}
+
+input[type="file"] {
+  min-height: 2.75rem;
 }
 
 code.recovery-key {
@@ -292,6 +325,7 @@ mark {
   display: block;
   width: 100%;
   max-height: 80vh;
+  max-height: 80dvh;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   margin-bottom: var(--gap);
@@ -299,6 +333,7 @@ mark {
 
 iframe.preview {
   height: 70vh;
+  height: 70dvh;
 }
 
 .facts {
@@ -331,6 +366,8 @@ fieldset {
 pre {
   overflow-x: auto;
   max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
   padding: 0.75rem;
   background: var(--surface);
   border: 1px solid var(--border);
