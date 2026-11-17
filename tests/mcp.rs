@@ -276,8 +276,8 @@ async fn client_handshake_with_mcp_headers() {
         .await;
     assert_eq!(resp.status(), 200);
     let v: Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    // A read-only token is not offered the two write tools.
-    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 4);
+    // A read-only full-text token is not offered the two write tools.
+    assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
 
     // An unsupported version is answered with ours.
     let resp = f
@@ -1014,7 +1014,8 @@ async fn tools_list_hides_write_tools_from_read_only_tokens() {
             "get_document",
             "list_documents",
             "list_tags",
-            "search_documents"
+            "search_documents",
+            "semantic_search"
         ]
     );
 }

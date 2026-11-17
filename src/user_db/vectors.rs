@@ -5,7 +5,8 @@ use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::access::{Channel, Level, effective_level};
-use crate::embed::Chunk;
+use super::documents::{Document, ListFilter, semantic_candidates};
+use crate::embed::{Chunk, MODEL};
 
 /// f32 little-endian.
 fn vec_to_blob(v: &[f32]) -> Vec<u8> {
@@ -247,4 +248,54 @@ pub(crate) fn enforce_all(conn: &Connection) -> Result<()> {
         enforce_document(conn, &id)?;
     }
     Ok(())
+}
+
+/// Brute-force semantic search over the documents visible under `filter`
+/// (`access` must be `Some(Mcp, Full)`; effective `semantic_index` must also be
+/// full). Visibility is decided in SQL before any vector is read. Scores are
+/// the dot product of the (L2-normalised) vectors. Returns the best chunk per
+/// document, top `limit` documents by score (ties by document id).
+pub fn search(
+    conn: &Connection,
+    query_vec: &[f32],
+    filter: &ListFilter,
+    limit: usize,
+) -> Result<Vec<(Document, f32, Chunk)>> {
+    let mut stmt = conn.prepare(
+        "SELECT start, end, vector FROM chunk_vectors WHERE document_id = ?1 AND model = ?2",
+    )?;
+    let mut best: Vec<(Document, f32, Chunk)> = Vec::new();
+    for doc in semantic_candidates(conn, filter)? {
+        let rows = stmt.query_map(params![doc.id, MODEL.name], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut top: Option<(f32, Chunk)> = None;
+        for row in rows {
+            let (start, end, blob) = row?;
+            let v = blob_to_vec(&blob);
+            if v.len() != query_vec.len() {
+                continue;
+            }
+            let score: f32 = v.iter().zip(query_vec).map(|(a, b)| a * b).sum();
+            if top.is_none_or(|(s, _)| score > s) {
+                top = Some((
+                    score,
+                    Chunk {
+                        start: start as usize,
+                        end: end as usize,
+                    },
+                ));
+            }
+        }
+        if let Some((score, chunk)) = top {
+            best.push((doc, score, chunk));
+        }
+    }
+    best.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
+    best.truncate(limit);
+    Ok(best)
 }

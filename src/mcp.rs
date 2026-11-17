@@ -231,7 +231,7 @@ async fn rpc(
         "ping" => rpc_result(id, json!({})),
         "tools/list" => rpc_result(
             id,
-            json!({"tools": tool_definitions(principal.can_write())}),
+            json!({"tools": tool_definitions(principal.can_write(), principal.cap() == Level::Full)}),
         ),
         "tools/call" => {
             let params = env
@@ -302,10 +302,12 @@ const TOOL_NAMES: &[&str] = &[
     "list_tags",
     "upload_document",
     "update_document",
+    "semantic_search",
 ];
 
-/// The tool list; write tools only for tokens that may write.
-fn tool_definitions(can_write: bool) -> Value {
+/// The tool list; write tools only for tokens that may write, semantic search
+/// only for full-text tokens.
+fn tool_definitions(can_write: bool, full_text: bool) -> Value {
     let tags = json!({"type": "array", "items": {"type": "string"}});
     let date = json!({"type": "string", "description": "YYYY-MM-DD"});
     let all = json!([
@@ -316,6 +318,15 @@ fn tool_definitions(can_write: bool) -> Value {
                 "query": {"type": "string"},
                 "tags": tags, "date_from": date, "date_to": date,
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+            }, "required": ["query"]}
+        },
+        {
+            "name": "semantic_search",
+            "description": "Meaning-based search over document passages (full_text tokens only). Returns the best passage per document.",
+            "inputSchema": {"type": "object", "properties": {
+                "query": {"type": "string", "maxLength": 1000},
+                "tags": tags, "date_from": date, "date_to": date,
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20}
             }, "required": ["query"]}
         },
         {
@@ -363,6 +374,9 @@ fn tool_definitions(can_write: bool) -> Value {
     };
     if !can_write {
         all.retain(|t| !t["name"].as_str().is_some_and(|n| WRITE_TOOLS.contains(&n)));
+    }
+    if !full_text {
+        all.retain(|t| t["name"] != "semantic_search");
     }
     Value::Array(all)
 }
@@ -446,6 +460,7 @@ async fn call_tool(
         "list_documents" => Ok(list_docs(p, parse(args)?).await?),
         "get_document" => Ok(get_doc(p, parse(args)?).await?),
         "list_tags" => Ok(list_tag_names(p).await?),
+        "semantic_search" => semantic_search(state, p, parse(args)?).await,
         "upload_document" => upload_document(state, p, parse(args)?).await,
         "update_document" => update_document(p, parse(args)?).await,
         _ => Err(ToolError::Tool("unknown tool".into())),
@@ -524,6 +539,103 @@ async fn search_documents(p: &Principal, a: SearchArgs) -> Result<Value, String>
         })
         .collect();
     Ok(Value::Array(out))
+}
+
+/// Longest passage returned by `semantic_search`, in characters.
+const PASSAGE_MAX_CHARS: usize = 1200;
+const QUERY_MAX_CHARS: usize = 1000;
+const NO_INDEX: &str = "semantic index not available yet";
+
+#[derive(Deserialize)]
+struct SemanticArgs {
+    query: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    date_from: Option<String>,
+    date_to: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `text[start..end]` by character offsets, cut to [`PASSAGE_MAX_CHARS`]
+/// with `…` appended when cut.
+fn passage(text: &str, start: usize, end: usize) -> String {
+    let end = end.max(start);
+    let mut it = text.chars().skip(start).take(end - start);
+    let out: String = it.by_ref().take(PASSAGE_MAX_CHARS).collect();
+    if it.next().is_none() {
+        return out;
+    }
+    // Total length stays within the cap: the ellipsis takes the last slot.
+    let mut cut: String = out.chars().take(PASSAGE_MAX_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+async fn semantic_search(
+    state: &AppState,
+    p: &Principal,
+    a: SemanticArgs,
+) -> Result<Value, ToolError> {
+    // Metadata-only tokens never reach the vector code.
+    if p.cap() != Level::Full {
+        return Err(ToolError::Tool("token cannot use semantic search".into()));
+    }
+    if a.query.chars().count() > QUERY_MAX_CHARS {
+        return Err(ToolError::Params("query too long"));
+    }
+    if a.query.trim().is_empty() {
+        return Err(ToolError::Tool("query must not be empty".into()));
+    }
+    // Never download the model on a query.
+    if !state.engine.is_available() {
+        return Err(ToolError::Tool(NO_INDEX.into()));
+    }
+    let engine = state.engine.clone();
+    let query = a.query;
+    let qv = match tokio::task::spawn_blocking(move || engine.embed_query(&query)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "semantic query embedding failed");
+            return Err(ToolError::Tool(NO_INDEX.into()));
+        }
+        Err(e) => return Err(ToolError::Tool(internal(e))),
+    };
+    let mut f = p.filter();
+    f.tags_all = a.tags;
+    f.date_from = clean(a.date_from);
+    f.date_to = clean(a.date_to);
+    let limit = a.limit.unwrap_or(8).clamp(1, 20) as usize;
+    let p2 = p.clone();
+    let hits = blocking(&p.unlocked, move |c| {
+        if !tags_filter_allowed(&p2, c, &f.tags_all)? {
+            return Ok(vec![]);
+        }
+        let hits = crate::user_db::vectors::search(c, &qv, &f, limit)?;
+        let mut out = Vec::with_capacity(hits.len());
+        for (doc, score, chunk) in hits {
+            let text = get_document_text(c, &doc.id)?.unwrap_or_default();
+            let mut docs = [doc];
+            restrict_tags(&p2, c, &mut docs)?;
+            let [doc] = docs;
+            out.push((doc, score, passage(&text, chunk.start, chunk.end)));
+        }
+        Ok(out)
+    })
+    .await
+    .map_err(ToolError::Tool)?;
+    Ok(Value::Array(
+        hits.into_iter()
+            .map(|(doc, score, passage)| {
+                let mut m = doc_json(&doc);
+                m.insert(
+                    "score".into(),
+                    json!((f64::from(score) * 1000.0).round() / 1000.0),
+                );
+                m.insert("passage".into(), json!(passage));
+                Value::Object(m)
+            })
+            .collect(),
+    ))
 }
 
 async fn list_docs(p: &Principal, a: ListArgs) -> Result<Value, String> {

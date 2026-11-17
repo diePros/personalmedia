@@ -383,6 +383,42 @@ pub fn list_documents(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>
     Ok(docs)
 }
 
+/// Documents a semantic search may read vectors of: effective `mcp` level
+/// `Full` under the filter's cap (which must itself be `Full`), effective
+/// `semantic_index` `Full`, plus the tag allow-list and date filters. Decided
+/// in SQL; no limit. `f.access` must be `Some(Mcp, Full)` or nothing matches.
+pub(crate) fn semantic_candidates(conn: &Connection, f: &ListFilter) -> Result<Vec<Document>> {
+    let Some(a) = f.access else {
+        return Ok(vec![]);
+    };
+    if a.channel != Channel::Mcp || a.cap != Level::Full {
+        return Ok(vec![]);
+    }
+    let defaults = get_access_defaults(conn)?;
+    let mut params: Vec<Value> = vec![Value::Text(Channel::SemanticIndex.as_str().into())];
+    let mut sql = format!(
+        "SELECT {DOC_COLS} FROM documents d \
+         LEFT JOIN document_access s ON s.document_id = d.id AND s.channel = ?"
+    );
+    access_clause(conn, f, &mut sql, &mut params)?;
+    sql.push_str(" AND COALESCE(a.level, ?) = 'full'");
+    params.push(Value::Text(defaults.level(Channel::Mcp).as_str().into()));
+    sql.push_str(" AND COALESCE(s.level, ?) = 'full'");
+    params.push(Value::Text(
+        defaults.level(Channel::SemanticIndex).as_str().into(),
+    ));
+    filter_conditions(f, &mut sql, &mut params);
+    sql.push_str(" ORDER BY d.id");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut docs: Vec<Document> = stmt
+        .query_map(params_from_iter(params), map_doc)?
+        .collect::<rusqlite::Result<_>>()?;
+    for d in &mut docs {
+        load_tags(conn, d)?;
+    }
+    Ok(docs)
+}
+
 /// Documents whose effective level on `channel` is off (the raw level, or the
 /// channel default when there is no override), newest first. One query.
 pub fn hidden_from(conn: &Connection, channel: Channel) -> Result<Vec<Document>> {

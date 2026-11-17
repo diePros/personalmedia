@@ -70,6 +70,14 @@ impl Engine {
         }
     }
 
+    /// Whether the model is loaded or its files are on disk (hashes are
+    /// checked on load). Never downloads.
+    pub fn is_available(&self) -> bool {
+        let dir = MODEL.dir(&self.models_dir);
+        self.is_loaded()
+            || (dir.join(model::MODEL_FILE).is_file() && dir.join(model::TOKENIZER_FILE).is_file())
+    }
+
     pub fn is_loaded(&self) -> bool {
         self.lock().loaded.is_some()
     }
