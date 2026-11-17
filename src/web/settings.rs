@@ -156,6 +156,7 @@ struct SettingsPage {
     totp_enabled: bool,
     totp_setup: Option<SetupView>,
     semantic: SemanticStatus,
+    storage: String,
 }
 
 #[derive(Template)]
@@ -293,6 +294,15 @@ async fn settings_response(
 ) -> Response {
     let (u, accounts) = (session.unlocked.clone(), state.accounts.clone());
     let user_id = session.user_id.clone();
+    let used = state.quotas.usage(&user_id).await;
+    let storage = match state.quotas.limit_for(&user_id) {
+        Some(limit) => format!(
+            "{} of {}",
+            crate::quota::human_bytes(used),
+            crate::quota::human_bytes(limit)
+        ),
+        None => format!("{} (unlimited)", crate::quota::human_bytes(used)),
+    };
     let loaded = blocking(move || -> anyhow::Result<_> {
         let (defaults, hidden, tokens, tags, semantic) = u.with_db(|c| -> anyhow::Result<_> {
             let defaults = get_access_defaults(c)?;
@@ -335,6 +345,7 @@ async fn settings_response(
             .collect(),
         totp_enabled,
         semantic,
+        storage,
         totp_setup: view.setup.map(|s| SetupView {
             secret: s.secret_b32,
             qr: s.qr_png_base64,

@@ -36,6 +36,7 @@ use crate::documents::Documents;
 use crate::embed::Engine;
 use crate::extract::{EmbedRuntime, ExtractConfig, ExtractQueue, start_workers, wipe_tmp};
 use crate::keyring::Keyring;
+use crate::quota::Quotas;
 use crate::system_db::{SYSTEM_DB_FILE, SystemDb};
 use crate::tokens::TokenCache;
 use ratelimit::RateLimiter;
@@ -62,6 +63,8 @@ pub struct AppState {
     pub keyring: Arc<Keyring>,
     pub accounts: Arc<Accounts>,
     pub docs: Arc<Documents>,
+    /// Per-user storage usage and limits.
+    pub quotas: Arc<Quotas>,
     /// Extraction and embedding jobs.
     pub queue: ExtractQueue,
     /// The one embedding engine, shared with the workers.
@@ -107,10 +110,12 @@ impl AppState {
         engine.start_idle_reaper();
         let keyring = Arc::new(Keyring::new(data_dir.clone(), Arc::new(queue.clone())));
         let accounts = Arc::new(Accounts::new(&cfg, sys.clone(), keyring.clone()));
+        let quotas = Quotas::new(sys.clone(), data_dir.clone());
         let docs = Arc::new(Documents::new(
             data_dir.clone(),
             cfg.max_upload_bytes,
             Arc::new(queue.clone()),
+            quotas.clone(),
         ));
 
         let tmp = data_dir.join("tmp");
@@ -134,6 +139,7 @@ impl AppState {
             keyring,
             accounts,
             docs,
+            quotas,
             queue,
             engine,
             sessions,

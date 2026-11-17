@@ -37,7 +37,12 @@ async fn setup(dir: &Path) -> String {
     let url = accounts.create_invite(Role::User, NOW).unwrap();
     let token = url.rsplit('/').next().unwrap().to_string();
     let (u, _, rk) = accounts.signup(&token, "sebi", PASSWORD, NOW).unwrap();
-    let docs = Documents::new(dir.to_path_buf(), 10_000_000, Arc::new(NoQueue));
+    let docs = Documents::new(
+        dir.to_path_buf(),
+        10_000_000,
+        Arc::new(NoQueue),
+        personal_media::quota::Quotas::unlimited(dir.to_path_buf()),
+    );
     for (i, (name, data)) in FILES.iter().enumerate() {
         let body =
             futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::copy_from_slice(data))]);

@@ -806,6 +806,7 @@ fn invalid_input(e: DocError) -> ToolError {
 fn doc_err(e: DocError) -> ToolError {
     ToolError::Tool(match e {
         DocError::TooLarge => "upload too large".into(),
+        e @ DocError::QuotaExceeded { .. } => e.to_string(),
         DocError::NotFound => NOT_FOUND.into(),
         DocError::InvalidDate => "invalid date (use YYYY-MM-DD)".into(),
         DocError::InvalidInput(msg) => return ToolError::Params(msg),

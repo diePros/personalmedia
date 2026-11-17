@@ -48,6 +48,22 @@
 </form>
 </section>
 
+<section id="quota">
+<h2>Storage quota</h2>
+<p class="muted">Default for every user without their own setting: {{ default_text }}. Only sizes are shown here, never content.</p>
+<form method="post" action="/admin/quota" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="default-gib">Default quota (GiB)</label>
+<input type="text" id="default-gib" name="gib" inputmode="decimal" value="{{ default_gib }}">
+</div>
+<div>
+<label><input type="checkbox" name="unlimited" value="on"{% if default_unlimited %} checked{% endif %}> Unlimited</label>
+</div>
+<button type="submit">Save default</button>
+</form>
+</section>
+
 <section id="users">
 <h2>Users</h2>
 <ul class="doc-list">
@@ -55,6 +71,18 @@
 <li class="doc-item">
 <span class="doc-title">{{ u.username }}</span>
 <span class="muted doc-meta">{{ u.role }} · created {{ u.created }} · {{ u.storage }}{% if u.disabled %} · disabled{% endif %}</span>
+<form method="post" action="/admin/users/{{ u.id }}/quota">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<label for="quota-mode-{{ u.id }}" class="muted">Quota</label>
+<select id="quota-mode-{{ u.id }}" name="mode">
+<option value="default"{% if u.quota_mode == "default" %} selected{% endif %}>default</option>
+<option value="custom"{% if u.quota_mode == "custom" %} selected{% endif %}>custom</option>
+<option value="unlimited"{% if u.quota_mode == "unlimited" %} selected{% endif %}>unlimited</option>
+</select>
+<label for="quota-gib-{{ u.id }}" class="muted">GiB (custom)</label>
+<input type="text" id="quota-gib-{{ u.id }}" name="gib" inputmode="decimal" value="{{ u.quota_gib }}">
+<button type="submit">Set quota</button>
+</form>
 {% if u.is_self -%}
 <span class="muted doc-meta">This is you.</span>
 {% else -%}

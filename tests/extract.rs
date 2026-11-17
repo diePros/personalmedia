@@ -128,6 +128,7 @@ impl Env {
             dir.path().to_path_buf(),
             100 << 20,
             Arc::new(queue.clone()),
+            personal_media::quota::Quotas::unlimited(dir.path().to_path_buf()),
         ));
         if workers {
             start_workers(2, ExtractConfig::new(tmp.clone()), docs.clone(), rx);

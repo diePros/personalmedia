@@ -12,7 +12,6 @@
 
 #![allow(clippy::result_large_err)] // helpers return a ready `Response` as the error
 
-use std::path::Path as FsPath;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use askama::Template;
@@ -26,8 +25,8 @@ use serde::Deserialize;
 use super::docs::format_date;
 use super::session::{AdminUser, CsrfForm, NoFields, Session};
 use super::{AppState, Page, redirect, render};
-use crate::keyring::user_dir;
-use crate::system_db::Role;
+use crate::quota::human_bytes;
+use crate::system_db::{QuotaSetting, Role};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -37,6 +36,8 @@ pub fn routes() -> Router<AppState> {
         .route("/admin/users/{id}/disable", post(disable))
         .route("/admin/users/{id}/enable", post(enable))
         .route("/admin/users/{id}/delete", post(delete))
+        .route("/admin/quota", post(set_default_quota))
+        .route("/admin/users/{id}/quota", post(set_user_quota))
 }
 
 fn now() -> i64 {
@@ -64,6 +65,9 @@ struct UserView {
     disabled: bool,
     storage: String,
     is_self: bool,
+    /// "default", "custom" or "unlimited".
+    quota_mode: &'static str,
+    quota_gib: String,
 }
 
 #[derive(Template)]
@@ -75,6 +79,9 @@ struct AdminPage {
     new_invite: Option<String>,
     invites: Vec<InviteRow>,
     users: Vec<UserView>,
+    default_gib: String,
+    default_unlimited: bool,
+    default_text: String,
 }
 
 fn role_name(r: Role) -> &'static str {
@@ -90,37 +97,35 @@ fn notice_text(key: &str) -> Option<&'static str> {
         "disabled" => "Account disabled and logged out.",
         "enabled" => "Account enabled.",
         "deleted" => "Account and all its data deleted.",
+        "quota" => "Storage quota saved.",
         _ => return None,
     })
 }
 
-/// Sum of the file sizes under `dir`, recursively. Symlinks are not followed.
-fn dir_size(dir: &FsPath) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
-    };
-    entries
-        .flatten()
-        .map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => dir_size(&e.path()),
-            Ok(m) if m.is_file() => m.len(),
-            _ => 0,
-        })
-        .sum()
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Largest quota the forms accept: 1 PiB.
+const MAX_QUOTA_BYTES: u64 = 1 << 50;
+
+/// Parses a GiB figure (one decimal is typical) into bytes. Empty, negative,
+/// non-numeric and over-1-PiB values are rejected.
+fn parse_gib(s: &str) -> Option<u64> {
+    let gib: f64 = s.trim().parse().ok()?;
+    if !gib.is_finite() || gib < 0.0 {
+        return None;
+    }
+    let bytes = gib * GIB;
+    if bytes > MAX_QUOTA_BYTES as f64 {
+        return None;
+    }
+    Some(bytes as u64)
 }
 
-fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
-    if n < 1024 {
-        return format!("{n} B");
-    }
-    let mut v = n as f64 / 1024.0;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    format!("{v:.1} {}", UNITS[i])
+fn gib_text(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / GIB)
+}
+
+fn limit_text(limit: Option<u64>) -> String {
+    limit.map_or_else(|| "unlimited".to_owned(), human_bytes)
 }
 
 async fn admin_response(
@@ -131,11 +136,7 @@ async fn admin_response(
     error: Option<String>,
     new_invite: Option<String>,
 ) -> Response {
-    let (sys, data_dir, me) = (
-        state.sys.clone(),
-        state.cfg.data_dir.clone(),
-        session.user_id.clone(),
-    );
+    let (sys, me) = (state.sys.clone(), session.user_id.clone());
     let loaded = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let invites: Vec<InviteRow> = sys
             .list_open_invites(now())?
@@ -146,27 +147,34 @@ async fn admin_response(
                 expires: format_date(exp),
             })
             .collect();
-        let users: Vec<UserView> = sys
-            .list_users()?
-            .into_iter()
-            .map(|u| UserView {
-                storage: human_bytes(dir_size(&user_dir(&data_dir, &u.id))),
-                is_self: u.id == me,
-                created: format_date(u.created_at),
-                role: role_name(u.role),
-                disabled: u.disabled,
-                username: u.username,
-                id: u.id,
-            })
-            .collect();
-        Ok((invites, users))
+        Ok((invites, sys.list_users()?, sys.default_quota()?))
     })
     .await;
-    let (invites, users) = match loaded {
+    let (invites, rows, default_quota) = match loaded {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
     };
+    let mut users = Vec::new();
+    for u in rows {
+        let (mode, limit) = match u.quota {
+            QuotaSetting::Default => ("default", default_quota),
+            QuotaSetting::Custom(b) => ("custom", Some(b)),
+            QuotaSetting::Unlimited => ("unlimited", None),
+        };
+        let used = state.quotas.usage(&u.id).await;
+        users.push(UserView {
+            storage: format!("{} / {}", human_bytes(used), limit_text(limit)),
+            quota_mode: mode,
+            quota_gib: limit.map(gib_text).unwrap_or_default(),
+            is_self: u.id == me,
+            created: format_date(u.created_at),
+            role: role_name(u.role),
+            disabled: u.disabled,
+            username: u.username,
+            id: u.id,
+        });
+    }
     let mut resp = render(&AdminPage {
         page: Page::for_session(session),
         notice,
@@ -174,6 +182,9 @@ async fn admin_response(
         new_invite,
         invites,
         users,
+        default_gib: default_quota.map(gib_text).unwrap_or_default(),
+        default_unlimited: default_quota.is_none(),
+        default_text: limit_text(default_quota),
     });
     if resp.status() == StatusCode::OK {
         *resp.status_mut() = status;
@@ -342,12 +353,104 @@ async fn delete(
         Err(e) => return internal(e),
     }
     cut_off(&state, &row.id);
+    state.quotas.forget(&row.id);
     redirect(&headers, "/admin?notice=deleted")
+}
+
+#[derive(Deserialize)]
+struct DefaultQuotaForm {
+    gib: Option<String>,
+    unlimited: Option<String>,
+}
+
+const BAD_QUOTA: &str = "Enter a size in GiB between 0 and 1048576 (1 PiB).";
+
+async fn set_default_quota(
+    State(state): State<AppState>,
+    AdminUser(session): AdminUser,
+    headers: HeaderMap,
+    CsrfForm(form): CsrfForm<DefaultQuotaForm>,
+) -> Response {
+    let quota = if form.unlimited.is_some() {
+        None
+    } else {
+        match form.gib.as_deref().and_then(parse_gib) {
+            Some(b) => Some(b),
+            None => return failure(&state, &session, StatusCode::BAD_REQUEST, BAD_QUOTA).await,
+        }
+    };
+    let sys = state.sys.clone();
+    match tokio::task::spawn_blocking(move || sys.set_default_quota(quota)).await {
+        Ok(Ok(())) => redirect(&headers, "/admin?notice=quota"),
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct UserQuotaForm {
+    mode: String,
+    gib: Option<String>,
+}
+
+async fn set_user_quota(
+    State(state): State<AppState>,
+    AdminUser(session): AdminUser,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    CsrfForm(form): CsrfForm<UserQuotaForm>,
+) -> Response {
+    let setting = match form.mode.as_str() {
+        "default" => QuotaSetting::Default,
+        "unlimited" => QuotaSetting::Unlimited,
+        "custom" => match form.gib.as_deref().and_then(parse_gib) {
+            Some(b) => QuotaSetting::Custom(b),
+            None => return failure(&state, &session, StatusCode::BAD_REQUEST, BAD_QUOTA).await,
+        },
+        _ => {
+            return failure(
+                &state,
+                &session,
+                StatusCode::BAD_REQUEST,
+                "Unknown quota mode.",
+            )
+            .await;
+        }
+    };
+    let sys = state.sys.clone();
+    let uid = id.clone();
+    let res = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        if sys.user_by_id(&uid)?.is_none() {
+            return Ok(false);
+        }
+        sys.set_user_quota(&uid, setting)?;
+        Ok(true)
+    })
+    .await;
+    match res {
+        Ok(Ok(true)) => redirect(&headers, "/admin?notice=quota"),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => internal(e),
+        Err(e) => internal(e),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::human_bytes;
+    use super::{human_bytes, parse_gib};
+
+    #[test]
+    fn parses_gib() {
+        assert_eq!(parse_gib("1"), Some(1 << 30));
+        assert_eq!(parse_gib(" 0.5 "), Some(1 << 29));
+        assert_eq!(parse_gib("0"), Some(0));
+        assert_eq!(parse_gib("-1"), None);
+        assert_eq!(parse_gib("abc"), None);
+        assert_eq!(parse_gib("NaN"), None);
+        assert_eq!(parse_gib("inf"), None);
+        assert_eq!(parse_gib("1048576"), Some(1 << 50));
+        assert_eq!(parse_gib("1048576.1"), None);
+    }
 
     #[test]
     fn formats_sizes() {

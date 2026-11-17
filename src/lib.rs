@@ -8,6 +8,7 @@ pub mod extract;
 pub mod harden;
 pub mod keyring;
 pub mod mcp;
+pub mod quota;
 pub mod recover;
 pub mod system_db;
 pub mod tokens;

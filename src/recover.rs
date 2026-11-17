@@ -151,7 +151,12 @@ pub fn recover(
 
     let all = all_documents(&u)?;
     let plan = plan_entries(&all);
-    let docs = Documents::new(data_dir.to_path_buf(), 0, Arc::new(NoQueue));
+    let docs = Documents::new(
+        data_dir.to_path_buf(),
+        0,
+        Arc::new(NoQueue),
+        crate::quota::Quotas::unlimited(data_dir.to_path_buf()),
+    );
 
     create_private_dir(out)?;
     create_private_dir(&out.join("files"))?;

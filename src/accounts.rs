@@ -18,7 +18,7 @@ use crate::crypto::{
     password_kek, seal, secret_kek, unwrap_key, wrap_key,
 };
 use crate::keyring::{Keyring, Unlocked, index_db_path, user_dir};
-use crate::system_db::{InviteError, Role, SysError, SystemDb, UserRow};
+use crate::system_db::{InviteError, QuotaSetting, Role, SysError, SystemDb, UserRow};
 use crate::user_db::open_user_db;
 
 const INVITE_TTL_SECS: i64 = 7 * 86400;
@@ -280,6 +280,7 @@ impl Accounts {
             index_key_wrapped,
             totp_sealed: None,
             pending_recovery_sealed: Some(pending),
+            quota: QuotaSetting::Default,
         };
         match self.sys.insert_user(&row) {
             Ok(()) => Ok((row, recovery)),

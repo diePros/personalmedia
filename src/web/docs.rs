@@ -111,6 +111,14 @@ fn internal(e: impl std::fmt::Display) -> Response {
 fn doc_error(e: DocError) -> Response {
     match e {
         DocError::TooLarge => json_error(StatusCode::PAYLOAD_TOO_LARGE, "upload too large"),
+        e @ DocError::QuotaExceeded { .. } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            axum::Json(serde_json::json!({
+                "status": "quota_exceeded",
+                "message": e.to_string(),
+            })),
+        )
+            .into_response(),
         DocError::NotFound => StatusCode::NOT_FOUND.into_response(),
         DocError::InvalidDate => json_error(StatusCode::UNPROCESSABLE_ENTITY, "invalid date"),
         DocError::InvalidInput(msg) => json_error(StatusCode::UNPROCESSABLE_ENTITY, msg),

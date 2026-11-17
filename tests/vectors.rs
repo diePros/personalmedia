@@ -81,6 +81,7 @@ impl Env {
             data.clone(),
             100 << 20,
             Arc::new(queue.clone()),
+            personal_media::quota::Quotas::unlimited(data.clone()),
         ));
         let mut rx = Some(rx);
         if let Some((models, hook)) = models {

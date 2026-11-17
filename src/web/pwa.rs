@@ -376,6 +376,7 @@ enum Saved {
         existing_title: String,
     },
     Failed,
+    QuotaFull(String),
 }
 
 struct ResultRow {
@@ -455,6 +456,7 @@ async fn save_share(
                 existing_id,
                 existing_title,
             },
+            Err(e @ DocError::QuotaExceeded { .. }) => Saved::QuotaFull(e.to_string()),
             Err(e) => {
                 if let DocError::Internal(e) = &e {
                     tracing::error!(error = %e, "saving a shared file failed");
@@ -483,6 +485,11 @@ async fn save_share(
                 name: file.filename.clone(),
                 link: Some(format!("/documents/{existing_id}")),
                 note: format!("Not saved: already in your vault as \"{existing_title}\""),
+            },
+            Saved::QuotaFull(msg) => ResultRow {
+                name: file.filename.clone(),
+                link: None,
+                note: format!("Not saved: {msg}"),
             },
             Saved::Failed => ResultRow {
                 name: file.filename.clone(),

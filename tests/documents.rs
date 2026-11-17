@@ -46,7 +46,12 @@ fn env(max: u64) -> Env {
         .signup(&token, "sebi", "correct horse battery", NOW)
         .unwrap();
     let rec = Arc::new(Recorder::default());
-    let docs = Documents::new(dir.path().to_path_buf(), max, rec.clone());
+    let docs = Documents::new(
+        dir.path().to_path_buf(),
+        max,
+        rec.clone(),
+        personal_media::quota::Quotas::unlimited(dir.path().to_path_buf()),
+    );
     Env { dir, u, rec, docs }
 }
 

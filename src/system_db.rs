@@ -53,6 +53,18 @@ impl Role {
     }
 }
 
+/// The default quota the v2 migration seeds: 10 GiB.
+pub const DEFAULT_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_QUOTA_KEY: &str = "default_quota_bytes";
+
+/// A user's storage quota: the admin default, their own number or no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaSetting {
+    Default,
+    Custom(u64),
+    Unlimited,
+}
+
 #[derive(Clone, Debug)]
 pub struct UserRow {
     pub id: String,
@@ -69,13 +81,18 @@ pub struct UserRow {
     /// The newest recovery key, sealed under the UMK, until the user confirms
     /// having saved it.
     pub pending_recovery_sealed: Option<Vec<u8>>,
+    pub quota: QuotaSetting,
 }
 
 pub struct SystemDb {
     conn: Mutex<Connection>,
+    /// Column list for user reads; a v1 database opened read-only has no
+    /// quota columns, so constants stand in for them.
+    cols: &'static str,
 }
 
-const SCHEMA_V1: &str = "
+#[doc(hidden)]
+pub const SCHEMA_V1: &str = "
 CREATE TABLE users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE,
@@ -107,9 +124,25 @@ CREATE TABLE tokens (
 CREATE INDEX tokens_user ON tokens(user_id);
 ";
 
-const USER_COLS: &str = "id, username, role, disabled, created_at, salt, argon2_m, argon2_t, \
+const MIGRATION_V2: &str = "
+CREATE TABLE system_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO system_settings (key, value) VALUES ('default_quota_bytes', '10737418240');
+ALTER TABLE users ADD COLUMN quota_mode TEXT NOT NULL DEFAULT 'default'
+    CHECK (quota_mode IN ('default','custom','unlimited'));
+ALTER TABLE users ADD COLUMN quota_bytes INTEGER;
+PRAGMA user_version = 2;
+";
+
+const USER_COLS_V1: &str = "id, username, role, disabled, created_at, salt, argon2_m, argon2_t, \
      argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed, \
      pending_recovery_sealed";
+const USER_COLS: &str = "id, username, role, disabled, created_at, salt, argon2_m, argon2_t, \
+     argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed, \
+     pending_recovery_sealed, quota_mode, quota_bytes";
+/// Same shape as [`USER_COLS`] for a database without the quota columns.
+const USER_COLS_NO_QUOTA: &str = "id, username, role, disabled, created_at, salt, argon2_m, \
+     argon2_t, argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed, \
+     pending_recovery_sealed, 'default', NULL";
 
 fn bad_col(i: usize, what: &str) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
@@ -141,6 +174,16 @@ fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<UserRow> {
         index_key_wrapped: r.get(11)?,
         totp_sealed: r.get(12)?,
         pending_recovery_sealed: r.get(13)?,
+        quota: {
+            let mode: String = r.get(14)?;
+            let bytes: Option<i64> = r.get(15)?;
+            match (mode.as_str(), bytes) {
+                ("default", _) => QuotaSetting::Default,
+                ("unlimited", _) => QuotaSetting::Unlimited,
+                ("custom", Some(b)) if b >= 0 => QuotaSetting::Custom(b as u64),
+                _ => return Err(bad_col(14, "invalid quota")),
+            }
+        },
     })
 }
 
@@ -157,8 +200,28 @@ impl SystemDb {
             tx.pragma_update(None, "user_version", 1)?;
             tx.commit()?;
         }
+        if version < 2 {
+            // Re-checked inside the write transaction so two openers cannot
+            // both apply the migration.
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let res = (|| -> anyhow::Result<()> {
+                let v: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+                if v < 2 {
+                    conn.execute_batch(MIGRATION_V2)?;
+                }
+                Ok(())
+            })();
+            match res {
+                Ok(()) => conn.execute_batch("COMMIT;")?,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return Err(e.context("migrating system db to v2"));
+                }
+            }
+        }
         Ok(SystemDb {
             conn: Mutex::new(conn),
+            cols: USER_COLS,
         })
     }
 
@@ -173,8 +236,14 @@ impl SystemDb {
             anyhow::ensure!(version >= 1, "not a system database");
             Ok(())
         })?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         Ok(SystemDb {
             conn: Mutex::new(conn),
+            cols: if version >= 2 {
+                USER_COLS
+            } else {
+                USER_COLS_NO_QUOTA
+            },
         })
     }
 
@@ -185,7 +254,7 @@ impl SystemDb {
 
     pub fn insert_user(&self, u: &UserRow) -> Result<(), SysError> {
         let res = self.lock().execute(
-            &format!("INSERT INTO users ({USER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
+            &format!("INSERT INTO users ({USER_COLS_V1}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
             params![
                 u.id,
                 u.username,
@@ -219,7 +288,7 @@ impl SystemDb {
         Ok(self
             .lock()
             .query_row(
-                &format!("SELECT {USER_COLS} FROM users WHERE {col} = ?1"),
+                &format!("SELECT {} FROM users WHERE {col} = ?1", self.cols),
                 [val],
                 row_to_user,
             )
@@ -237,7 +306,8 @@ impl SystemDb {
     pub fn list_users(&self) -> anyhow::Result<Vec<UserRow>> {
         let conn = self.lock();
         let mut st = conn.prepare(&format!(
-            "SELECT {USER_COLS} FROM users ORDER BY created_at, username"
+            "SELECT {} FROM users ORDER BY created_at, username",
+            self.cols
         ))?;
         let rows = st.query_map([], row_to_user)?.collect::<Result<_, _>>()?;
         Ok(rows)
@@ -300,6 +370,46 @@ impl SystemDb {
         self.lock().execute(
             "UPDATE users SET disabled=?2 WHERE id=?1",
             params![id, disabled as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The admin-set default quota; `None` is unlimited.
+    pub fn default_quota(&self) -> anyhow::Result<Option<u64>> {
+        let v: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT value FROM system_settings WHERE key = ?1",
+                [DEFAULT_QUOTA_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(match v.as_deref() {
+            None => Some(DEFAULT_QUOTA_BYTES),
+            Some("unlimited") => None,
+            Some(n) => Some(n.parse()?),
+        })
+    }
+
+    pub fn set_default_quota(&self, quota: Option<u64>) -> anyhow::Result<()> {
+        let value = quota.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
+        self.lock().execute(
+            "INSERT INTO system_settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![DEFAULT_QUOTA_KEY, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_user_quota(&self, id: &str, q: QuotaSetting) -> anyhow::Result<()> {
+        let (mode, bytes) = match q {
+            QuotaSetting::Default => ("default", None),
+            QuotaSetting::Custom(b) => ("custom", Some(i64::try_from(b)?)),
+            QuotaSetting::Unlimited => ("unlimited", None),
+        };
+        self.lock().execute(
+            "UPDATE users SET quota_mode=?2, quota_bytes=?3 WHERE id=?1",
+            params![id, mode, bytes],
         )?;
         Ok(())
     }
@@ -484,6 +594,7 @@ mod tests {
             index_key_wrapped: vec![6],
             totp_sealed: None,
             pending_recovery_sealed: None,
+            quota: QuotaSetting::Default,
         }
     }
 

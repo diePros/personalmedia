@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::crypto::stream::{DecryptReader, EncryptWriter};
 use crate::crypto::{Key32, aad, unwrap_key, wrap_key};
 use crate::keyring::{Unlocked, user_dir};
+use crate::quota::{QuotaError, Quotas, Reservation, UPLOAD_OVERHEAD};
 use crate::user_db::{
     Document, ListFilter, NewDocument, TextStatus, delete_document, find_by_sha256_visible,
     get_document, insert_document, set_text, update_document_meta,
@@ -54,6 +55,9 @@ pub enum StoreOutcome {
 pub enum DocError {
     #[error("upload too large")]
     TooLarge,
+    /// The user's storage quota is used up.
+    #[error("Storage quota reached ({} of {} used)", crate::quota::human_bytes(*used), crate::quota::human_bytes(*limit))]
+    QuotaExceeded { used: u64, limit: u64 },
     #[error("not found")]
     NotFound,
     #[error("invalid date")]
@@ -68,6 +72,15 @@ pub enum DocError {
 impl From<anyhow::Error> for DocError {
     fn from(e: anyhow::Error) -> Self {
         DocError::Internal(e)
+    }
+}
+
+impl From<QuotaError> for DocError {
+    fn from(e: QuotaError) -> Self {
+        DocError::QuotaExceeded {
+            used: e.used,
+            limit: e.limit,
+        }
     }
 }
 
@@ -192,16 +205,23 @@ pub struct Documents {
     data_dir: PathBuf,
     max_upload_bytes: u64,
     queue: Arc<dyn Enqueue>,
+    quotas: Arc<Quotas>,
 }
 
 type Chunk = Result<Bytes, anyhow::Error>;
 
 impl Documents {
-    pub fn new(data_dir: PathBuf, max_upload_bytes: u64, queue: Arc<dyn Enqueue>) -> Documents {
+    pub fn new(
+        data_dir: PathBuf,
+        max_upload_bytes: u64,
+        queue: Arc<dyn Enqueue>,
+        quotas: Arc<Quotas>,
+    ) -> Documents {
         Documents {
             data_dir,
             max_upload_bytes,
             queue,
+            quotas,
         }
     }
 
@@ -225,6 +245,8 @@ impl Documents {
         if let Some(d) = &meta.document_date {
             validate_date(d)?;
         }
+        // Reserve before anything touches the disk; the writer grows it per chunk.
+        let reservation = self.quotas.reserve(&u.user_id, UPLOAD_OVERHEAD).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let final_path = blob_path(&self.data_dir, &u.user_id, &id);
         let part_path = final_path.with_file_name(format!("{id}.part"));
@@ -236,26 +258,30 @@ impl Documents {
         let max = self.max_upload_bytes;
         let worker_dek = Key32::from_bytes(*dek.as_bytes());
         let worker_path = part_path.clone();
-        let worker = tokio::task::spawn_blocking(move || -> Result<([u8; 32], u64), DocError> {
-            let file = File::create(&worker_path)?;
-            let mut w =
-                EncryptWriter::new(io::BufWriter::new(file), &worker_dek, blob_aad.as_bytes())?;
-            let mut hasher = Sha256::new();
-            let mut size: u64 = 0;
-            while let Some(chunk) = rx.blocking_recv() {
-                let chunk = chunk.map_err(DocError::Internal)?;
-                size += chunk.len() as u64;
-                if size > max {
-                    return Err(DocError::TooLarge);
+        let worker = tokio::task::spawn_blocking(
+            move || -> Result<([u8; 32], u64, Reservation), DocError> {
+                let mut reservation = reservation;
+                let file = File::create(&worker_path)?;
+                let mut w =
+                    EncryptWriter::new(io::BufWriter::new(file), &worker_dek, blob_aad.as_bytes())?;
+                let mut hasher = Sha256::new();
+                let mut size: u64 = 0;
+                while let Some(chunk) = rx.blocking_recv() {
+                    let chunk = chunk.map_err(DocError::Internal)?;
+                    size += chunk.len() as u64;
+                    if size > max {
+                        return Err(DocError::TooLarge);
+                    }
+                    reservation.grow(chunk.len() as u64)?;
+                    hasher.update(&chunk);
+                    w.write_all(&chunk)?;
                 }
-                hasher.update(&chunk);
-                w.write_all(&chunk)?;
-            }
-            let mut bw = w.finish()?;
-            bw.flush()?;
-            bw.get_ref().sync_all()?;
-            Ok((hasher.finalize().into(), size))
-        });
+                let mut bw = w.finish()?;
+                bw.flush()?;
+                bw.get_ref().sync_all()?;
+                Ok((hasher.finalize().into(), size, reservation))
+            },
+        );
 
         while let Some(item) = body.next().await {
             let item = item.map_err(Into::into);
@@ -265,7 +291,7 @@ impl Documents {
             }
         }
         drop(tx);
-        let (sha, size) = worker
+        let (sha, size, reservation) = worker
             .await
             .map_err(|e| DocError::Internal(anyhow!("upload task failed: {e}")))??;
 
@@ -303,6 +329,7 @@ impl Documents {
 
         fs::rename(&part_path, &final_path)?;
         part_guard.disarm();
+        let stored_bytes = fs::metadata(&final_path).map_or(size, |m| m.len());
         let mut final_guard = FileGuard(Some(final_path));
         u.with_db(|c| {
             insert_document(c, &new)?;
@@ -313,6 +340,7 @@ impl Documents {
         })
         .map_err(DocError::Internal)?;
         final_guard.disarm();
+        reservation.commit(stored_bytes);
 
         if eligible {
             self.queue.enqueue(u.clone(), id.clone());
@@ -365,8 +393,10 @@ impl Documents {
         u.with_db(|c| get_document(c, id))
             .map_err(DocError::Internal)?
             .ok_or(DocError::NotFound)?;
-        match fs::remove_file(blob_path(&self.data_dir, &u.user_id, id)) {
-            Ok(()) => {}
+        let path = blob_path(&self.data_dir, &u.user_id, id);
+        let blob_len = fs::metadata(&path).map_or(0, |m| m.len());
+        match fs::remove_file(&path) {
+            Ok(()) => self.quotas.on_delete(&u.user_id, blob_len),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
