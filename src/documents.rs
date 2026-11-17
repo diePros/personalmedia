@@ -253,6 +253,10 @@ impl Documents {
     /// reservation grows chunk by chunk. The hint is an upper bound for
     /// reserving (the request length of a multipart upload is fine); the real
     /// size is what gets committed.
+    ///
+    /// Known limit: a duplicate is only recognised after the stream was
+    /// hashed, so a user at their limit who re-sends a file that is already
+    /// stored is told the quota is reached, not that it is a duplicate.
     #[allow(clippy::too_many_arguments)]
     pub async fn store_sized<S, E>(
         &self,

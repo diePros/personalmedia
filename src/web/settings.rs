@@ -295,7 +295,7 @@ async fn settings_response(
     let (u, accounts) = (session.unlocked.clone(), state.accounts.clone());
     let user_id = session.user_id.clone();
     let used = state.quotas.usage(&user_id).await;
-    let storage = match state.quotas.limit_for(&user_id) {
+    let storage = match state.quotas.limit_for_async(&user_id).await {
         Some(limit) => format!(
             "{} of {}",
             crate::quota::human_bytes(used),

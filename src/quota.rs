@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -57,9 +58,10 @@ pub fn human_bytes(n: u64) -> String {
     format!("{v:.1} {}", UNITS[i])
 }
 
-/// Sum of the file sizes under `dir`, recursively. Symlinks are not followed
-/// and unfinished uploads (`*.part`) are not counted: they are covered by
-/// their reservation.
+/// Sum of the file sizes under `dir`, recursively. Symlinks are not followed.
+/// Unfinished uploads (`*.part`) count: while an upload runs the walk is not
+/// used (its reservation is), and a leftover from a crash stays visible until
+/// the startup sweep ([`sweep_stale_parts`]) removes it.
 pub fn dir_size(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -68,22 +70,66 @@ pub fn dir_size(dir: &Path) -> u64 {
         .flatten()
         .map(|e| match e.metadata() {
             Ok(m) if m.is_dir() => dir_size(&e.path()),
-            Ok(m) if m.is_file() && e.path().extension().is_none_or(|x| x != "part") => m.len(),
+            Ok(m) if m.is_file() => m.len(),
             _ => 0,
         })
         .sum()
+}
+
+/// Size of the user's search index (`index.db` and its WAL/SHM files).
+fn index_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("index.db"))
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Removes the unfinished uploads (`users/*/blobs/*.part`) a crash left
+/// behind. Call at startup, before any upload can run; returns how many
+/// files were removed.
+pub fn sweep_stale_parts(data_dir: &Path) -> usize {
+    let Ok(users) = std::fs::read_dir(data_dir.join("users")) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for user in users.flatten() {
+        let Ok(blobs) = std::fs::read_dir(user.path().join("blobs")) else {
+            continue;
+        };
+        for f in blobs.flatten() {
+            let path = f.path();
+            if path.extension().is_some_and(|x| x == "part") && std::fs::remove_file(&path).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 struct Entry {
     committed: u64,
     reserved: u64,
     loaded: Instant,
+    /// What `committed` includes for the search index, so a commit can add
+    /// only its growth.
+    index_len: u64,
 }
 
 pub struct Quotas {
     sys: Option<Arc<SystemDb>>,
     data_dir: PathBuf,
     entries: Mutex<HashMap<String, Entry>>,
+    refresh: Duration,
+    /// Bumped by every delete and commit; a directory walk that started
+    /// before such a change may have seen the old state and is discarded.
+    changes: AtomicU64,
 }
 
 impl Quotas {
@@ -92,15 +138,25 @@ impl Quotas {
             sys: Some(sys),
             data_dir,
             entries: Mutex::default(),
+            refresh: REFRESH,
+            changes: AtomicU64::new(0),
         })
     }
 
     /// No limits at all (offline recovery, tests that do not care).
     pub fn unlimited(data_dir: PathBuf) -> Arc<Quotas> {
+        Self::unlimited_with_refresh(data_dir, REFRESH)
+    }
+
+    /// [`Quotas::unlimited`] with a custom re-walk interval (tests).
+    #[doc(hidden)]
+    pub fn unlimited_with_refresh(data_dir: PathBuf, refresh: Duration) -> Arc<Quotas> {
         Arc::new(Quotas {
             sys: None,
             data_dir,
             entries: Mutex::default(),
+            refresh,
+            changes: AtomicU64::new(0),
         })
     }
 
@@ -147,34 +203,55 @@ impl Quotas {
     fn is_fresh(&self, user_id: &str) -> bool {
         self.lock()
             .get(user_id)
-            .is_some_and(|e| e.reserved > 0 || e.loaded.elapsed() < REFRESH)
+            .is_some_and(|e| e.reserved > 0 || e.loaded.elapsed() < self.refresh)
     }
 
     async fn ensure_loaded(&self, user_id: &str) {
-        if self.is_fresh(user_id) {
-            return;
-        }
         let dir = user_dir(&self.data_dir, user_id);
-        let size = tokio::task::spawn_blocking(move || dir_size(&dir))
-            .await
-            .unwrap_or(0);
-        let mut map = self.lock();
-        match map.get_mut(user_id) {
-            Some(e) if e.reserved > 0 || e.loaded.elapsed() < REFRESH => {}
-            Some(e) => {
-                e.committed = size;
-                e.loaded = Instant::now();
+        self.load_with(user_id, move || dir_size(&dir)).await;
+    }
+
+    /// Refreshes the cached figure with `walk` when it is missing or stale.
+    /// A walk that raced a delete or a commit is thrown away and repeated
+    /// (a few times), so it cannot overwrite the newer state.
+    #[doc(hidden)]
+    pub async fn load_with<W>(&self, user_id: &str, walk: W)
+    where
+        W: Fn() -> u64 + Clone + Send + 'static,
+    {
+        const ATTEMPTS: usize = 3;
+        for attempt in 0..ATTEMPTS {
+            if self.is_fresh(user_id) {
+                return;
             }
-            None => {
-                map.insert(
-                    user_id.to_owned(),
-                    Entry {
-                        committed: size,
-                        reserved: 0,
-                        loaded: Instant::now(),
-                    },
-                );
+            let before = self.changes.load(Ordering::SeqCst);
+            let w = walk.clone();
+            let size = tokio::task::spawn_blocking(w).await.unwrap_or(0);
+            let index_len = index_size(&user_dir(&self.data_dir, user_id));
+            let mut map = self.lock();
+            if self.changes.load(Ordering::SeqCst) != before && attempt + 1 < ATTEMPTS {
+                continue;
             }
+            match map.get_mut(user_id) {
+                Some(e) if e.reserved > 0 || e.loaded.elapsed() < self.refresh => {}
+                Some(e) => {
+                    e.committed = size;
+                    e.index_len = index_len;
+                    e.loaded = Instant::now();
+                }
+                None => {
+                    map.insert(
+                        user_id.to_owned(),
+                        Entry {
+                            committed: size,
+                            reserved: 0,
+                            loaded: Instant::now(),
+                            index_len,
+                        },
+                    );
+                }
+            }
+            return;
         }
     }
 
@@ -197,7 +274,7 @@ impl Quotas {
         let mut r = Reservation {
             q: self.clone(),
             user_id: user_id.to_owned(),
-            limit: self.limit_for(user_id),
+            limit: self.limit_for_async(user_id).await,
             held: 0,
             done: false,
         };
@@ -220,6 +297,7 @@ impl Quotas {
 
     /// A document of `bytes` (its blob size on disk) was deleted.
     pub fn on_delete(&self, user_id: &str, bytes: u64) {
+        self.changes.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = self.lock().get_mut(user_id) {
             e.committed = e.committed.saturating_sub(bytes);
         }
@@ -258,6 +336,7 @@ impl Reservation {
             committed: 0,
             reserved: 0,
             loaded: Instant::now(),
+            index_len: 0,
         });
         if let Some(limit) = self.limit {
             let total = e.committed + e.reserved;
@@ -274,11 +353,16 @@ impl Reservation {
     }
 
     /// The upload succeeded: trade the reservation for the real size.
+    /// The search index grew (or shrank) meanwhile; that change is counted
+    /// too, so index growth does not wait for the next re-walk.
     pub fn commit(mut self, final_bytes: u64) {
         self.done = true;
+        let index_now = index_size(&user_dir(&self.q.data_dir, &self.user_id));
+        self.q.changes.fetch_add(1, Ordering::SeqCst);
         if let Some(e) = self.q.lock().get_mut(&self.user_id) {
             e.reserved = e.reserved.saturating_sub(self.held);
-            e.committed += final_bytes;
+            e.committed = (e.committed + final_bytes + index_now).saturating_sub(e.index_len);
+            e.index_len = index_now;
         }
     }
 }

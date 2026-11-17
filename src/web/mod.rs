@@ -118,6 +118,11 @@ impl AppState {
             quotas.clone(),
         ));
 
+        // No upload can be running yet, so every unfinished one is orphaned.
+        let swept = crate::quota::sweep_stale_parts(&data_dir);
+        if swept > 0 {
+            tracing::warn!(files = swept, "removed unfinished uploads left by a crash");
+        }
         let tmp = data_dir.join("tmp");
         wipe_tmp(&tmp)?;
         let extract_cfg =

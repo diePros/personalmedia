@@ -670,3 +670,129 @@ async fn admin_custom_quota_resubmit_is_a_no_op() {
         );
     }
 }
+
+fn quota_dir(files: &[(&str, usize)]) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let u = user_dir(dir.path(), "u1");
+    for (name, n) in files {
+        let p = u.join(name);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, vec![0u8; *n]).unwrap();
+    }
+    (dir, u)
+}
+
+#[tokio::test]
+async fn walk_racing_a_delete_is_discarded_and_repeated() {
+    use personal_media::quota::Quotas;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (dir, _) = quota_dir(&[]);
+    let q = Quotas::unlimited(dir.path().to_path_buf());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (q2, c2) = (q.clone(), calls.clone());
+    let rt = tokio::runtime::Handle::current();
+    // First walk: a delete lands while the walk runs and the walk still saw
+    // the deleted blob (1000). The retry sees the settled state (400).
+    q.load_with("u1", move || {
+        if c2.fetch_add(1, Ordering::SeqCst) == 0 {
+            let _g = rt.enter();
+            q2.on_delete("u1", 600);
+            1000
+        } else {
+            400
+        }
+    })
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(q.usage("u1").await, 400);
+}
+
+#[tokio::test]
+async fn commit_counts_index_growth() {
+    use personal_media::quota::Quotas;
+    let (dir, u) = quota_dir(&[("index.db", 1000), ("blobs/a", 500)]);
+    let q = Quotas::unlimited(dir.path().to_path_buf());
+    assert_eq!(q.usage("u1").await, 1500);
+    // The index grows by 700 bytes (OCR text, vectors) before the next upload.
+    std::fs::write(u.join("index.db"), vec![0u8; 1700]).unwrap();
+    let r = q.reserve("u1", 100).await.unwrap();
+    r.commit(60);
+    assert_eq!(q.usage("u1").await, 1500 + 60 + 700);
+}
+
+#[tokio::test]
+async fn startup_sweep_removes_stale_part_files_and_walk_counts_them() {
+    use personal_media::quota::{Quotas, sweep_stale_parts};
+    let (dir, u) = quota_dir(&[
+        ("blobs/done", 100),
+        ("blobs/crashed.part", 4000),
+        ("index.db", 50),
+    ]);
+    let q = Quotas::unlimited(dir.path().to_path_buf());
+    assert_eq!(q.usage("u1").await, 4150, "the leftover counts until swept");
+    assert_eq!(sweep_stale_parts(dir.path()), 1);
+    assert!(!u.join("blobs/crashed.part").exists());
+    assert!(u.join("blobs/done").exists());
+    let q = Quotas::unlimited(dir.path().to_path_buf());
+    assert_eq!(q.usage("u1").await, 150);
+}
+
+#[tokio::test]
+async fn dropped_reservation_is_released_and_users_are_independent() {
+    let t = TestApp::new();
+    let _a = t.session_for("alice");
+    let _b = t.session_for("bob");
+    let (a, b) = (uid(&t, "alice"), uid(&t, "bob"));
+    let (ua, ub) = (
+        t.state.quotas.usage(&a).await,
+        t.state.quotas.usage(&b).await,
+    );
+    t.state
+        .sys
+        .set_user_quota(&a, QuotaSetting::Custom(ua + 10_000))
+        .unwrap();
+    t.state
+        .sys
+        .set_user_quota(&b, QuotaSetting::Custom(ub + 10_000))
+        .unwrap();
+    let held = t.state.quotas.reserve(&a, 9_000).await.unwrap();
+    assert_eq!(t.state.quotas.usage(&a).await, ua + 9_000);
+    // Bob is unaffected by Alice's reservation.
+    assert!(t.state.quotas.reserve(&b, 9_000).await.is_ok());
+    assert!(t.state.quotas.reserve(&a, 2_000).await.is_err());
+    // Dropping without commit gives the bytes back.
+    drop(held);
+    assert_eq!(t.state.quotas.usage(&a).await, ua);
+    assert!(t.state.quotas.reserve(&a, 9_000).await.is_ok());
+}
+
+#[tokio::test]
+async fn forget_drops_the_cached_figure() {
+    use personal_media::quota::Quotas;
+    let (dir, u) = quota_dir(&[("blobs/a", 300)]);
+    let q = Quotas::unlimited(dir.path().to_path_buf());
+    assert_eq!(q.usage("u1").await, 300);
+    std::fs::write(u.join("blobs/a"), vec![0u8; 900]).unwrap();
+    assert_eq!(q.usage("u1").await, 300, "cached");
+    q.forget("u1");
+    assert_eq!(q.usage("u1").await, 900, "re-walked after forget");
+}
+
+#[tokio::test]
+async fn stale_entry_is_rewalked_after_the_refresh_interval() {
+    use personal_media::quota::Quotas;
+    use std::time::Duration;
+    let (dir, u) = quota_dir(&[("blobs/a", 300)]);
+    let q = Quotas::unlimited_with_refresh(dir.path().to_path_buf(), Duration::from_millis(50));
+    assert_eq!(q.usage("u1").await, 300);
+    std::fs::write(u.join("blobs/a"), vec![0u8; 900]).unwrap();
+    assert_eq!(q.usage("u1").await, 300, "still fresh");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(q.usage("u1").await, 900, "refreshed");
+    // Never while an upload is in flight.
+    let r = q.reserve("u1", 10).await.unwrap();
+    std::fs::write(u.join("blobs/a"), vec![0u8; 1200]).unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(q.usage("u1").await, 910);
+    drop(r);
+}
