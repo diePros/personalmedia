@@ -430,6 +430,7 @@ async fn save_share(
             title: title.clone(),
             tags: tags.clone(),
             document_date: None,
+            date_source: None,
         };
         // The bytes are handed over in chunks so no second full copy is made.
         let body = stream::iter(

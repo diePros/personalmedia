@@ -224,10 +224,7 @@ async fn resume_after_restart_unlocks_a_locked_user() {
         create_device(&t.state.sys, &u, "x", NOW).unwrap()
     };
     t.state.sessions.remove(&c.cookie);
-    assert!(
-        t.state.keyring.get(&user_id(&t)).is_none(),
-        "still unlocked"
-    );
+    wait_locked(&t.state.keyring, &user_id(&t)).await;
     let r = resume_device(&t.state, &token, NOW + 5).unwrap();
     assert_eq!(r.user.id, user_id(&t));
     let metas = r.unlocked.with_db(list_device_meta).unwrap();

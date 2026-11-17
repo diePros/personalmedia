@@ -66,6 +66,7 @@ impl Fx {
             title: Some(format!("title of {name}")),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             document_date: None,
+            date_source: None,
         };
         let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
             bytes.to_vec(),
@@ -622,4 +623,50 @@ async fn list_documents_needs_transcription_filter() {
         .call(&hw, "list_documents", json!({"needs_transcription": true}))
         .await;
     assert_eq!(v.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_update_date_sets_ai_source() {
+    use personal_media::user_db::DateSource;
+    let f = Fx::new();
+    let rw = f.token(Access::ReadWrite, Content::FullText, None);
+    let id = f
+        .doc("d.bin", "application/octet-stream", b"x", &[], Level::Full)
+        .await;
+    let state = |id: &str| {
+        let d = f.u.with_db(|c| get_document(c, id)).unwrap().unwrap();
+        (d.document_date, d.date_source)
+    };
+    assert_eq!(state(&id), (None, None));
+    let (err, _) = f
+        .call(
+            &rw,
+            "update_document",
+            json!({"id": id, "date": "2024-06-07"}),
+        )
+        .await;
+    assert!(!err);
+    assert_eq!(
+        state(&id),
+        (Some("2024-06-07".into()), Some(DateSource::Ai))
+    );
+    // A title-only update leaves the source alone.
+    let (err, _) = f
+        .call(&rw, "update_document", json!({"id": id, "title": "x"}))
+        .await;
+    assert!(!err);
+    assert_eq!(state(&id).1, Some(DateSource::Ai));
+    // upload_document with a date is AI-set too.
+    let (err, v) = f
+        .call(
+            &rw,
+            "upload_document",
+            json!({"filename": "u.dat", "content_base64": BASE64.encode(b"uu"), "date": "2023-01-02"}),
+        )
+        .await;
+    assert!(!err);
+    assert_eq!(
+        state(v["id"].as_str().unwrap()),
+        (Some("2023-01-02".into()), Some(DateSource::Ai))
+    );
 }

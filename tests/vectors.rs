@@ -113,6 +113,7 @@ impl Env {
             title: None,
             tags: vec![],
             document_date: None,
+            date_source: None,
         };
         let body =
             futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(text.to_owned()))]);
@@ -197,7 +198,7 @@ fn migration_v2_upgrades_v1_db_once() {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         let (title, status): (String, String) = conn
             .query_row(
                 "SELECT title, embed_status FROM documents WHERE id = 'd1'",
@@ -742,7 +743,7 @@ fn readonly_open_works_on_v1_and_v2_databases() {
             .unwrap();
     }
     let ro = open_user_db_readonly(&v2, &key).unwrap();
-    assert_eq!(user_version(&ro), 4);
+    assert_eq!(user_version(&ro), 5);
     let (n, st): (i64, String) = ro
         .query_row(
             "SELECT (SELECT count(*) FROM chunk_vectors), embed_status FROM documents",

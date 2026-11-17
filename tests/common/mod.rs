@@ -344,3 +344,17 @@ fn urlencode(s: &str) -> String {
     }
     out
 }
+
+/// Waits (up to 5 s) until `user_id` is no longer unlocked. A background task
+/// (the date backfill) may hold a strong reference for a few milliseconds after
+/// the last session is gone.
+#[allow(dead_code)]
+pub async fn wait_locked(keyring: &personal_media::keyring::Keyring, user_id: &str) {
+    for _ in 0..500 {
+        if keyring.get(user_id).is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("user is still unlocked");
+}

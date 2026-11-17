@@ -1,6 +1,7 @@
 pub mod accounts;
 pub mod config;
 pub mod crypto;
+pub mod dates;
 pub mod devices;
 pub mod documents;
 pub mod embed;

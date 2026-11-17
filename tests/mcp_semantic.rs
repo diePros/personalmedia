@@ -91,6 +91,7 @@ impl Fx {
             title: Some(format!("title of {name}")),
             tags: tags.iter().map(|s| s.to_string()).collect(),
             document_date: date.map(str::to_owned),
+            date_source: None,
         };
         let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
             format!("bytes of {name}"),
@@ -537,6 +538,7 @@ async fn slow_download_does_not_block_search_or_web() {
         title: None,
         tags: vec![],
         document_date: None,
+        date_source: None,
     };
     let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
         "Der Vertrag regelt die Kündigungsfrist.",

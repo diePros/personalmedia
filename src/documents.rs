@@ -17,7 +17,7 @@ use crate::keyring::{Unlocked, user_dir};
 use crate::quota::{QuotaError, Quotas, Reservation, UPLOAD_OVERHEAD, upload_reservation};
 use crate::user_db::{
     Document, ListFilter, NewDocument, TextStatus, delete_document, find_by_sha256_visible,
-    get_document, insert_document, set_text, update_document_meta,
+    get_document, insert_document_sourced, set_text, update_document_meta,
 };
 
 /// Queue for text extraction, implemented by the extraction workers.
@@ -31,6 +31,8 @@ pub struct UploadMeta {
     pub title: Option<String>,
     pub tags: Vec<String>,
     pub document_date: Option<String>,
+    /// Who set `document_date`; `None` means the user (the web forms).
+    pub date_source: Option<crate::user_db::DateSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -371,6 +373,7 @@ impl Documents {
             .title
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| default_title(&meta.filename));
+        let date_source = meta.date_source;
         let new = NewDocument {
             id: id.clone(),
             wrapped_dek: wrap_key(u.umk(), &dek, aad::dek(&u.user_id, &id).as_bytes()),
@@ -389,7 +392,7 @@ impl Documents {
         let stored_bytes = fs::metadata(&final_path).map_or(size, |m| m.len());
         let mut final_guard = FileGuard(Some(final_path));
         u.with_db(|c| {
-            insert_document(c, &new)?;
+            insert_document_sourced(c, &new, date_source)?;
             if !eligible {
                 set_text(c, &id, TextStatus::Unsupported, None, None, now)?;
             }

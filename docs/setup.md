@@ -292,18 +292,21 @@ PMS cannot read handwriting itself yet. Instead your own AI assistant (claude.ai
 2. Scan or upload the handwritten pages and tag them (for example `handwritten`). The document's own MCP setting must not be limited below `full`.
 3. Ask the assistant, for example in claude.ai:
 
-   > Find my documents that need transcription (list_documents with needs_transcription), read each page with get_page_image, and save a faithful transcription with set_transcription.
+   > Find my documents that need transcription (list_documents with needs_transcription), read each page with get_page_image, and save a faithful transcription with set_transcription. If the page shows a date, also set it with update_document.
 
 Tools involved:
 
 - `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute; this limit is kept in memory, so it resets when the server restarts.
 - `set_transcription { id, text, mode? }` stores the text (`replace`, the default, or `append`). It becomes the searchable text, is marked "transcribed by an AI assistant" on the document page and is indexed for semantic search again if that is enabled for the document.
 - `set_notes { id, notes }` sets the document's notes (see below).
+- `update_document { id, date }` sets the document date. A date set this way is marked "set by AI" on the document page.
 - `list_documents { needs_transcription: true }` lists only documents tagged `handwritten` that have no transcription yet. The documents page has the same **Needs transcription** filter. If the token has a tag allow-list, it must include `handwritten`, otherwise the filter returns nothing.
 
 **Privacy:** page images leave your server and go to the AI provider of the assistant you connected, but only for documents that your token or app may read in full and whose MCP setting is `full`. Documents set to `metadata` or `off` for MCP, and tokens without full text access, never get page images. Images are rendered on demand in memory-backed scratch space, never cached and deleted right after.
 
 **Notes:** every document has an optional **Notes** field (up to 2000 characters), editable on the document page and in the Scan save sheet. Notes count as metadata, like title and tags: they are searchable even for assistants that only get metadata, so keep secrets out of them. They are included in the ZIP export.
+
+**Document dates:** when a document has no date, PMS looks for one in its text (German and English formats; labels such as "Rechnungsdatum" or "Datum" and the top of the first page win, and it picks the earliest date when nothing stands out). The document page then shows **(found in text)** next to the date. A date you enter yourself is never replaced, and neither is one you clear. A date set by an assistant shows **(set by AI)**. Once, after the update that added this, PMS goes through existing documents without a date in the background after you sign in.
 
 ## 8. Backups
 

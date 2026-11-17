@@ -40,8 +40,8 @@ use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
 use crate::tokens::{AuthFail, Principal, authenticate, parse_bearer};
 use crate::user_db::{
-    Document, Level, effective_level, get_document, get_document_text, list_documents,
-    list_tags_visible, search, update_document_meta,
+    DateSource, Document, Level, effective_level, get_document, get_document_text, list_documents,
+    list_tags_visible, search, update_document_meta_sourced,
 };
 use crate::web::AppState;
 use crate::web::ratelimit::{client_ip, mcp_ip_key, too_many_requests};
@@ -420,7 +420,7 @@ fn tool_definitions(can_write: bool, full_text: bool) -> Value {
         },
         {
             "name": "set_transcription",
-            "description": "Stores a transcription of a document's handwriting as its searchable text (read_write + full_text tokens only). It replaces the extracted text unless mode is append.",
+            "description": "Stores a transcription of a document's handwriting as its searchable text (read_write + full_text tokens only). It replaces the extracted text unless mode is append. If the page shows a date, also set it with update_document.",
             "inputSchema": {"type": "object", "properties": {
                 "id": {"type": "string"},
                 "text": {"type": "string", "maxLength": 500000},
@@ -854,6 +854,7 @@ async fn upload_document(
         title: clean(a.title),
         tags,
         document_date: clean(a.date),
+        date_source: Some(DateSource::Ai),
     };
     let filter = p.filter();
     let size = bytes.len() as u64;
@@ -929,7 +930,16 @@ async fn update_document(p: &Principal, a: UpdateArgs) -> Result<Value, ToolErro
         {
             return Ok(Err(doc_err(e)));
         }
-        update_document_meta(c, &id, a.title.as_deref(), date, tags.as_deref(), now())?;
+        update_document_meta_sourced(
+            c,
+            &id,
+            a.title.as_deref(),
+            date,
+            tags.as_deref(),
+            None,
+            DateSource::Ai,
+            now(),
+        )?;
         Ok(Ok(()))
     })
     .await

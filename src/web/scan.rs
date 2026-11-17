@@ -275,6 +275,7 @@ async fn scan_upload(
         title: Some(title.unwrap_or(default_title)),
         tags,
         document_date: date,
+        date_source: None,
     };
     // Small copies out of the wiped buffer, made one at a time.
     let body = Box::pin(stream::unfold((pdf, 0usize), |(pdf, at)| async move {

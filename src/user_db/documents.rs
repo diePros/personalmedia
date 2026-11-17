@@ -68,6 +68,38 @@ impl TextSource {
     }
 }
 
+/// Where a document's date came from (`NULL` in the database = unknown/legacy,
+/// treated like `User` for overwrite purposes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DateSource {
+    /// Typed by the user (web edit or upload form).
+    User,
+    /// Found in the document text by the local date finder.
+    Detected,
+    /// Set by the user's AI assistant over MCP.
+    Ai,
+}
+
+impl DateSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DateSource::User => "user",
+            DateSource::Detected => "detected",
+            DateSource::Ai => "ai",
+        }
+    }
+
+    fn parse(s: &str) -> Option<DateSource> {
+        match s {
+            "user" => Some(DateSource::User),
+            "detected" => Some(DateSource::Detected),
+            "ai" => Some(DateSource::Ai),
+            _ => None,
+        }
+    }
+}
+
 /// Longest `notes` value, in characters.
 pub const NOTES_MAX_CHARS: usize = 2000;
 
@@ -102,6 +134,8 @@ pub struct Document {
     /// User-typed keywords; metadata (searchable at the metadata level).
     pub notes: String,
     pub text_source: TextSource,
+    /// Who set `document_date` (`None` = unknown, e.g. dated before v1.6.3).
+    pub date_source: Option<DateSource>,
     pub tags: Vec<String>,
 }
 
@@ -142,29 +176,36 @@ pub struct SearchHit {
 
 const DOC_COLS: &str = "d.id, d.wrapped_dek, d.original_filename, d.title, d.mime, d.size, \
      d.sha256, d.document_date, d.created_at, d.updated_at, d.text_status, d.page_count, \
-     d.notes, d.text_source";
+     d.notes, d.text_source, d.date_source";
+
+/// [`DOC_COLS`] for a v3/v4 index DB opened read-only (no `date_source`).
+const DOC_COLS_PRE_V5: &str = "d.id, d.wrapped_dek, d.original_filename, d.title, d.mime, d.size, \
+     d.sha256, d.document_date, d.created_at, d.updated_at, d.text_status, d.page_count, \
+     d.notes, d.text_source, NULL AS date_source";
 
 /// [`DOC_COLS`] for an index DB older than v3 (opened read-only for recovery
 /// and never migrated): the missing columns read as their defaults.
 const DOC_COLS_PRE_V3: &str = "d.id, d.wrapped_dek, d.original_filename, d.title, d.mime, d.size, \
      d.sha256, d.document_date, d.created_at, d.updated_at, d.text_status, d.page_count, \
-     '' AS notes, 'ocr' AS text_source";
+     '' AS notes, 'ocr' AS text_source, NULL AS date_source";
 
 /// The document column list that matches the schema version of `conn`.
 fn doc_cols(conn: &Connection) -> &'static str {
     match conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)) {
         Ok(v) if v < 3 => DOC_COLS_PRE_V3,
+        Ok(v) if v < 5 => DOC_COLS_PRE_V5,
         _ => DOC_COLS,
     }
 }
 
 /// Index of the first column after the document columns.
-const AFTER_DOC_COLS: usize = 14;
+const AFTER_DOC_COLS: usize = 15;
 
 fn map_doc(r: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
     let sha: Vec<u8> = r.get(6)?;
     let status: String = r.get(10)?;
     let source: String = r.get(13)?;
+    let date_source: Option<String> = r.get(14)?;
     let bad = |what: &str| {
         rusqlite::Error::FromSqlConversionFailure(
             0,
@@ -187,6 +228,9 @@ fn map_doc(r: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         page_count: r.get::<_, Option<i64>>(11)?.map(|p| p as u32),
         notes: r.get(12)?,
         text_source: TextSource::parse(&source).ok_or_else(|| bad("bad text_source"))?,
+        date_source: date_source
+            .map(|s| DateSource::parse(&s).ok_or_else(|| bad("bad date_source")))
+            .transpose()?,
         tags: Vec::new(),
     })
 }
@@ -284,12 +328,26 @@ fn set_doc_tags(conn: &Connection, id: &str, tags: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// [`insert_document_sourced`] with the default source: a given date is the
+/// user's.
 pub fn insert_document(conn: &Connection, d: &NewDocument) -> Result<()> {
+    insert_document_sourced(conn, d, None)
+}
+
+/// Insert a document; a given date is recorded with `source` (`None` = user)
+/// in the same statement.
+pub fn insert_document_sourced(
+    conn: &Connection,
+    d: &NewDocument,
+    source: Option<DateSource>,
+) -> Result<()> {
+    let source = source.unwrap_or(DateSource::User).as_str();
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "INSERT INTO documents(id, wrapped_dek, original_filename, title, mime, size, sha256,
-            document_date, created_at, updated_at, text_status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, 'pending')",
+            document_date, date_source, created_at, updated_at, text_status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                 CASE WHEN ?8 IS NULL THEN NULL ELSE ?10 END, ?9, ?9, 'pending')",
         params![
             d.id,
             d.wrapped_dek,
@@ -299,7 +357,8 @@ pub fn insert_document(conn: &Connection, d: &NewDocument) -> Result<()> {
             d.size as i64,
             d.sha256.as_slice(),
             d.document_date,
-            d.created_at
+            d.created_at,
+            source
         ],
     )?;
     set_doc_tags(&tx, &d.id, &d.tags)?;
@@ -525,7 +584,8 @@ pub fn update_document_meta(
     update_document_meta_notes(conn, id, title, document_date, tags, None, now)
 }
 
-/// [`update_document_meta`] plus the notes, all in one transaction.
+/// [`update_document_meta`] plus the notes, all in one transaction. A date
+/// change (including clearing) is recorded as the user's.
 pub fn update_document_meta_notes(
     conn: &Connection,
     id: &str,
@@ -533,6 +593,35 @@ pub fn update_document_meta_notes(
     document_date: Option<Option<&str>>,
     tags: Option<&[String]>,
     notes: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    update_document_meta_sourced(
+        conn,
+        id,
+        title,
+        document_date,
+        tags,
+        notes,
+        DateSource::User,
+        now,
+    )
+}
+
+/// [`update_document_meta_notes`] where a date change is recorded with
+/// `source`, but only when the date actually differs from the stored one: an
+/// edit that leaves the date alone (a rename, or the form posting the same or
+/// an empty date) keeps its source, so it neither blocks detection nor turns a
+/// detected date into the user's. A real clear records `source` with a NULL
+/// date, so detection never refills a date somebody removed.
+#[allow(clippy::too_many_arguments)]
+pub fn update_document_meta_sourced(
+    conn: &Connection,
+    id: &str,
+    title: Option<&str>,
+    document_date: Option<Option<&str>>,
+    tags: Option<&[String]>,
+    notes: Option<&str>,
+    source: DateSource,
     now: i64,
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
@@ -550,8 +639,9 @@ pub fn update_document_meta_notes(
     }
     if let Some(date) = document_date {
         tx.execute(
-            "UPDATE documents SET document_date = ?2 WHERE id = ?1",
-            params![id, date],
+            "UPDATE documents SET document_date = ?2, date_source = ?3
+             WHERE id = ?1 AND document_date IS NOT ?2",
+            params![id, date, source.as_str()],
         )?;
     }
     if let Some(tags) = tags {
@@ -564,6 +654,128 @@ pub fn update_document_meta_notes(
     reindex(&tx, id)?;
     tx.commit()?;
     Ok(())
+}
+
+/// The ISO date the finder picks from `text`, if any. Pure: call it before
+/// taking the database lock.
+pub fn detect_date_iso(text: &str, today: time::Date) -> Option<String> {
+    let date = crate::dates::detect_date(text, today)?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    ))
+}
+
+/// Write a detected date. Only when the document has no date and nobody set
+/// or cleared one (`date_source` is NULL or `detected`); the check and the
+/// write are one statement, so a user's or AI's date set meanwhile is never
+/// overwritten. Returns whether it was set. The date is metadata: the search
+/// index needs no rebuild.
+pub fn set_detected_date(conn: &Connection, id: &str, iso: &str, now: i64) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE documents SET document_date = ?2, date_source = 'detected', updated_at = ?3
+         WHERE id = ?1 AND document_date IS NULL
+           AND (date_source IS NULL OR date_source = 'detected')",
+        params![id, iso, now],
+    )?;
+    Ok(n > 0)
+}
+
+/// Convenience wrapper: [`detect_date_iso`] then [`set_detected_date`] on one
+/// connection. Production paths (extraction, backfill) do not use it, since
+/// they detect with the database lock released; tests do.
+pub fn apply_detected_date(
+    conn: &Connection,
+    id: &str,
+    text: &str,
+    today: time::Date,
+    now: i64,
+) -> Result<bool> {
+    match detect_date_iso(text, today) {
+        Some(iso) => set_detected_date(conn, id, &iso, now),
+        None => Ok(false),
+    }
+}
+
+/// Settings key and value that mark the one-time backfill as done.
+const BACKFILL_KEY: &str = "date_backfill";
+const BACKFILL_VALUE: &str = "v1";
+
+/// Read one batch of the one-time backfill: up to `limit` dateless documents
+/// with OCR text and `id > after`, in id order (transcriptions are left to the
+/// AI, as in the live pipeline). Returns the `(id, text)` rows and the id to
+/// continue after, or `None` when this was the last batch (or the backfill
+/// already ran). Only reads: detect with the lock released, then
+/// [`backfill_write_batch`].
+#[allow(clippy::type_complexity)]
+pub fn backfill_read_batch(
+    conn: &Connection,
+    after: &str,
+    limit: usize,
+) -> Result<(Vec<(String, String)>, Option<String>)> {
+    if super::get_setting(conn, BACKFILL_KEY)?.as_deref() == Some(BACKFILL_VALUE) {
+        return Ok((Vec::new(), None));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT d.id, t.content FROM documents d
+         JOIN document_text t ON t.document_id = d.id
+         WHERE d.id > ?1 AND d.document_date IS NULL
+           AND (d.date_source IS NULL OR d.date_source = 'detected')
+           AND d.text_source != 'transcription'
+         ORDER BY d.id LIMIT ?2",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map(params![after, limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let next = (rows.len() >= limit)
+        .then(|| rows.last().map(|(id, _)| id.clone()))
+        .flatten();
+    Ok((rows, next))
+}
+
+/// Write the detected `(id, iso date)` pairs of a batch; returns how many
+/// were set.
+pub fn backfill_write_batch(
+    conn: &Connection,
+    dates: &[(String, String)],
+    now: i64,
+) -> Result<usize> {
+    let mut set = 0;
+    for (id, iso) in dates {
+        if set_detected_date(conn, id, iso, now)? {
+            set += 1;
+        }
+    }
+    Ok(set)
+}
+
+/// Mark the backfill as done (`date_backfill = v1`).
+pub fn backfill_mark_done(conn: &Connection) -> Result<()> {
+    super::set_setting(conn, BACKFILL_KEY, BACKFILL_VALUE)
+}
+
+/// The one-time backfill in one go: dates every dateless document that has
+/// text, then marks the index done. Returns how many were dated; zero (and
+/// nothing touched) when it already ran.
+pub fn backfill_detected_dates(conn: &Connection, today: time::Date, now: i64) -> Result<usize> {
+    let (mut total, mut after) = (0, String::new());
+    loop {
+        let (rows, next) = backfill_read_batch(conn, &after, 100)?;
+        let dates: Vec<(String, String)> = rows
+            .iter()
+            .filter_map(|(id, text)| Some((id.clone(), detect_date_iso(text, today)?)))
+            .collect();
+        total += backfill_write_batch(conn, &dates, now)?;
+        match next {
+            Some(id) => after = id,
+            None => {
+                backfill_mark_done(conn)?;
+                return Ok(total);
+            }
+        }
+    }
 }
 
 pub fn delete_document(conn: &Connection, id: &str) -> Result<()> {

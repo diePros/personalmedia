@@ -153,6 +153,7 @@ impl Env {
             title: None,
             tags: vec![],
             document_date: None,
+            date_source: None,
         };
         let body = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(bytes))]);
         match self
@@ -390,6 +391,18 @@ fn scratch_never_holds_more_than_one_page_png() {
     );
     assert!(max_seen.load(std::sync::atomic::Ordering::SeqCst) <= 1);
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn ocr_pages_are_separated_by_form_feed() {
+    if !have_tesseract() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let pdf = scanned3(work.path());
+    let tmp = tempfile::tempdir().unwrap();
+    let r = extract_text(&pdf, "application/pdf", &cfg(tmp.path())).unwrap();
+    assert_eq!(r.text.matches('\u{c}').count(), 2, "{:?}", r.text);
 }
 
 #[test]

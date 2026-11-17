@@ -52,6 +52,7 @@ async fn setup(dir: &Path) -> String {
             title: None,
             tags: vec!["t".into()],
             document_date: None,
+            date_source: None,
         };
         let out = docs
             .store(&u, meta, body, OnDuplicate::Keep, None, NOW + i as i64)
