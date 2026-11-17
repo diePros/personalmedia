@@ -94,6 +94,9 @@ pub mod aad {
     pub fn umk_token(token_id: &str) -> String {
         format!("pm/v1/umk/token/{token_id}")
     }
+    pub fn umk_device(token_id: &str) -> String {
+        format!("pm/v1/umk/device/{token_id}")
+    }
     pub fn index_key(user_id: &str) -> String {
         format!("pm/v1/indexkey/{user_id}")
     }
@@ -185,6 +188,7 @@ mod tests {
         assert_eq!(aad::dek("u", "d"), "pm/v1/dek/u/d");
         assert_eq!(aad::blob("u", "d"), "pm/v1/blob/u/d");
         assert_eq!(aad::umk_token("t"), "pm/v1/umk/token/t");
+        assert_eq!(aad::umk_device("t"), "pm/v1/umk/device/t");
         assert_eq!(aad::index_key("u"), "pm/v1/indexkey/u");
         assert_eq!(aad::totp("u"), "pm/v1/totp/u");
         assert_eq!(aad::umk_recovery("u"), "pm/v1/umk/recovery/u");

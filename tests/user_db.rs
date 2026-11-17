@@ -690,7 +690,7 @@ fn index_migration_v3_rebuilds_fts_once() {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3, "from v{from}");
+        assert_eq!(v, 4, "from v{from}");
 
         // Old content, title and tag are still searchable.
         for (q, id) in [
@@ -771,7 +771,7 @@ fn readonly_open_reads_v1_v2_and_v3_without_migrating() {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, v, "recover must not migrate");
+        assert_eq!(ver, if v == 3 { 4 } else { v }, "recover must not migrate");
     }
 }
 
@@ -902,4 +902,59 @@ fn needs_transcription_filter() {
     assert_eq!(list_documents(&conn, &web()).unwrap().len(), 4);
     let hits = search(&conn, "x", &f).unwrap();
     assert_eq!(ids(&hits), ["a1"]);
+}
+
+// ---------------------------------------------------------------------------
+// v4: remembered devices
+// ---------------------------------------------------------------------------
+
+#[test]
+fn index_migration_v3_to_v4_keeps_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.db");
+    {
+        // A real v3 database: v1 + v2 + v3 migrations, with data.
+        let conn = raw_conn(&path);
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        conn.execute_batch(MIGRATION_V2).unwrap();
+        conn.execute_batch(MIGRATION_V3).unwrap();
+        conn.execute(
+            "INSERT INTO documents(id, wrapped_dek, original_filename, title, mime, size, sha256,
+                created_at, updated_at, text_status)
+             VALUES ('a1', x'010203', 'a1.pdf', 'Rechnung', 'application/pdf', 1, x'00', 100, 100, 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO token_meta(id, name, scope_json, created_at) VALUES ('t1','bot','{}',5)",
+            [],
+        )
+        .unwrap();
+    }
+    let conn = open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
+    let v: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 4);
+    conn.execute(
+        "INSERT INTO device_meta(id, label, created_at) VALUES ('d1','Mac · Safari',9)",
+        [],
+    )
+    .unwrap();
+    let title: String = conn
+        .query_row("SELECT title FROM documents WHERE id='a1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(title, "Rechnung");
+    let name: String = conn
+        .query_row("SELECT name FROM token_meta WHERE id='t1'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(name, "bot");
+    drop(conn);
+    // Reopening does not migrate again.
+    open_user_db(&path, &Key32::from_bytes([7; 32])).unwrap();
 }

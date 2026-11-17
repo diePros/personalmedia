@@ -667,6 +667,49 @@ impl SystemDb {
         Ok(())
     }
 
+    /// Inserts a remembered-device row (`kind='device'`, expiring).
+    pub fn insert_device_token(
+        &self,
+        token_id: &str,
+        user_id: &str,
+        umk_wrapped: &[u8],
+        expires_at: i64,
+    ) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO tokens (token_id, user_id, umk_wrapped, kind, expires_at) \
+             VALUES (?1,?2,?3,'device',?4)",
+            params![token_id, user_id, umk_wrapped, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Sets a token row's expiry (the sliding expiry of a device token).
+    pub fn set_token_expiry(&self, token_id: &str, expires_at: i64) -> anyhow::Result<()> {
+        self.lock().execute(
+            "UPDATE tokens SET expires_at=?2 WHERE token_id=?1",
+            params![token_id, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes every device row of a user; returns their ids.
+    pub fn delete_device_tokens(&self, user_id: &str) -> anyhow::Result<Vec<String>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let ids: Vec<String> = {
+            let mut st =
+                tx.prepare("SELECT token_id FROM tokens WHERE user_id=?1 AND kind='device'")?;
+            st.query_map([user_id], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        tx.execute(
+            "DELETE FROM tokens WHERE user_id=?1 AND kind='device'",
+            [user_id],
+        )?;
+        tx.commit()?;
+        Ok(ids)
+    }
+
     /// Deletes every token row whose expiry has passed (static tokens have
     /// none); returns how many went. Grant metadata left without rows is
     /// pruned on unlock.

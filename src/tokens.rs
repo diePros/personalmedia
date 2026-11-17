@@ -174,7 +174,7 @@ impl AuthFail {
 }
 
 /// Splits `{prefix}{id: 32 hex}_{secret: 64 hex}` into `(id, secret)`.
-fn split_token<'a>(token: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn split_token<'a>(token: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
     let rest = token.strip_prefix(prefix)?;
     let (id, secret) = rest.split_once('_')?;
     let hex_ok = |s: &str, n: usize| {
