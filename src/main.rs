@@ -36,6 +36,13 @@ enum Command {
         #[arg(long)]
         data: Option<PathBuf>,
     },
+    /// Check the embedding model on this machine (downloads it if missing): ranking
+    /// quality, speed and peak memory. Exit 0 if at least 3 of 4 queries pass.
+    EmbedSelftest {
+        /// Data directory (default: `PM_DATA_DIR`, else `/data`)
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
     /// Offline recovery export for a user
     Recover {
         #[arg(long)]
@@ -181,6 +188,53 @@ async fn main() -> anyhow::Result<()> {
                 &mut |line| println!("{line}"),
             )?;
             println!("Model ready: {}", dir.display());
+        }
+        Command::EmbedSelftest { data } => {
+            let data = match data {
+                Some(d) => d,
+                None => Config::from_env()?.data_dir,
+            };
+            let models = data.join("models");
+            personal_media::embed::model::ensure_model_with_progress(
+                &models,
+                &personal_media::embed::MODEL,
+                &mut |line| println!("{line}"),
+            )?;
+            let engine =
+                personal_media::embed::Engine::new(models, std::time::Duration::from_secs(600));
+            let report = personal_media::embed::selftest::run(&engine)?;
+            let hits = report.queries.iter().filter(|q| q.ok()).count();
+            for q in &report.queries {
+                println!(
+                    "{} query {:?} ({}): expected passage {}, top {}",
+                    if q.ok() { "PASS" } else { "FAIL" },
+                    q.query,
+                    if q.cross_language {
+                        "cross-language"
+                    } else {
+                        "same language"
+                    },
+                    q.expected,
+                    q.top
+                );
+            }
+            println!(
+                "speed: {:.1} ms per passage (first {}-token chunk, mean of 10 runs)",
+                report.ms_per_passage, report.chunk_tokens_run
+            );
+            match report.peak_rss_mb {
+                Some(mb) => println!("peak RSS: {mb:.0} MB"),
+                None => println!("peak RSS: unavailable"),
+            }
+            let total = report.queries.len();
+            if report.passed() {
+                println!("embed-selftest OK: {hits} of {total} queries ranked correctly");
+            } else {
+                eprintln!(
+                    "embed-selftest FAILED: only {hits} of {total} queries ranked correctly; the quantized model may not suit this CPU"
+                );
+                std::process::exit(1);
+            }
         }
         Command::Recover {
             data,

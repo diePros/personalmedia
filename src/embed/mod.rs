@@ -7,6 +7,7 @@
 
 pub mod chunk;
 pub mod model;
+pub mod selftest;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
