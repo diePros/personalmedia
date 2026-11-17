@@ -54,6 +54,7 @@ pub fn routes() -> Router<AppState> {
         .route("/settings/totp/enable", post(totp_enable))
         .route("/settings/totp/disable", post(totp_disable))
         .route("/settings/tokens", post(create_token_route))
+        .route("/settings/ios", post(ios_setup_route))
         .route("/settings/tokens/{id}/revoke", post(revoke_token_route))
         .route("/settings/grants/{id}/revoke", post(revoke_grant_route))
         .route("/settings/export", post(export_zip))
@@ -169,6 +170,14 @@ struct SettingsPage {
     totp_setup: Option<SetupView>,
     semantic: SemanticStatus,
     storage: String,
+}
+
+#[derive(Template)]
+#[template(path = "ios_setup.html")]
+struct IosSetupPage {
+    page: Page,
+    shortcut_url: Option<String>,
+    setup_code: String,
 }
 
 #[derive(Template)]
@@ -863,27 +872,30 @@ fn field<'a>(pairs: &'a Pairs, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-async fn create_token_route(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    CurrentUser(session): CurrentUser,
-    CsrfForm(pairs): CsrfForm<Pairs>,
-) -> Response {
-    let bad = |msg: &'static str| failure(&state, &session, StatusCode::BAD_REQUEST, msg);
+/// Validates the token form fields, checks the password and mints the token.
+/// `Err` is a ready response. Shared by the generic token form and the
+/// iPhone setup. Returns the token name and the secret.
+async fn issue_token(
+    state: &AppState,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+    session: &Session,
+    pairs: Pairs,
+) -> Result<(String, String), Response> {
+    let bad = |msg: &'static str| failure(state, session, StatusCode::BAD_REQUEST, msg);
     let name = field(&pairs, "name").unwrap_or_default().trim().to_owned();
     if name.is_empty() || name.chars().count() > TOKEN_NAME_MAX_CHARS {
-        return bad("The token name is required and at most 100 characters").await;
+        return Err(bad("The token name is required and at most 100 characters").await);
     }
     let access = match field(&pairs, "access").unwrap_or("read") {
         "read" => Access::Read,
         "read_write" => Access::ReadWrite,
-        _ => return bad("Invalid access").await,
+        _ => return Err(bad("Invalid access").await),
     };
     let content = match field(&pairs, "content").unwrap_or("metadata_only") {
         "metadata_only" => Content::MetadataOnly,
         "full_text" => Content::FullText,
-        _ => return bad("Invalid content level").await,
+        _ => return Err(bad("Invalid content level").await),
     };
     let mut tag_ids: Vec<i64> = Vec::new();
     for (k, v) in &pairs {
@@ -891,7 +903,7 @@ async fn create_token_route(
             match v.parse::<i64>() {
                 Ok(id) if !tag_ids.contains(&id) => tag_ids.push(id),
                 Ok(_) => {}
-                Err(_) => return bad("Invalid tag").await,
+                Err(_) => return Err(bad("Invalid tag").await),
             }
         }
     }
@@ -905,31 +917,31 @@ async fn create_token_route(
     if !new_tag.is_empty() {
         let names = std::slice::from_ref(&new_tag);
         if let Err(DocError::InvalidInput(msg)) = validate_meta(None, None, names) {
-            return bad(msg).await;
+            return Err(bad(msg).await);
         }
     }
 
     // A token outlives logout and password changes, so minting one asks for
     // the password again.
-    let keys = limiter_keys(&state, peer, &headers, &session);
+    let keys = limiter_keys(state, peer, headers, session);
     let attempt = match state.limiter.begin(&keys) {
         Ok(a) => a,
-        Err(retry) => return too_many_requests(retry),
+        Err(retry) => return Err(too_many_requests(retry)),
     };
     let password = field(&pairs, "password").unwrap_or_default().to_owned();
-    match check_password(&state, &session, password).await {
-        Err(r) => return r,
+    match check_password(state, session, password).await {
+        Err(r) => return Err(r),
         Ok(Err(AccountError::InvalidCredentials)) => {
             attempt.failure();
-            return failure(
-                &state,
-                &session,
+            return Err(failure(
+                state,
+                session,
                 StatusCode::UNAUTHORIZED,
                 "The password is wrong",
             )
-            .await;
+            .await);
         }
-        Ok(Err(e)) => return internal(e),
+        Ok(Err(e)) => return Err(internal(e)),
         Ok(Ok(())) => attempt.success(),
     }
 
@@ -955,21 +967,74 @@ async fn create_token_route(
     })
     .await;
     match created {
-        Ok(Ok(Some(token))) => {
-            let mut resp = render(&TokenCreatedPage {
-                page: Page::for_session(&session),
-                name: display_name,
-                token,
-                public_url: state.cfg.public_url.trim_end_matches('/').to_owned(),
-            });
-            resp.headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            resp
-        }
-        Ok(Ok(None)) => bad("Invalid tag").await,
-        Ok(Err(e)) => internal(e),
+        Ok(Ok(Some(token))) => Ok((display_name, token)),
+        Ok(Ok(None)) => Err(bad("Invalid tag").await),
+        Ok(Err(e)) => Err(internal(e)),
+        Err(r) => Err(r),
+    }
+}
+
+fn no_store(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+async fn create_token_route(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    CurrentUser(session): CurrentUser,
+    CsrfForm(pairs): CsrfForm<Pairs>,
+) -> Response {
+    match issue_token(&state, peer, &headers, &session, pairs).await {
+        Ok((name, token)) => no_store(render(&TokenCreatedPage {
+            page: Page::for_session(&session),
+            name,
+            token,
+            public_url: state.cfg.public_url.trim_end_matches('/').to_owned(),
+        })),
         Err(r) => r,
     }
+}
+
+/// The token an iPhone Shortcut uses: it uploads only, sees metadata only
+/// and reaches only documents tagged `inbox`.
+async fn ios_setup_route(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    CurrentUser(session): CurrentUser,
+    CsrfForm(form): CsrfForm<IosSetupForm>,
+) -> Response {
+    let pairs: Pairs = vec![
+        ("name".into(), IOS_TOKEN_NAME.into()),
+        ("access".into(), "read_write".into()),
+        ("content".into(), "metadata_only".into()),
+        ("new_tag".into(), "inbox".into()),
+        ("password".into(), form.password),
+    ];
+    match issue_token(&state, peer, &headers, &session, pairs).await {
+        Ok((_, token)) => no_store(render(&IosSetupPage {
+            page: Page::for_session(&session),
+            shortcut_url: state.cfg.ios_shortcut_url.clone(),
+            setup_code: ios_setup_code(&state.cfg.public_url, &token),
+        })),
+        Err(r) => r,
+    }
+}
+
+const IOS_TOKEN_NAME: &str = "iPhone Shortcut";
+
+#[derive(Deserialize)]
+struct IosSetupForm {
+    #[serde(default)]
+    password: String,
+}
+
+/// `{PM_PUBLIC_URL}|{token}`, what the Shortcut's import question expects.
+fn ios_setup_code(public_url: &str, token: &str) -> String {
+    format!("{}|{token}", public_url.trim_end_matches('/'))
 }
 
 async fn revoke_token_route(

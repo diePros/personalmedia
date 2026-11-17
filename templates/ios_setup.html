@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}iPhone sharing · PMS{% endblock %}
+{% block content %}
+<h1>iPhone &amp; iPad sharing</h1>
+<p class="notice" role="status">The setup code is shown only once. Use it now.</p>
+<ol class="stack">
+<li>
+<p><strong>Get the Shortcut</strong></p>
+{% match shortcut_url -%}
+{% when Some with (url) -%}
+<p><a class="button" href="{{ url }}">Get the Shortcut</a></p>
+{% when None -%}
+<p>Ask the admin for the Shortcut link. The admin finds how to build it in <code>docs/ios-shortcut.md</code>.</p>
+{% endmatch -%}
+</li>
+<li>
+<p><strong>Your setup code</strong></p>
+<p>
+<label for="ios-setup-code">Setup code</label>
+<input type="text" id="ios-setup-code" class="recovery-key" value="{{ setup_code }}" readonly autocomplete="off" spellcheck="false">
+</p>
+<p><button type="button" data-copy-target="ios-setup-code">Copy</button> <span class="muted" id="ios-copy-status" role="status"></span></p>
+</li>
+<li>
+<p>When the Shortcut asks for the setup code, paste it.</p>
+</li>
+</ol>
+<p class="muted">This created a token named "iPhone Shortcut". It can only add documents tagged <code>inbox</code>. If you set this up before, you can revoke the previous iPhone tokens in the Tokens list in Settings.</p>
+<p><a href="/settings#tokens">Back to settings</a></p>
+{% endblock %}

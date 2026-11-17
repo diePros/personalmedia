@@ -36,6 +36,40 @@
     return fetch(url, opts);
   };
 
+  // ---- Copy buttons (`data-copy-target` names a readonly input) ----------
+  document.addEventListener("click", function (event) {
+    var btn = event.target.closest ? event.target.closest("[data-copy-target]") : null;
+    if (!btn) {
+      return;
+    }
+    var input = document.getElementById(btn.getAttribute("data-copy-target"));
+    if (!input) {
+      return;
+    }
+    var status = document.getElementById("ios-copy-status");
+    function say(text) {
+      if (status) {
+        status.textContent = text;
+      }
+    }
+    function fallback() {
+      input.focus();
+      input.select();
+      input.setSelectionRange(0, input.value.length);
+      say("Selected. Press and hold, then Copy.");
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(input.value).then(
+        function () {
+          say("Copied.");
+        },
+        fallback
+      );
+    } else {
+      fallback();
+    }
+  });
+
   // ---- Drag & drop / multi-file upload (documents list page) --------------
   //
   // One POST per file to /api/upload, one after the other. The server reads

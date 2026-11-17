@@ -120,6 +120,19 @@
 </form>
 </section>
 
+<section id="ios-sharing">
+<h2>iPhone &amp; iPad sharing</h2>
+<p class="muted">iOS cannot share to web apps directly. A Shortcut adds a "PMS" entry to the share sheet that saves photos, PDFs and files into your vault, tagged <code>inbox</code>. This creates a token named "iPhone Shortcut" that can only add documents and reach the <code>inbox</code> tag; revoke it below if the phone is lost.</p>
+<form method="post" action="/settings/ios" class="stack">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<div>
+<label for="ios-password">Your password</label>
+<input type="password" id="ios-password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit">Set up iPhone sharing</button>
+</form>
+</section>
+
 <section id="connected-apps">
 <h2>Connected apps</h2>
 <p class="muted">Apps you let in with OAuth, such as claude.ai or Hermes. Revoking disconnects the app at once; it has to ask for access again. Tokens you created yourself are listed above.</p>

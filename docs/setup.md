@@ -78,6 +78,7 @@ services:
       PM_PUBLIC_URL: https://<node>.<tailnet>.ts.net   # edit: your Funnel URL
       PM_TRUSTED_PROXY: 127.0.0.1
       PM_MAX_UPLOAD_MB: "100"
+      # PM_IOS_SHORTCUT_URL: https://www.icloud.com/shortcuts/<32 hex chars>   # optional: iCloud link of the PMS Shortcut
     volumes:
       - /DATA/AppData/personal-media:/data
     tmpfs:
@@ -229,7 +230,7 @@ Treat the token like a key: it can unlock your documents within its scope. If it
 ## 7b. Share to Personal Media from a phone
 
 - **Android (Chrome):** install the app (menu → *Install app*). Personal Media then appears in the share sheet for PDFs, images and text files. Shared files go to a review page where you can set a title and tags and press **Save**; nothing is stored before that. They wait in the server's memory only (never on disk), for 15 minutes at most, and a share is limited to `PM_MAX_UPLOAD_MB`. If your session has expired you log in first and land on the review page with the files still waiting.
-- **iPhone/iPad:** iOS has no share target for web apps. Use the Shortcut in [`docs/ios-shortcut.md`](ios-shortcut.md), which uploads through `/api/upload` with a restricted token.
+- **iPhone/iPad:** iOS has no share target for web apps. The owner builds one Shortcut from [`docs/ios-shortcut.md`](ios-shortcut.md) and sets `PM_IOS_SHORTCUT_URL` to its iCloud link (`https://www.icloud.com/shortcuts/<32 hex chars>`; anything else is ignored with a warning). Each user then presses **Set up iPhone sharing** in Settings, taps **Get the Shortcut** and pastes their setup code.
 
 **SameSite note.** The Android share is a cross-site `POST` navigation into the app. Whether Chrome sends the `SameSite=Strict` session cookie with it is not guaranteed, so the flow does not depend on it. If the share arrives **without a session**, the server stages the files anonymously (at most 25 MiB, one share per client address), sets a short-lived `__Host-pm_continue` cookie (`SameSite=Lax`) holding only the staging id, and sends you through login; after login you land on the review page. If you are already logged in and the browser opens `/login` with that cookie, you are forwarded straight to the review page. Only the browser that holds the continue cookie can claim an anonymous share, and its review page warns that the files were sent before you logged in. The session cookie `__Host-pm_session` stays `Strict`: a `Lax` cookie is not sent on a cross-site `POST` either, so relaxing it would not help the share, and it would only expose pages to cross-site navigations. Do not relax it. Having to log in on each share is the accepted cost.
 
