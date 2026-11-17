@@ -436,13 +436,22 @@ async fn expired_access_token_401_with_metadata_pointer() {
             "Bearer resource_metadata=\"https://test.example/.well-known/oauth-protected-resource\""
         )
     );
-    // The row was deleted lazily.
-    let n: i64 = sys_conn(&f)
-        .query_row("SELECT count(*) FROM tokens WHERE token_id=?1", [id], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(n, 0);
+    // The row stays until the sweeper deletes expired rows.
+    let count = |f: &Flow| -> i64 {
+        sys_conn(f)
+            .query_row("SELECT count(*) FROM tokens WHERE token_id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    assert_eq!(count(&f), 1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Only the expired access row goes; the live refresh row stays.
+    assert_eq!(f.t.state.sys.delete_expired_tokens(now).unwrap(), 1);
+    assert_eq!(count(&f), 0);
 
     // The client then refreshes and carries on.
     let (s, v) = f.refresh(&refresh).await;
@@ -469,6 +478,73 @@ async fn expired_access_token_401_with_metadata_pointer() {
         .unwrap();
     let (s, v) = f.refresh(&rid).await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn garbage_codes_do_not_lock_out_mcp_for_shared_ip() {
+    let f = Flow::new().await;
+    // Another client (another claude.ai user) with a working grant, same IP.
+    let (access, refresh) = f.tokens(&[]).await;
+    let attacker = register(&f.t, "Attacker", &[REDIRECT]).await;
+
+    // The attacker's garbage codes lock out the attacker's own client only.
+    let mut last = 0;
+    for _ in 0..15 {
+        last = f
+            .token(&[
+                ("grant_type", "authorization_code"),
+                ("code", "garbage"),
+                ("redirect_uri", REDIRECT),
+                ("client_id", &attacker),
+                ("code_verifier", VERIFIER),
+            ])
+            .await
+            .0;
+    }
+    assert_eq!(last, 429);
+
+    // Same IP: MCP and the other client's refresh still work.
+    assert_eq!(f.tools_list(&access).await.0, 200);
+    let (s, v) = f.refresh(&refresh).await;
+    assert_eq!(s, 200);
+    let access = v["access_token"].as_str().unwrap().to_owned();
+
+    // Unknown client ids are keyed by address, still apart from /mcp.
+    for _ in 0..15 {
+        f.token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "x"),
+            ("client_id", "pmc_unknown"),
+        ])
+        .await;
+    }
+    assert_eq!(f.tools_list(&access).await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_token_401_does_not_count_as_failure() {
+    let f = Flow::new().await;
+    let (access, _) = f.tokens(&[]).await;
+    let id = access
+        .strip_prefix("pma_")
+        .unwrap()
+        .split('_')
+        .next()
+        .unwrap();
+    sys_conn(&f)
+        .execute("UPDATE tokens SET expires_at = 1 WHERE token_id = ?1", [id])
+        .unwrap();
+    // Far more than the limit: an expired, correctly signed token never locks.
+    for _ in 0..25 {
+        assert_eq!(f.tools_list(&access).await.0, 401);
+    }
+    // A wrong secret does count.
+    let forged = format!("{}{}", &access[..access.len() - 64], "0".repeat(64));
+    let mut last = 0;
+    for _ in 0..15 {
+        last = f.tools_list(&forged).await.0;
+    }
+    assert_eq!(last, 429);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -978,7 +1054,7 @@ async fn token_endpoint_rejects_non_form_and_counts_failures() {
         (400, Some("unsupported_grant_type"))
     );
 
-    // Wrong credentials lock the address out like MCP token failures do.
+    // Wrong credentials lock the client out (not the address).
     let mut last = 0;
     for _ in 0..40 {
         last = f

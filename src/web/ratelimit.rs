@@ -63,6 +63,19 @@ pub fn mcp_ip_key(ip: IpAddr) -> String {
     format!("mcp-ip:{}", ip_part(ip))
 }
 
+/// `/oauth/token` failures of a registered client. Codes and refresh tokens
+/// carry 256 bits, so this guards nothing worth an IP lock; keying it by
+/// client keeps one party from locking out a shared egress IP (ruling AH).
+pub fn oauth_client_key(client_id: &str) -> String {
+    format!("oauth-client:{client_id}")
+}
+
+/// `/oauth/token` failures without a known client id. Separate from
+/// [`mcp_ip_key`] and [`ip_key`] so it shares state with neither `/mcp` nor logins.
+pub fn oauth_ip_key(ip: IpAddr) -> String {
+    format!("oauth-ip:{}", ip_part(ip))
+}
+
 /// The address rate limiting should attribute a request to.
 ///
 /// `X-Forwarded-For` is honoured only when the TCP peer is the trusted proxy;

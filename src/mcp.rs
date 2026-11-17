@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
-use crate::tokens::{Principal, authenticate, parse_bearer};
+use crate::tokens::{AuthFail, Principal, authenticate, parse_bearer};
 use crate::user_db::{
     Document, Level, effective_level, get_document, get_document_text, list_documents,
     list_tags_visible, search, update_document_meta,
@@ -91,11 +91,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Authenticates the bearer token of a request, rate limited per client IP
-/// (`mcp-ip:{ip}`). Only failures of a well-formed `pm_` token count (a
+/// (`mcp-ip:{ip}`). Only failures of a well-formed `pm_`/`pma_` token count (a
 /// missing or malformed header says nothing about guessing), nothing is
 /// reserved while a request is in flight, and a successful authentication
 /// clears the address's failures. Every failure is a `401` with an empty
-/// body; a locked IP gets `429`.
+/// body; a locked IP gets `429`. A correctly signed but expired token is a
+/// `401` that does not count (ruling AH).
 #[allow(clippy::result_large_err)] // the error is a ready `Response`
 pub async fn bearer_principal(
     state: &AppState,
@@ -115,6 +116,9 @@ pub async fn bearer_principal(
             state.limiter.clear(&keys);
             Ok(p)
         }
+        // A correctly signed but expired token is the normal end of an access
+        // token's hour, not a guess (ruling AH).
+        Ok(Err(AuthFail { expired: true })) => Err(unauthorized(state)),
         _ => {
             if well_formed {
                 state.limiter.record_failure(&keys);

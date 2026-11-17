@@ -660,6 +660,15 @@ impl SystemDb {
         Ok(())
     }
 
+    /// Deletes every token row whose expiry has passed (static tokens have
+    /// none); returns how many went. Grant metadata left without rows is
+    /// pruned on unlock.
+    pub fn delete_expired_tokens(&self, now: i64) -> anyhow::Result<usize> {
+        Ok(self
+            .lock()
+            .execute("DELETE FROM tokens WHERE expires_at < ?1", [now])?)
+    }
+
     /// Inserts an OAuth token row (`kind` `oauth_access` or `oauth_refresh`).
     pub fn insert_oauth_token(&self, t: &OauthTokenRow) -> anyhow::Result<()> {
         insert_oauth_token_row(&self.lock(), t)?;

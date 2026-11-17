@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use super::{CodeEntry, ct_eq, json_response, oauth_error};
 use crate::tokens::{ACCESS_TTL_SECS, RefreshError, refresh_grant, revoke_grant, revoke_presented};
 use crate::web::AppState;
-use crate::web::ratelimit::{client_ip, mcp_ip_key, too_many_requests};
+use crate::web::ratelimit::{client_ip, oauth_client_key, oauth_ip_key, too_many_requests};
 
 /// Token and revocation requests are tiny forms.
 pub const BODY_LIMIT: usize = 16 * 1024;
@@ -96,12 +96,47 @@ pub async fn token(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let ip = client_ip(peer, &headers, state.cfg.trusted_proxy);
-    let keys = [mcp_ip_key(ip)];
+    if !is_form(&headers) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Content-Type must be application/x-www-form-urlencoded",
+        );
+    }
+    let Ok(form) = serde_urlencoded::from_bytes::<TokenForm>(&body) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "The body is not a valid form",
+        );
+    };
+    let client_id = form.client_id.clone().filter(|c| !c.is_empty());
+    let known = match &client_id {
+        Some(id) => {
+            let sys = state.sys.clone();
+            let cid = id.clone();
+            match tokio::task::spawn_blocking(move || sys.oauth_client(&cid)).await {
+                Ok(Ok(c)) => c.is_some(),
+                _ => return server_error(),
+            }
+        }
+        None => false,
+    };
+    // Failures are keyed by the registered client, never by the `/mcp` IP key
+    // (ruling AH): anyone can make claude.ai's egress IP send garbage codes.
+    // Without a known client the only thing to key on is the address.
+    let keys = match (&client_id, known) {
+        (Some(id), true) => [oauth_client_key(id)],
+        _ => [oauth_ip_key(client_ip(
+            peer,
+            &headers,
+            state.cfg.trusted_proxy,
+        ))],
+    };
     if let Err(retry) = state.limiter.check(&keys) {
         return too_many_requests(retry);
     }
-    let resp = handle_token(&state, &headers, &body).await;
+    let resp = handle_token(&state, form, client_id, known).await;
     if resp.status() == StatusCode::OK {
         state.limiter.clear(&keys);
     } else if counts_as_failure(&resp) {
@@ -110,40 +145,25 @@ pub async fn token(
     resp
 }
 
-async fn handle_token(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Response {
-    if !is_form(headers) {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "Content-Type must be application/x-www-form-urlencoded",
-        );
-    }
-    let Ok(form) = serde_urlencoded::from_bytes::<TokenForm>(body) else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request",
-            "The body is not a valid form",
-        );
-    };
-    let Some(client_id) = form.client_id.clone().filter(|c| !c.is_empty()) else {
+async fn handle_token(
+    state: &AppState,
+    form: TokenForm,
+    client_id: Option<String>,
+    known: bool,
+) -> Response {
+    let Some(client_id) = client_id else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "client_id is required",
         );
     };
-    let sys = state.sys.clone();
-    let cid = client_id.clone();
-    match tokio::task::spawn_blocking(move || sys.oauth_client(&cid)).await {
-        Ok(Ok(Some(_))) => {}
-        Ok(Ok(None)) => {
-            return guess_failure(oauth_error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_client",
-                "Unknown client",
-            ));
-        }
-        _ => return server_error(),
+    if !known {
+        return guess_failure(oauth_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_client",
+            "Unknown client",
+        ));
     }
     match form.grant_type.as_deref() {
         Some("authorization_code") => code_grant(state, form, client_id).await,

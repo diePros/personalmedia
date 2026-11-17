@@ -251,6 +251,9 @@ fn spawn_sweeper(
                 if let Err(e) = sys.prune_oauth_clients(cutoff) {
                     tracing::error!(error = %e, "pruning unused oauth clients failed");
                 }
+                if let Err(e) = sys.delete_expired_tokens(unix_now()) {
+                    tracing::error!(error = %e, "sweeping expired tokens failed");
+                }
                 for (user_id, grant_id) in expired {
                     let u = keyring.get(&user_id);
                     if let Err(e) =

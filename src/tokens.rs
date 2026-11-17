@@ -157,9 +157,17 @@ impl Principal {
     }
 }
 
-/// Authentication failed. Carries no detail on purpose.
+/// Authentication failed. Carries no detail on purpose, except whether the
+/// failure was a correctly signed but expired token (the normal hourly
+/// lifecycle of an access token, which must not count as a guess).
 #[derive(Debug)]
-pub struct AuthFail;
+pub struct AuthFail {
+    pub expired: bool,
+}
+
+impl AuthFail {
+    const BAD: AuthFail = AuthFail { expired: false };
+}
 
 /// Splits `{prefix}{id: 32 hex}_{secret: 64 hex}` into `(id, secret)`.
 fn split_token<'a>(token: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
@@ -202,7 +210,7 @@ fn now_secs() -> i64 {
 /// The system rows (token and user) are read on every call, cache hit or not,
 /// so a revoked token, a disabled user or a deleted user fails at once.
 pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFail> {
-    let id = parse_bearer(bearer).ok_or(AuthFail)?;
+    let id = parse_bearer(bearer).ok_or(AuthFail::BAD)?;
     let is_access = bearer.starts_with(ACCESS_PREFIX);
     let hash: [u8; 32] = Sha256::digest(bearer.as_bytes()).into();
 
@@ -211,9 +219,9 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
         .token_full(id)
         .map_err(|e| {
             tracing::error!(error = %e, "token lookup failed");
-            AuthFail
+            AuthFail::BAD
         })?
-        .ok_or(AuthFail)?;
+        .ok_or(AuthFail::BAD)?;
     // The prefix must match the row's kind: a refresh token is never a bearer.
     let kind_ok = if is_access {
         row.kind == KIND_ACCESS
@@ -221,15 +229,16 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
         row.kind == KIND_STATIC
     };
     if !kind_ok {
-        return Err(AuthFail);
+        return Err(AuthFail::BAD);
     }
     if row.expires_at.is_some_and(|exp| exp <= now_secs()) {
-        // Lazy cleanup of an expired token.
+        // Verify the secret before reporting expiry: only a token whose secret
+        // is right is "expired" (not counted as a guess by the caller). The
+        // row stays for the sweeper, so a client retrying with it is not
+        // counted either.
         state.tokens.evict(id);
-        if let Err(e) = state.sys.delete_token(id) {
-            tracing::warn!(error = %e, "could not delete expired token row");
-        }
-        return Err(AuthFail);
+        let genuine = unwrap_with_secret(id, &bearer[bearer.len() - 64..], &row.wrapped).is_some();
+        return Err(AuthFail { expired: genuine });
     }
     let user_id = row.user_id.clone();
     // Static tokens keep their metadata under the token id, grants under the
@@ -240,11 +249,11 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
         .user_by_id(&user_id)
         .map_err(|e| {
             tracing::error!(error = %e, "user lookup failed");
-            AuthFail
+            AuthFail::BAD
         })?
-        .ok_or(AuthFail)?;
+        .ok_or(AuthFail::BAD)?;
     if user.disabled {
-        return Err(AuthFail);
+        return Err(AuthFail::BAD);
     }
 
     // Cache hit.
@@ -257,7 +266,7 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
             }
             Some(e) => {
                 if e.unlocked.user_id != user_id || !ct_eq(&e.token_hash, &hash) {
-                    return Err(AuthFail);
+                    return Err(AuthFail::BAD);
                 }
                 e.last_used = Instant::now();
                 let touch = e.last_touch.elapsed() >= TOUCH_EVERY;
@@ -281,21 +290,22 @@ pub fn authenticate(state: &AppState, bearer: &str) -> Result<Principal, AuthFai
     }
 
     // Miss: unwrap the UMK with the secret and unlock.
-    let umk = unwrap_with_secret(id, &bearer[bearer.len() - 64..], &row.wrapped).ok_or(AuthFail)?;
+    let umk =
+        unwrap_with_secret(id, &bearer[bearer.len() - 64..], &row.wrapped).ok_or(AuthFail::BAD)?;
     let unlocked = state
         .keyring
         .unlock(&user_id, umk, &user.index_key_wrapped)
         .map_err(|e| {
             tracing::error!(error = %e, "token unlock failed");
-            AuthFail
+            AuthFail::BAD
         })?;
     let meta = unlocked
         .with_db(|c| get_token_meta(c, &meta_id))
         .map_err(|e| {
             tracing::error!(error = %e, "token meta lookup failed");
-            AuthFail
+            AuthFail::BAD
         })?
-        .ok_or(AuthFail)?;
+        .ok_or(AuthFail::BAD)?;
     touch_meta(&unlocked, &meta_id);
     let now = Instant::now();
     state.tokens.lock().insert(
