@@ -5,8 +5,8 @@ use std::io::Read;
 use common::*;
 use personal_media::system_db::SYSTEM_DB_FILE;
 use personal_media::user_db::{
-    Access, Channel, Content, Level, TokenScope, get_access_defaults, list_token_meta,
-    set_document_access,
+    Access, Channel, Content, Level, TokenScope, get_access_defaults, get_token_meta,
+    list_token_meta, set_document_access,
 };
 
 const PDF: &[u8] = include_bytes!("fixtures/text.pdf");
@@ -1091,4 +1091,163 @@ async fn settings_shows_semantic_index_status() {
     assert!(detail.contains("Indexing failed"), "{detail}");
     let detail = body_string(t.get(&format!("/documents/{off}"), &c).await).await;
     assert!(detail.contains("Not indexed"), "{detail}");
+}
+
+fn make_grant(
+    t: &TestApp,
+    u: &personal_media::keyring::Unlocked,
+    name: &str,
+    scope: TokenScope,
+) -> (String, personal_media::tokens::IssuedPair) {
+    personal_media::tokens::create_grant(
+        &t.state.sys,
+        u,
+        scope,
+        personal_media::user_db::GrantInfo {
+            client_id: "cid".into(),
+            client_name: name.into(),
+            redirect_host: "claude.ai".into(),
+        },
+        1_700_000_000,
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connected_apps_listed_and_revocable() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let bob = t.session_for("bob");
+    let u = unlocked(&t, &c);
+
+    let page = body_string(t.get("/settings", &c).await).await;
+    assert!(page.contains("Connected apps"));
+    assert!(page.contains("No apps connected."));
+
+    let (gid, _pair) = make_grant(
+        &t,
+        &u,
+        "<b>Evil</b> App",
+        TokenScope {
+            access: Access::Read,
+            content: Content::MetadataOnly,
+            tags: None,
+        },
+    );
+    t.post_form(
+        "/settings/tokens",
+        &[("name", "static"), ("password", PASSWORD)],
+        &c,
+    )
+    .await;
+
+    let page = body_string(t.get("/settings", &c).await).await;
+    assert!(!page.contains("No apps connected."));
+    assert!(page.contains("&lt;b&gt;Evil&lt;/b&gt; App") || page.contains("&#60;b&#62;Evil"));
+    assert!(!page.contains("<b>Evil</b>"));
+    assert!(
+        page.contains("Read · Metadata only · All documents"),
+        "{page}"
+    );
+    assert!(page.contains("claude.ai"));
+    assert!(page.contains(&format!("/settings/grants/{gid}/revoke")));
+    // The static token is listed separately and has no grant revoke form.
+    assert!(page.contains("static"));
+
+    // Another user cannot revoke it.
+    let denied = t
+        .post_form(&format!("/settings/grants/{gid}/revoke"), &[], &bob)
+        .await;
+    assert_eq!(denied.status(), 404);
+    assert_eq!(t.state.sys.token_ids_for_grant(&gid).unwrap().len(), 2);
+
+    // A static token id is not a grant.
+    let static_id = u
+        .with_db(|conn| list_token_meta(conn).unwrap())
+        .into_iter()
+        .find(|m| m.grant.is_none())
+        .unwrap()
+        .id;
+    let wrong = t
+        .post_form(&format!("/settings/grants/{static_id}/revoke"), &[], &c)
+        .await;
+    assert_eq!(wrong.status(), 404);
+
+    let resp = t
+        .post_form(&format!("/settings/grants/{gid}/revoke"), &[], &c)
+        .await;
+    assert_eq!(resp.status(), 303);
+    assert!(t.state.sys.token_ids_for_grant(&gid).unwrap().is_empty());
+    assert!(
+        u.with_db(|conn| get_token_meta(conn, &gid).unwrap())
+            .is_none()
+    );
+    let page = body_string(t.get("/settings", &c).await).await;
+    assert!(page.contains("No apps connected."));
+    let again = t
+        .post_form(&format!("/settings/grants/{gid}/revoke"), &[], &c)
+        .await;
+    assert_eq!(again.status(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_never_shows_token_secrets() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let (gid, pair) = make_grant(
+        &t,
+        &u,
+        "Hermes",
+        TokenScope {
+            access: Access::ReadWrite,
+            content: Content::FullText,
+            tags: None,
+        },
+    );
+    let page = body_string(t.get("/settings", &c).await).await;
+    assert!(page.contains("Hermes"));
+    for secret in [pair.access.as_str(), pair.refresh.as_str()] {
+        assert!(!page.contains(secret));
+        // Not even the secret half or the token id.
+        let (id, sec) = secret.rsplit_once('_').unwrap();
+        assert!(!page.contains(sec));
+        assert!(!page.contains(id.rsplit('_').next().unwrap()));
+    }
+    assert!(!page.contains("pma_") && !page.contains("pmr_"));
+    assert!(page.contains(&gid));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn orphan_grant_meta_is_pruned_on_unlock() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let scope = || TokenScope {
+        access: Access::Read,
+        content: Content::MetadataOnly,
+        tags: None,
+    };
+    let (orphan, _p1) = make_grant(&t, &u, "Gone", scope());
+    let (live, _p2) = make_grant(&t, &u, "Live", scope());
+    // Revoked while the user was locked: only the system rows went away.
+    t.state.sys.delete_grant_tokens(&orphan).unwrap();
+    t.post_form(
+        "/settings/tokens",
+        &[("name", "st"), ("password", PASSWORD)],
+        &c,
+    )
+    .await;
+
+    personal_media::tokens::prune_orphan_grants(&t.state.sys, &u).unwrap();
+
+    let ids: Vec<String> = u
+        .with_db(|conn| list_token_meta(conn).unwrap())
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(!ids.contains(&orphan));
+    assert!(ids.contains(&live));
+    // The static token's meta is untouched.
+    assert_eq!(ids.len(), 2);
 }

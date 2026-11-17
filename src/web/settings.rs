@@ -31,7 +31,7 @@ use super::{AppState, Page, kdf_blocking, redirect, render};
 use crate::accounts::{AccountError, TotpSetup};
 use crate::documents::{DocError, validate_meta};
 use crate::export;
-use crate::tokens::{create_token, revoke_token};
+use crate::tokens::{create_token, revoke_grant, revoke_token};
 use crate::user_db::tag_ids as tag_ids_for;
 use crate::user_db::vectors::{SemanticStatus, semantic_status};
 use crate::user_db::{
@@ -55,6 +55,7 @@ pub fn routes() -> Router<AppState> {
         .route("/settings/totp/disable", post(totp_disable))
         .route("/settings/tokens", post(create_token_route))
         .route("/settings/tokens/{id}/revoke", post(revoke_token_route))
+        .route("/settings/grants/{id}/revoke", post(revoke_grant_route))
         .route("/settings/export", post(export_zip))
 }
 
@@ -133,6 +134,16 @@ struct TokenRow {
     last_used: String,
 }
 
+/// One connected OAuth app. Holds metadata only, never a token string.
+struct GrantRow {
+    id: String,
+    client_name: String,
+    summary: String,
+    redirect_host: String,
+    created: String,
+    last_used: String,
+}
+
 struct TagBox {
     id: i64,
     name: String,
@@ -152,6 +163,7 @@ struct SettingsPage {
     channels: Vec<ChannelRow>,
     hidden: Vec<HiddenRow>,
     tokens: Vec<TokenRow>,
+    grants: Vec<GrantRow>,
     tags: Vec<TagBox>,
     totp_enabled: bool,
     totp_setup: Option<SetupView>,
@@ -178,6 +190,7 @@ fn notice_text(key: &str) -> Option<&'static str> {
         "totp_on" => "Two-factor authentication is on.",
         "totp_off" => "Two-factor authentication is off.",
         "token_revoked" => "Token revoked.",
+        "grant_revoked" => "App disconnected. Its access and refresh tokens no longer work.",
         _ => return None,
     })
 }
@@ -278,6 +291,44 @@ fn token_row(t: &TokenMeta, tags: &[(i64, String)]) -> TokenRow {
     }
 }
 
+/// "Read · Metadata only · Tags: inbox" in plain words.
+fn grant_summary(scope: &TokenScope, tags: &[(i64, String)]) -> String {
+    let access = match scope.access {
+        Access::Read => "Read",
+        Access::ReadWrite => "Read and write",
+    };
+    let content = match scope.content {
+        Content::MetadataOnly => "Metadata only",
+        Content::FullText => "Full text",
+    };
+    let scope_tags = match &scope.tags {
+        None => "All documents".to_owned(),
+        Some(ids) => {
+            let names: Vec<&str> = tags
+                .iter()
+                .filter(|(id, _)| ids.contains(id))
+                .map(|(_, n)| n.as_str())
+                .collect();
+            format!("Tags: {}", names.join(", "))
+        }
+    };
+    format!("{access} · {content} · {scope_tags}")
+}
+
+fn grant_row(t: &TokenMeta, tags: &[(i64, String)]) -> Option<GrantRow> {
+    let g = t.grant.as_ref()?;
+    Some(GrantRow {
+        id: t.id.clone(),
+        client_name: g.client_name.clone(),
+        summary: grant_summary(&t.scope, tags),
+        redirect_host: g.redirect_host.clone(),
+        created: format_date(t.created_at),
+        last_used: t.last_used_at.map_or("never used".to_owned(), |ts| {
+            format!("last used {}", format_date(ts))
+        }),
+    })
+}
+
 #[derive(Default)]
 struct View {
     notice: Option<&'static str>,
@@ -304,30 +355,38 @@ async fn settings_response(
         None => format!("{} (unlimited)", crate::quota::human_bytes(used)),
     };
     let loaded = blocking(move || -> anyhow::Result<_> {
-        let (defaults, hidden, tokens, tags, semantic) = u.with_db(|c| -> anyhow::Result<_> {
-            let defaults = get_access_defaults(c)?;
-            let hidden = hidden_rows(c, &defaults)?;
-            let all_tags = list_tags(c)?;
-            let tokens: Vec<TokenRow> = list_token_meta(c)?
-                .iter()
-                .map(|t| token_row(t, &all_tags))
-                .collect();
-            // The token form offers tags attached to at least one document.
-            let tags = list_tags_visible(c, &ListFilter::default())?;
-            let semantic = semantic_status(c)?;
-            Ok((defaults, hidden, tokens, tags, semantic))
-        })?;
+        let (defaults, hidden, tokens, grants, tags, semantic) =
+            u.with_db(|c| -> anyhow::Result<_> {
+                let defaults = get_access_defaults(c)?;
+                let hidden = hidden_rows(c, &defaults)?;
+                let all_tags = list_tags(c)?;
+                let metas = list_token_meta(c)?;
+                let tokens: Vec<TokenRow> = metas
+                    .iter()
+                    .filter(|t| t.grant.is_none())
+                    .map(|t| token_row(t, &all_tags))
+                    .collect();
+                let grants: Vec<GrantRow> = metas
+                    .iter()
+                    .filter_map(|t| grant_row(t, &all_tags))
+                    .collect();
+                // The token form offers tags attached to at least one document.
+                let tags = list_tags_visible(c, &ListFilter::default())?;
+                let semantic = semantic_status(c)?;
+                Ok((defaults, hidden, tokens, grants, tags, semantic))
+            })?;
         Ok((
             defaults,
             hidden,
             tokens,
+            grants,
             tags,
             semantic,
             accounts.totp_enabled(&user_id),
         ))
     })
     .await;
-    let (defaults, hidden, tokens, tags, semantic, totp_enabled) = match loaded {
+    let (defaults, hidden, tokens, grants, tags, semantic, totp_enabled) = match loaded {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(r) => return r,
@@ -339,6 +398,7 @@ async fn settings_response(
         channels: channel_rows(&defaults),
         hidden,
         tokens,
+        grants,
         tags: tags
             .into_iter()
             .map(|(id, name)| TagBox { id, name })
@@ -923,6 +983,38 @@ async fn revoke_token_route(
     .await;
     match result {
         Ok(Ok(true)) => redirect(&headers, "/settings?notice=token_revoked"),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => internal(e),
+        Err(r) => r,
+    }
+}
+
+/// Disconnects an OAuth app: deletes all its token rows, the grant metadata
+/// and its cache entries. Only grants of the current user can be found, and a
+/// static token id is not a grant.
+async fn revoke_grant_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    CurrentUser(session): CurrentUser,
+    Path(id): Path<String>,
+    CsrfForm(_): CsrfForm<NoFields>,
+) -> Response {
+    let (u, sys, tokens) = (
+        session.unlocked.clone(),
+        state.sys.clone(),
+        state.tokens.clone(),
+    );
+    let result = blocking(move || -> anyhow::Result<bool> {
+        match u.with_db(|c| get_token_meta(c, &id))? {
+            Some(m) if m.grant.is_some() => {}
+            _ => return Ok(false),
+        }
+        revoke_grant(&sys, Some(&u), &id, &tokens)?;
+        Ok(true)
+    })
+    .await;
+    match result {
+        Ok(Ok(true)) => redirect(&headers, "/settings?notice=grant_revoked"),
         Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
         Ok(Err(e)) => internal(e),
         Err(r) => r,

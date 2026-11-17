@@ -55,11 +55,21 @@ host allow-list. There is no SSE stream: `GET /mcp` is 405.
 
 - Per-user encryption, OCR (German and English), full-text search, tags, sharing from phones.
 - Scoped MCP tokens with a per-channel access switchboard (web, MCP, semantic index).
+- OAuth for MCP (v1.4): claude.ai custom connectors and Hermes connect with authorization code +
+  PKCE and dynamic client registration; grants are listed and revocable under Settings →
+  Connected apps. Static `pm_` tokens still work. See [docs/setup.md](docs/setup.md) section 7d.
 - Semantic search (v1.2): an in-process multilingual embedding model (multilingual-e5-small, int8)
   downloaded on first use. Off by default; enable it in Settings. See
   [docs/setup.md](docs/setup.md) section 7c, including `fetch-model` and `embed-selftest`.
 
 ## Security notes
+
+- OAuth access and refresh tokens unlock the user key exactly like static tokens (the UMK is
+  wrapped under a key derived from the token secret). Refresh tokens are single-use and rotate; reuse
+  of a consumed refresh token revokes the grant. That detection is memory-only, so it is lost on a
+  restart (a replay after a restart is rejected but does not revoke). PMS makes no outbound
+  requests for OAuth: client metadata documents (CIMD) are not supported, only dynamic
+  registration.
 
 - Semantic vectors are encrypted like the text (SQLCipher index database) and are only created for
   documents whose `semantic_index` level is `full`. `semantic_search` is only available to

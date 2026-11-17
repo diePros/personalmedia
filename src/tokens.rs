@@ -516,6 +516,23 @@ pub fn revoke_grant(
     Ok(())
 }
 
+/// Removes grant metadata whose token rows no longer exist, e.g. a grant that
+/// was revoked (or whose code expired unused) while the user was locked and
+/// so could not be cleaned up then. Returns how many were removed. Static
+/// tokens are never touched. Grant rows are inserted before their metadata, so
+/// a grant being created right now is not an orphan.
+pub fn prune_orphan_grants(sys: &SystemDb, u: &Unlocked) -> anyhow::Result<usize> {
+    let metas = u.with_db(crate::user_db::list_token_meta)?;
+    let mut removed = 0;
+    for m in metas.iter().filter(|m| m.grant.is_some()) {
+        if sys.token_ids_for_grant(&m.id)?.is_empty() {
+            u.with_db(|c| delete_token_meta(c, &m.id))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 /// Why a refresh failed.
 #[derive(Debug)]
 pub enum RefreshError {

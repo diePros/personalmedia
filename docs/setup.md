@@ -257,6 +257,34 @@ Semantic search lets an assistant find documents by meaning (also across German 
 
   It works with the read-only root file system (the model lives in `/data/models`, which is writable) and downloads the model if it is missing. It embeds a few synthetic German/English passages, checks that 3 of 4 test queries (two cross-language) rank the right passage first, and prints ms per 300-token passage and peak RSS. Exit code 0 means OK; 1 means the quantized model may not suit this CPU.
 
+## 7d. Connect claude.ai or Hermes with OAuth (v1.4)
+
+OAuth lets an assistant connect without you copying a token. The app registers itself (dynamic client registration), you log in on the PMS consent page and choose the access, and the app gets short-lived access tokens (1 hour) plus a rotating refresh token (30 days). The static `pm_` tokens from section 7 keep working next to it.
+
+**claude.ai**
+
+1. In claude.ai: **Settings → Connectors → Add custom connector**.
+2. URL: `{PM_PUBLIC_URL}/mcp` (for example `https://<node>.<tailnet>.ts.net/mcp`). Leave the client ID and client secret empty; dynamic registration is used.
+3. Press **Connect**. Log in on the PMS consent page, read the callback host it shows, and choose the access (read or read and write, metadata or full text, optional tag allow-list, or a new restricted tag).
+
+**Hermes**
+
+```yaml
+mcp_servers:
+  pms:
+    url: "https://<node>.<tailnet>.ts.net/mcp"
+    auth: oauth
+```
+
+Then run `hermes mcp login pms`, or simply use the server once. The browser opens the PMS consent page; Hermes stores its tokens in `~/.hermes/mcp-tokens/`.
+
+**Notes**
+
+- Only `claude.ai` / `claude.com` callbacks and loopback callbacks (`http://127.0.0.1` or `localhost`, any port) are accepted by default. Set `PM_OAUTH_EXTRA_REDIRECT_HOSTS` (comma-separated hosts) to allow others.
+- claude.ai connects from Anthropic's servers through Funnel and they give up after about 10 seconds. If Funnel is slow the connection can fail; simply retry.
+- Revoke an app under **Settings → Connected apps**. It stops working at once.
+- Static `pm_` tokens still work and are managed under **Settings → Tokens**.
+
 ## 8. Backups
 
 `/DATA/AppData/personal-media` contains only encrypted user data plus account metadata (usernames, sizes, timestamps), so you can copy it off-site as-is, e.g. with restic or rclone. For a consistent snapshot, stop the container first or back up while it's idle.

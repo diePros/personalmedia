@@ -119,6 +119,28 @@
 </form>
 </section>
 
+<section id="connected-apps">
+<h2>Connected apps</h2>
+<p class="muted">Apps you let in with OAuth, such as claude.ai or Hermes. Revoking disconnects the app at once; it has to ask for access again. Tokens you created yourself are listed above.</p>
+{% if grants.is_empty() -%}
+<p class="muted">No apps connected.</p>
+{% else -%}
+<ul class="doc-list">
+{% for g in grants -%}
+<li class="doc-item">
+<span class="doc-title">{{ g.client_name }}</span>
+<span class="muted doc-meta">{{ g.summary }}</span>
+<span class="muted doc-meta">Redirects to {{ g.redirect_host }} · Created {{ g.created }} · {{ g.last_used }}</span>
+<form method="post" action="/settings/grants/{{ g.id }}/revoke">
+<input type="hidden" name="csrf" value="{{ page.csrf.as_deref().unwrap_or_default() }}">
+<button type="submit" class="danger">Revoke</button>
+</form>
+</li>
+{% endfor -%}
+</ul>
+{% endif -%}
+</section>
+
 <section id="two-factor">
 <h2>Two-factor authentication</h2>
 {% if totp_enabled -%}

@@ -93,6 +93,24 @@ const MCP_WRITE_PERMITS: usize = 2;
 /// Concurrent `POST /share` uploads (the route needs no session).
 pub const SHARE_PERMITS: usize = 2;
 
+/// Work done on every fresh unlock: drop OAuth grant metadata whose token
+/// rows are gone, then let the extraction queue pick up pending documents.
+struct UnlockHooks {
+    queue: ExtractQueue,
+    sys: Arc<SystemDb>,
+}
+
+impl crate::keyring::OnUnlock for UnlockHooks {
+    fn unlocked(&self, u: &Arc<crate::keyring::Unlocked>) {
+        match crate::tokens::prune_orphan_grants(&self.sys, u) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(removed = n, "removed orphaned grant metadata"),
+            Err(e) => tracing::warn!(error = %e, "could not prune orphaned grants"),
+        }
+        self.queue.unlocked(u);
+    }
+}
+
 impl AppState {
     /// Opens the data directory, wipes OCR scratch left by a previous run and
     /// starts the extraction workers and the sweeper. Must be called inside a
@@ -110,7 +128,13 @@ impl AppState {
         let sys = Arc::new(SystemDb::open(&data_dir.join(SYSTEM_DB_FILE))?);
         let (queue, rx) = ExtractQueue::channel();
         engine.start_idle_reaper();
-        let keyring = Arc::new(Keyring::new(data_dir.clone(), Arc::new(queue.clone())));
+        let keyring = Arc::new(Keyring::new(
+            data_dir.clone(),
+            Arc::new(UnlockHooks {
+                queue: queue.clone(),
+                sys: sys.clone(),
+            }),
+        ));
         let accounts = Arc::new(Accounts::new(&cfg, sys.clone(), keyring.clone()));
         let quotas = Quotas::new(sys.clone(), data_dir.clone());
         let docs = Arc::new(Documents::new(
