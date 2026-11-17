@@ -133,9 +133,6 @@ ALTER TABLE users ADD COLUMN quota_bytes INTEGER;
 PRAGMA user_version = 2;
 ";
 
-const USER_COLS_V1: &str = "id, username, role, disabled, created_at, salt, argon2_m, argon2_t, \
-     argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed, \
-     pending_recovery_sealed";
 const USER_COLS: &str = "id, username, role, disabled, created_at, salt, argon2_m, argon2_t, \
      argon2_p, umk_by_password, umk_by_recovery, index_key_wrapped, totp_sealed, \
      pending_recovery_sealed, quota_mode, quota_bytes";
@@ -252,9 +249,15 @@ impl SystemDb {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Inserts a user, quota setting included.
     pub fn insert_user(&self, u: &UserRow) -> Result<(), SysError> {
+        let (mode, bytes) = match u.quota {
+            QuotaSetting::Default => ("default", None),
+            QuotaSetting::Custom(b) => ("custom", Some(i64::try_from(b).unwrap_or(i64::MAX))),
+            QuotaSetting::Unlimited => ("unlimited", None),
+        };
         let res = self.lock().execute(
-            &format!("INSERT INTO users ({USER_COLS_V1}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"),
+            &format!("INSERT INTO users ({USER_COLS}) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)"),
             params![
                 u.id,
                 u.username,
@@ -270,6 +273,8 @@ impl SystemDb {
                 u.index_key_wrapped,
                 u.totp_sealed,
                 u.pending_recovery_sealed,
+                mode,
+                bytes,
             ],
         );
         match res {
@@ -596,6 +601,25 @@ mod tests {
             pending_recovery_sealed: None,
             quota: QuotaSetting::Default,
         }
+    }
+
+    #[test]
+    fn insert_user_persists_the_quota() {
+        let (_d, db) = db();
+        let mut u = user("u1", "alice");
+        u.quota = QuotaSetting::Custom(12_345);
+        db.insert_user(&u).unwrap();
+        assert_eq!(
+            db.user_by_id("u1").unwrap().unwrap().quota,
+            QuotaSetting::Custom(12_345)
+        );
+        let mut u = user("u2", "bob");
+        u.quota = QuotaSetting::Unlimited;
+        db.insert_user(&u).unwrap();
+        assert_eq!(
+            db.user_by_id("u2").unwrap().unwrap().quota,
+            QuotaSetting::Unlimited
+        );
     }
 
     #[test]
