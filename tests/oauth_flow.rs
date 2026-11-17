@@ -257,7 +257,9 @@ async fn full_flow_register_authorize_token_mcp_refresh() {
     // The old access token died with the rotation.
     assert_eq!(f.tools_list(&access).await.0, 401);
 
-    // The old refresh token fails and takes the grant with it.
+    // The old refresh token fails and, past the grace window, takes the grant
+    // with it.
+    f.t.state.oauth.set_refresh_grace(std::time::Duration::ZERO);
     let (s, v) = f.refresh(&refresh).await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
     assert_eq!(f.tools_list(&access2).await.0, 401);
@@ -357,7 +359,9 @@ async fn refresh_reuse_revokes_grant() {
     let refresh2 = v["refresh_token"].as_str().unwrap().to_owned();
     assert_eq!(f.tools_list(&access2).await.0, 200);
 
-    // Replaying the consumed token fails and revokes the whole grant.
+    // Replaying the consumed token after the grace window fails and revokes
+    // the whole grant.
+    f.t.state.oauth.set_refresh_grace(std::time::Duration::ZERO);
     let (s, v) = f.refresh(&refresh1).await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
     assert_eq!(f.tools_list(&access2).await.0, 401);
@@ -385,6 +389,23 @@ async fn refresh_reuse_revokes_grant() {
         .await;
     assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
     assert_eq!(f.refresh(&refresh).await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_retry_within_grace_does_not_revoke() {
+    let f = Flow::new().await;
+    let (_, refresh1) = f.tokens(&[]).await;
+    let (s, v) = f.refresh(&refresh1).await;
+    assert_eq!(s, 200);
+    let access2 = v["access_token"].as_str().unwrap().to_owned();
+    let refresh2 = v["refresh_token"].as_str().unwrap().to_owned();
+
+    // The response was lost and the client retries with the old token.
+    let (s, v) = f.refresh(&refresh1).await;
+    assert_eq!((s, v["error"].as_str()), (400, Some("invalid_grant")));
+    // The newest pair is untouched.
+    assert_eq!(f.tools_list(&access2).await.0, 200);
+    assert_eq!(f.refresh(&refresh2).await.0, 200);
 }
 
 #[tokio::test(flavor = "multi_thread")]

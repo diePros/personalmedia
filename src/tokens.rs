@@ -563,7 +563,8 @@ fn token_hash(token: &str) -> [u8; 32] {
 /// The old refresh and access rows are deleted and the new rows inserted in
 /// one system-DB transaction, so a crash cannot leave two live refresh
 /// tokens. The consumed id is remembered (memory only, see
-/// `OAuthState::consumed_refresh`); presenting it again revokes the grant.
+/// `OAuthState::consumed_refresh`); presenting it again revokes the grant unless that happens within
+/// `REFRESH_GRACE` of the rotation.
 pub fn refresh_grant(
     state: &AppState,
     refresh_token: &str,
@@ -576,8 +577,12 @@ pub fn refresh_grant(
 
     let Some(row) = state.sys.token_full(id)? else {
         // Gone: either never existed or already used. A replay of a consumed
-        // token (same full string) kills the whole grant.
-        if let Some((user_id, grant_id)) = state.oauth.consumed_refresh(id, &hash) {
+        // token (same full string) kills the whole grant, unless it comes
+        // within the grace window of the rotation (a retry after a lost
+        // response, or a parallel refresh): that only fails (ruling AF).
+        if let Some((user_id, grant_id, in_grace)) = state.oauth.consumed_refresh(id, &hash)
+            && !in_grace
+        {
             tracing::warn!(grant = %grant_id, "refresh token reuse; revoking grant");
             let unlocked = state.keyring.get(&user_id);
             revoke_grant(&state.sys, unlocked.as_deref(), &grant_id, &state.tokens)?;

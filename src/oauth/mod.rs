@@ -57,6 +57,10 @@ pub const REQUEST_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_REQUESTS: usize = 1000;
 /// Consumed refresh tokens remembered for reuse detection.
 const CONSUMED_REFRESH_CAP: usize = 4096;
+/// A consumed refresh token replayed within this long of its rotation is
+/// answered `invalid_grant` without revoking the grant (a lost response or a
+/// parallel refresh, ruling AF). Replays after it revoke the grant.
+pub const REFRESH_GRACE: Duration = Duration::from_secs(60);
 
 /// A validated `GET /oauth/authorize` request, held server-side while the user
 /// logs in and consents. The browser only carries its random id.
@@ -110,8 +114,8 @@ pub struct CodeEntry {
 #[derive(Default)]
 struct Consumed {
     order: VecDeque<String>,
-    /// token id -> (SHA-256 of the full token, user id, grant id)
-    map: HashMap<String, ([u8; 32], String, String)>,
+    /// token id -> (SHA-256 of the full token, user id, grant id, consumed at)
+    map: HashMap<String, ([u8; 32], String, String, Instant)>,
 }
 
 /// In-memory OAuth state shared through [`AppState`].
@@ -126,6 +130,7 @@ pub struct OAuthState {
     /// when the user revokes it in Settings.
     consumed: Mutex<Consumed>,
     code_ttl_ms: AtomicU64,
+    refresh_grace_ms: AtomicU64,
 }
 
 impl Default for OAuthState {
@@ -136,6 +141,7 @@ impl Default for OAuthState {
             codes: Mutex::default(),
             consumed: Mutex::default(),
             code_ttl_ms: AtomicU64::new(CODE_TTL.as_millis() as u64),
+            refresh_grace_ms: AtomicU64::new(REFRESH_GRACE.as_millis() as u64),
         }
     }
 }
@@ -153,6 +159,13 @@ impl OAuthState {
     pub fn set_code_ttl(&self, ttl: Duration) {
         self.code_ttl_ms
             .store(ttl.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Test hook: the refresh-reuse grace window.
+    #[doc(hidden)]
+    pub fn set_refresh_grace(&self, grace: Duration) {
+        self.refresh_grace_ms
+            .store(grace.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn code_ttl(&self) -> Duration {
@@ -231,21 +244,27 @@ impl OAuthState {
         c.order.push_back(token_id.to_owned());
         c.map.insert(
             token_id.to_owned(),
-            (token_hash, user_id.to_owned(), grant_id.to_owned()),
+            (
+                token_hash,
+                user_id.to_owned(),
+                grant_id.to_owned(),
+                Instant::now(),
+            ),
         );
     }
 
-    /// `(user id, grant id)` when `token_id` was consumed and `token_hash` is
-    /// the hash of the very token string that was consumed (so knowing an id
-    /// alone cannot revoke a grant).
+    /// When `token_id` was consumed and `token_hash` is the hash of the very
+    /// token string that was consumed (so knowing an id alone cannot revoke a
+    /// grant): `(user id, grant id, within the grace window)`.
     pub fn consumed_refresh(
         &self,
         token_id: &str,
         token_hash: &[u8; 32],
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, bool)> {
+        let grace = Duration::from_millis(self.refresh_grace_ms.load(Ordering::Relaxed));
         let c = self.consumed.lock().unwrap_or_else(|e| e.into_inner());
-        let (h, user, grant) = c.map.get(token_id)?;
-        ct_eq(h, token_hash).then(|| (user.clone(), grant.clone()))
+        let (h, user, grant, at) = c.map.get(token_id)?;
+        ct_eq(h, token_hash).then(|| (user.clone(), grant.clone(), at.elapsed() < grace))
     }
 
     /// Counts one registration attempt for `key`; `Err(retry_after)` when the
