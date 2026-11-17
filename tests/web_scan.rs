@@ -300,11 +300,14 @@ async fn scan_page_offers_recent_tags_and_inbox() {
 async fn standalone_shell_markup_present() {
     let t = TestApp::new();
     let c = t.session_for("alice");
-    for path in ["/documents", "/scan", "/settings"] {
+    for path in ["/documents", "/scan", "/search", "/settings"] {
         let html = body_string(t.get(path, &c).await).await;
         assert!(html.contains("class=\"tabbar\""), "{path}");
         for href in ["/documents", "/scan", "/search", "/settings"] {
-            assert!(html.contains(&format!("href=\"{href}\"")), "{path} {href}");
+            assert!(
+                html.contains(&format!("class=\"tab\" href=\"{href}\"")),
+                "{path} {href}"
+            );
         }
         assert!(html.contains("<svg"), "{path}");
         assert_eq!(html.matches("class=\"tab\"").count(), 4, "{path}");

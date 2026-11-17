@@ -404,6 +404,9 @@ fieldset.mode {
   gap: 1rem;
   align-items: center;
 }
+fieldset.mode[hidden] {
+  display: none;
+}
 fieldset.mode legend {
   float: left;
   padding: 0;

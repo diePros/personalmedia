@@ -964,7 +964,7 @@ async fn search_page(
                 || needs_transcription,
             show_sort: !q.is_empty(),
             newest: query.newest(),
-            meaning: !q.is_empty() && query.mode.as_deref() == Some("meaning"),
+            meaning: query.mode.as_deref() == Some("meaning"),
             q,
             tag,
             from,

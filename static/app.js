@@ -294,6 +294,21 @@
     }
   }
 
+  // Search page: the Best match / Newest switch only makes sense with a query.
+  function initSortSwitch() {
+    var box = document.getElementById("q");
+    var sw = document.getElementById("sort-switch");
+    if (!box || !sw) {
+      return;
+    }
+    function sync() {
+      sw.hidden = box.value.trim() === "";
+    }
+    box.addEventListener("input", sync);
+    box.addEventListener("search", sync);
+    sync();
+  }
+
   function initInstallHint() {
     var hint = document.getElementById("install-hint");
     if (!hint) {
@@ -359,9 +374,11 @@
     document.addEventListener("DOMContentLoaded", initUpload);
     document.addEventListener("DOMContentLoaded", initInstallHint);
     document.addEventListener("DOMContentLoaded", initTabbar);
+    document.addEventListener("DOMContentLoaded", initSortSwitch);
   } else {
     initUpload();
     initInstallHint();
     initTabbar();
+    initSortSwitch();
   }
 })();

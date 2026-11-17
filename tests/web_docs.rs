@@ -872,6 +872,28 @@ async fn needs_transcription_kept_in_pagination() {
         html.contains("href=\"/search?tag=handwritten&#38;page=2\""),
         "{html}"
     );
+    // "yes" is off, not on: a plain (non-handwritten) document still matches.
+    upload(
+        &t,
+        &c,
+        "p.bin",
+        "application/octet-stream",
+        b"plain tagged",
+        &[("tags", "plainone")],
+    )
+    .await;
+    let html = body_string(
+        t.get("/search?needs_transcription=yes&tag=plainone", &c)
+            .await,
+    )
+    .await;
+    assert_eq!(html.matches("doc-item").count(), 1, "{html}");
+    let html = body_string(
+        t.get("/search?needs_transcription=1&tag=plainone", &c)
+            .await,
+    )
+    .await;
+    assert_eq!(html.matches("doc-item").count(), 0, "{html}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -995,14 +1017,26 @@ async fn search_filters_without_query_list_newest_and_hide_sort() {
         html.find(&format!("/documents/{b}")).unwrap()
             < html.find(&format!("/documents/{a}")).unwrap()
     );
-    assert!(!html.contains("name=\"sort\""), "{html}");
+    // The switch is in the markup but hidden: nothing to rank without a query.
+    assert!(
+        html.contains("<fieldset class=\"mode\" id=\"sort-switch\" hidden>"),
+        "{html}"
+    );
     assert!(
         html.contains("<details class=\"filters-box\" open"),
         "{html}"
     );
-    // With a query the switch shows.
+    // With a query the switch is not hidden.
     let html = body_string(t.get("/search?q=aaa&tag=red", &c).await).await;
-    assert!(html.contains("name=\"sort\""), "{html}");
+    assert!(
+        html.contains("<fieldset class=\"mode\" id=\"sort-switch\">"),
+        "{html}"
+    );
+    // The Meaning radio survives an empty query.
+    let html = body_string(t.get("/search?mode=meaning", &c).await).await;
+    assert!(html.contains("value=\"meaning\" checked"), "{html}");
+    // app.js shows the switch as soon as a query is typed.
+    assert!(include_str!("../static/app.js").contains("sort-switch"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

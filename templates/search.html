@@ -13,13 +13,11 @@
 <div class="check"><label><input type="radio" name="mode" value="words"{% if !meaning %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Words</label></div>
 <div class="check"><label><input type="radio" name="mode" value="meaning"{% if meaning %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Meaning</label></div>
 </fieldset>
-{% if show_sort -%}
-<fieldset class="mode">
+<fieldset class="mode" id="sort-switch"{% if !show_sort %} hidden{% endif %}>
 <legend>Sort by</legend>
 <div class="check"><label><input type="radio" name="sort" value="best"{% if !newest %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Best match</label></div>
 <div class="check"><label><input type="radio" name="sort" value="newest"{% if newest %} checked{% endif %} hx-get="/search" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Newest</label></div>
 </fieldset>
-{% endif -%}
 <details class="filters-box"{% if filters_open %} open{% endif %}>
 <summary>Filters</summary>
 <div class="filters">
