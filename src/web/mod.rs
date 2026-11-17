@@ -93,11 +93,17 @@ impl AppState {
     /// starts the extraction workers and the sweeper. Must be called inside a
     /// tokio runtime.
     pub fn build(cfg: Config) -> anyhow::Result<AppState> {
+        let engine = Arc::new(Engine::new(cfg.models_dir.clone(), EMBED_IDLE));
+        AppState::build_with_engine(cfg, engine)
+    }
+
+    /// [`AppState::build`] with a ready-made embedding engine (tests use one
+    /// that talks to a fake model server).
+    pub fn build_with_engine(cfg: Config, engine: Arc<Engine>) -> anyhow::Result<AppState> {
         let data_dir = cfg.data_dir.clone();
         std::fs::create_dir_all(&data_dir)?;
         let sys = Arc::new(SystemDb::open(&data_dir.join(SYSTEM_DB_FILE))?);
         let (queue, rx) = ExtractQueue::channel();
-        let engine = Arc::new(Engine::new(cfg.models_dir.clone(), EMBED_IDLE));
         engine.start_idle_reaper();
         let keyring = Arc::new(Keyring::new(data_dir.clone(), Arc::new(queue.clone())));
         let accounts = Arc::new(Accounts::new(&cfg, sys.clone(), keyring.clone()));

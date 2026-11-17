@@ -10,6 +10,7 @@ pub mod model;
 pub mod selftest;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,8 @@ use ort::value::Tensor;
 use tokenizers::Tokenizer;
 
 pub use chunk::{CHUNK_OVERLAP, CHUNK_TOKENS, Chunk, Chunked, WINDOW_CHARS, chunk_text};
-pub use model::{MODEL, ModelSpec, ensure_model};
+use model::ensure_model_with;
+pub use model::{DownloadPolicy, MODEL, ModelFile, ModelSpec, ensure_model, verify_model};
 
 const BATCH: usize = 16;
 
@@ -42,9 +44,20 @@ struct State {
 }
 
 pub struct Engine {
+    spec: &'static ModelSpec,
+    policy: DownloadPolicy,
     models_dir: PathBuf,
     idle: Duration,
+    /// The inference lock: held while the session runs a batch, never while a
+    /// model file is downloaded or hashed.
     state: Mutex<State>,
+    /// Mirrors `state.loaded.is_some()` so availability checks never wait for
+    /// a running inference.
+    loaded_flag: AtomicBool,
+    /// Serialises model downloads inside the process.
+    download: Mutex<()>,
+    /// When and why the last download or load failed.
+    failure: Mutex<Option<(Instant, String)>>,
 }
 
 /// ONNX Runtime allows one environment per process. Telemetry stays off.
@@ -66,26 +79,43 @@ fn ort_err(e: impl std::fmt::Display) -> anyhow::Error {
 
 impl Engine {
     pub fn new(models_dir: PathBuf, idle: Duration) -> Engine {
+        Engine::with_spec(models_dir, idle, &MODEL, DownloadPolicy::default())
+    }
+
+    /// An engine for another file set or network policy. The inference
+    /// constants (prefixes, dimensions) still come from [`MODEL`]; this exists
+    /// to test downloads and failure handling against a fake server.
+    #[doc(hidden)]
+    pub fn with_spec(
+        models_dir: PathBuf,
+        idle: Duration,
+        spec: &'static ModelSpec,
+        policy: DownloadPolicy,
+    ) -> Engine {
         Engine {
+            spec,
+            policy,
             models_dir,
             idle,
             state: Mutex::new(State {
                 loaded: None,
                 last_used: Instant::now(),
             }),
+            loaded_flag: AtomicBool::new(false),
+            download: Mutex::new(()),
+            failure: Mutex::new(None),
         }
     }
 
     /// Whether the model is loaded or its files are on disk (hashes are
-    /// checked on load). Never downloads.
+    /// checked on load). Never downloads and never waits for an inference;
+    /// it may stat two files, so call it off the async threads.
     pub fn is_available(&self) -> bool {
-        let dir = MODEL.dir(&self.models_dir);
-        self.is_loaded()
-            || (dir.join(model::MODEL_FILE).is_file() && dir.join(model::TOKENIZER_FILE).is_file())
+        self.is_loaded() || self.spec.files_present(&self.models_dir)
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.lock().loaded.is_some()
+        self.loaded_flag.load(Ordering::Acquire)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -100,6 +130,8 @@ impl Engine {
         };
         if st.loaded.is_some() && st.last_used.elapsed() >= self.idle {
             st.loaded = None;
+            self.loaded_flag.store(false, Ordering::Release);
+            release_freed_memory();
             return true;
         }
         false
@@ -123,7 +155,9 @@ impl Engine {
     }
 
     fn load(&self) -> Result<Loaded> {
-        let dir = ensure_model(&self.models_dir, &MODEL)?;
+        // Files were fetched and hashed before the inference lock was taken;
+        // this only re-checks them (cheap) and never downloads.
+        let dir = verify_model(&self.models_dir, self.spec)?;
         let started = Instant::now();
         let session = Session::builder(environment()?)
             .map_err(ort_err)?
@@ -157,11 +191,68 @@ impl Engine {
         })
     }
 
-    /// Run `f` with the loaded model, loading it first if necessary.
-    fn with_loaded<T>(&self, f: impl FnOnce(&mut Loaded) -> Result<T>) -> Result<T> {
+    /// Remaining back-off after a failed download or load, as an error.
+    fn check_backoff(&self) -> Result<()> {
+        let failure = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, why)) = failure.as_ref()
+            && at.elapsed() < self.policy.failure_backoff
+        {
+            let left = self.policy.failure_backoff - at.elapsed();
+            anyhow::bail!(
+                "embedding model unavailable after a recent failure ({why}); next attempt in {}s",
+                left.as_secs() + 1
+            );
+        }
+        Ok(())
+    }
+
+    fn record_failure(&self, e: &anyhow::Error) {
+        *self.failure.lock().unwrap_or_else(|x| x.into_inner()) =
+            Some((Instant::now(), format!("{e:#}")));
+    }
+
+    /// Get the model files verified on disk, downloading them if `download`.
+    /// Runs without the inference lock, under the download mutex.
+    fn prepare_files(&self, download: bool) -> Result<()> {
+        self.check_backoff()?;
+        let _dl = self.download.lock().unwrap_or_else(|e| e.into_inner());
+        // Someone else may have failed (or succeeded) while this call waited.
+        self.check_backoff()?;
+        let res = if download {
+            ensure_model_with(&self.models_dir, self.spec, &self.policy, &mut |_| {}).map(|_| ())
+        } else {
+            verify_model(&self.models_dir, self.spec).map(|_| ())
+        };
+        // A search that finds the files gone must not lock indexing out.
+        if download && let Err(e) = &res {
+            self.record_failure(e);
+        }
+        res
+    }
+
+    /// Run `f` with the loaded model, loading it first if necessary. With
+    /// `download` the files are fetched when missing (indexing only; a search
+    /// never downloads).
+    fn with_loaded<T>(
+        &self,
+        download: bool,
+        f: impl FnOnce(&mut Loaded) -> Result<T>,
+    ) -> Result<T> {
+        if !self.is_loaded() {
+            self.prepare_files(download)?;
+        }
         let mut st = self.lock();
         if st.loaded.is_none() {
-            st.loaded = Some(self.load()?);
+            match self.load() {
+                Ok(l) => {
+                    st.loaded = Some(l);
+                    self.loaded_flag.store(true, Ordering::Release);
+                }
+                Err(e) => {
+                    self.record_failure(&e);
+                    return Err(e);
+                }
+            }
         }
         let out = f(st.loaded.as_mut().expect("loaded above"));
         st.last_used = Instant::now();
@@ -178,7 +269,7 @@ impl Engine {
     /// [`Engine::chunk`] over at most the first `max_chars` characters,
     /// tokenised in windows (see [`chunk::chunk_text_bounded`]).
     pub fn chunk_bounded(&self, text: &str, max_chars: usize) -> Result<Chunked> {
-        self.with_loaded(|l| {
+        self.with_loaded(true, |l| {
             chunk::chunk_text_bounded(text, &l.tokenizer, CHUNK_TOKENS, CHUNK_OVERLAP, max_chars)
         })
     }
@@ -189,23 +280,33 @@ impl Engine {
             .iter()
             .map(|t| format!("{}{t}", MODEL.passage_prefix))
             .collect();
-        self.embed_all(prefixed)
+        self.embed_all(prefixed, true)
     }
 
     /// Embed a search query (`"query: "` prefix).
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
-        let mut v = self.embed_all(vec![format!("{}{text}", MODEL.query_prefix)])?;
+        let mut v = self.embed_all(vec![format!("{}{text}", MODEL.query_prefix)], false)?;
         v.pop().context("no embedding returned")
     }
 
-    fn embed_all(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        self.with_loaded(|l| {
+    fn embed_all(&self, texts: Vec<String>, download: bool) -> Result<Vec<Vec<f32>>> {
+        self.with_loaded(download, |l| {
             let mut out = Vec::with_capacity(texts.len());
             for batch in texts.chunks(BATCH) {
                 out.extend(run_batch(l, batch)?);
             }
             Ok(out)
         })
+    }
+}
+
+/// Hand freed heap pages back to the OS (glibc keeps them otherwise), so the
+/// idle footprint really drops after the model is unloaded.
+fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` is always safe to call.
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 

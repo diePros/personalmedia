@@ -587,10 +587,13 @@ async fn semantic_search(
         return Err(ToolError::Tool("query must not be empty".into()));
     }
     // Never download the model on a query.
-    if !state.engine.is_available() {
-        return Err(ToolError::Tool(NO_INDEX.into()));
-    }
     let engine = state.engine.clone();
+    let probe = engine.clone();
+    match tokio::task::spawn_blocking(move || probe.is_available()).await {
+        Ok(true) => {}
+        Ok(false) => return Err(ToolError::Tool(NO_INDEX.into())),
+        Err(e) => return Err(ToolError::Tool(internal(e))),
+    }
     let query = a.query;
     let qv = match tokio::task::spawn_blocking(move || engine.embed_query(&query)).await {
         Ok(Ok(v)) => v,

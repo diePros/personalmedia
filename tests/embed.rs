@@ -70,8 +70,8 @@ fn fetch_model_downloads_verifies_and_is_idempotent() {
     let mtimes: Vec<_> = MODEL
         .files
         .iter()
-        .map(|(f, _, _)| {
-            let m = std::fs::metadata(dir.join(f)).unwrap();
+        .map(|f| {
+            let m = std::fs::metadata(dir.join(f.name)).unwrap();
             (m.len(), m.modified().unwrap())
         })
         .collect();
@@ -84,8 +84,8 @@ fn fetch_model_downloads_verifies_and_is_idempotent() {
     // second run: nothing is downloaded again
     let again = ensure_model(tmp.path(), &MODEL).unwrap();
     assert_eq!(again, dir);
-    for ((f, _, _), (len, mtime)) in MODEL.files.iter().zip(mtimes) {
-        let m = std::fs::metadata(dir.join(f)).unwrap();
+    for (f, (len, mtime)) in MODEL.files.iter().zip(mtimes) {
+        let m = std::fs::metadata(dir.join(f.name)).unwrap();
         assert_eq!((m.len(), m.modified().unwrap()), (len, mtime));
     }
 }

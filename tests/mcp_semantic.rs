@@ -2,6 +2,7 @@
 //! (set `PM_TEST_MODELS_DIR`) and print `SKIP` otherwise.
 
 mod common;
+mod fakeserver;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,6 +43,12 @@ struct Fx {
 }
 
 impl Fx {
+    fn with_app(t: TestApp) -> Fx {
+        let c = t.session_for("alice");
+        let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+        Fx { t, u }
+    }
+
     /// `None` = the default (empty) models dir, i.e. no model.
     fn new(models: Option<PathBuf>) -> Fx {
         let t = TestApp::with_config(|c| {
@@ -487,4 +494,77 @@ async fn semantic_search_without_model_returns_clear_error() {
     let (err, v) = f.call(&tok, json!({"query": "anything"})).await;
     assert!(err);
     assert_eq!(v, json!("semantic index not available yet"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_download_does_not_block_search_or_web() {
+    use personal_media::embed::{DownloadPolicy, Engine};
+    use personal_media::user_db::{get_access_defaults, set_access_defaults};
+
+    // The model server accepts and then says nothing.
+    let server = fakeserver::FakeServer::start(|_, _, ctl| ctl.wait_for_shutdown());
+    let body = fakeserver::body_of(1000);
+    let spec = fakeserver::spec_for(&server.url, "stalled-model", &body);
+    let models = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::with_spec(
+        models.path().to_path_buf(),
+        std::time::Duration::from_secs(600),
+        spec,
+        DownloadPolicy {
+            allow_http: true,
+            idle_timeout: std::time::Duration::from_secs(120),
+            ..DownloadPolicy::default()
+        },
+    ));
+    let f = Fx::with_app(TestApp::with_engine(engine.clone()));
+    let tok = f.token(Content::FullText, None);
+
+    // A document the indexer wants to embed: it gets stuck downloading.
+    f.u.with_db(|c| {
+        let mut d = get_access_defaults(c)?;
+        d.0.insert(Channel::SemanticIndex, Level::Full);
+        set_access_defaults(c, &d)
+    })
+    .unwrap();
+    let meta = UploadMeta {
+        filename: "a.txt".into(),
+        mime: Some("text/plain".into()),
+        title: None,
+        tags: vec![],
+        document_date: None,
+    };
+    let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
+        "Der Vertrag regelt die Kündigungsfrist.",
+    ))));
+    f.t.state
+        .docs
+        .store(&f.u, meta, Box::pin(body), OnDuplicate::Keep, None, now())
+        .await
+        .unwrap();
+    let hits = &server;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while hits.hits() == 0 {
+        assert!(std::time::Instant::now() < end, "indexer never started");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // While it is stuck: search answers at once ...
+    let started = std::time::Instant::now();
+    let (err, v) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.call(&tok, json!({"query": "Kündigung"})),
+    )
+    .await
+    .expect("semantic_search blocked behind the download");
+    assert!(err, "{v}");
+    assert!(v.as_str().unwrap().contains("not available yet"), "{v}");
+    // ... and so does the rest of the server.
+    let c = f.t.session_for("bob");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), f.t.get("/settings", &c))
+        .await
+        .expect("web request blocked behind the download");
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert!(!engine.is_available());
+    assert_eq!(server.hits(), 1, "the download must still be the first one");
 }

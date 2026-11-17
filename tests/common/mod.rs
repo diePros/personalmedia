@@ -67,6 +67,15 @@ impl TestApp {
         TestApp { dir, state, app }
     }
 
+    /// Like [`TestApp::new`] with a ready-made embedding engine.
+    pub fn with_engine(engine: std::sync::Arc<personal_media::embed::Engine>) -> TestApp {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::for_tests(dir.path().to_path_buf());
+        let state = AppState::build_with_engine(cfg, engine).unwrap();
+        let app = build_app(state.clone());
+        TestApp { dir, state, app }
+    }
+
     /// Send a request as if it arrived from [`PEER`] (unless the request
     /// already carries a `ConnectInfo` extension).
     pub async fn request(&self, mut req: Request<Body>) -> Response {
