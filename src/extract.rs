@@ -430,7 +430,7 @@ fn extract_pdf(
                 if !ocr.is_empty() {
                     ocr.push('\u{c}');
                 }
-                ocr.push_str(&page);
+                ocr.push_str(page.trim_end_matches('\u{c}'));
                 pages_done += 1;
             }
             Err(e) => {
