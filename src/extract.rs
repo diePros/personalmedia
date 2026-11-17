@@ -428,7 +428,7 @@ fn extract_pdf(
         match ocr_page(budget, path, scratch, &prefix, n) {
             Ok(page) => {
                 if !ocr.is_empty() {
-                    ocr.push('\n');
+                    ocr.push('\u{c}');
                 }
                 ocr.push_str(&page);
                 pages_done += 1;

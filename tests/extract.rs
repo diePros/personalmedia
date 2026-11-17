@@ -393,6 +393,18 @@ fn scratch_never_holds_more_than_one_page_png() {
 }
 
 #[test]
+fn ocr_pages_are_separated_by_form_feed() {
+    if !have_tesseract() {
+        return;
+    }
+    let work = tempfile::tempdir().unwrap();
+    let pdf = scanned3(work.path());
+    let tmp = tempfile::tempdir().unwrap();
+    let r = extract_text(&pdf, "application/pdf", &cfg(tmp.path())).unwrap();
+    assert_eq!(r.text.matches('\u{c}').count(), 2, "{:?}", r.text);
+}
+
+#[test]
 fn ocr_keeps_partial_text_on_budget_exhaustion() {
     if !have_tesseract() {
         return;
