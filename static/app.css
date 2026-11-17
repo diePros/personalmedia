@@ -475,7 +475,7 @@ fieldset.mode legend {
   --main-top-inset: 0px;
 }
 
-@media (max-width: 40rem) {
+@media (width < 40rem) {
   :root {
     --tabbar-display: flex;
     --nav-display: none;

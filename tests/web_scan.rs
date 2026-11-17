@@ -336,8 +336,8 @@ async fn non_standalone_layout_unchanged() {
         .split(":root {\n  --tabbar-display")
         .nth(1)
         .expect("shell defaults");
-    let root = root.split('}').next().unwrap();
-    assert!(root.contains(": none"));
+    let root = format!("--tabbar-display{}", root.split('}').next().unwrap());
+    assert!(root.contains("--tabbar-display: none"));
     assert!(root.contains("--header-display: flex"));
     assert!(root.contains("--nav-display: flex"));
     assert!(root.contains("--account-display: none"));
@@ -345,12 +345,26 @@ async fn non_standalone_layout_unchanged() {
     assert!(css.contains("display: var(--header-display)"));
     // The tab bar rules exist once: no per-mode copy of them.
     assert_eq!(css.matches(".tabbar {").count(), 1);
-    assert!(css.contains(":root.standalone {"));
-    assert!(css.contains("@media (display-mode: standalone) {\n  :root {"));
+    for start in [
+        ":root.standalone {",
+        "@media (display-mode: standalone) {\n  :root {",
+    ] {
+        let block = css
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("{start}"))
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(block.contains("--tabbar-display: flex"), "{start}");
+        assert!(block.contains("--header-display: none"), "{start}");
+        assert!(block.contains("--account-display: block"), "{start}");
+    }
+    assert_eq!(css.matches("--header-display: none").count(), 2);
     // The phone browser keeps the header (brand only), so only standalone
     // modes may set --header-display: none.
     let phone = css
-        .split("@media (max-width: 40rem) {\n  :root {")
+        .split("@media (width < 40rem) {\n  :root {")
         .nth(1)
         .expect("phone shell")
         .split('}')

@@ -131,7 +131,7 @@
 
 /* Page strip: 3:4 thumbnails in a horizontal scroller. */
 .scan-pages-wrap {
-  padding-bottom: calc(var(--scan-savebar) + var(--scan-tabbar));
+  padding-bottom: var(--scan-savebar);
 }
 
 .strip {

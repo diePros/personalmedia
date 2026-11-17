@@ -241,7 +241,7 @@
     }
   }
 
-  // Bottom tab bar (shown only when standalone, see app.css): highlights the
+  // Bottom tab bar (shown when standalone or at phone width, see app.css): highlights the
   // current tab and makes Search focus the documents search field.
   function initTabbar() {
     var bar = document.querySelector(".tabbar");
