@@ -106,10 +106,10 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// Largest quota the forms accept: 1 PiB.
 const MAX_QUOTA_BYTES: u64 = 1 << 50;
 
-/// Parses a GiB figure (one decimal is typical) into bytes. Empty, negative,
+/// Parses a GiB figure (decimal point or comma) into bytes. Empty, negative,
 /// non-numeric and over-1-PiB values are rejected.
 fn parse_gib(s: &str) -> Option<u64> {
-    let gib: f64 = s.trim().parse().ok()?;
+    let gib: f64 = s.trim().replace(',', ".").parse().ok()?;
     if !gib.is_finite() || gib < 0.0 {
         return None;
     }
@@ -120,8 +120,10 @@ fn parse_gib(s: &str) -> Option<u64> {
     Some(bytes as u64)
 }
 
+/// The shortest text that parses back to exactly `bytes` (dividing by a power
+/// of two is exact), so an unchanged form re-submit changes nothing.
 fn gib_text(bytes: u64) -> String {
-    format!("{:.1}", bytes as f64 / GIB)
+    format!("{}", bytes as f64 / GIB)
 }
 
 fn limit_text(limit: Option<u64>) -> String {
@@ -363,7 +365,7 @@ struct DefaultQuotaForm {
     unlimited: Option<String>,
 }
 
-const BAD_QUOTA: &str = "Enter a size in GiB between 0 and 1048576 (1 PiB).";
+const BAD_QUOTA: &str = "Enter a size in GiB (for example 1.5) between 0 and 1048576 (1 PiB).";
 
 async fn set_default_quota(
     State(state): State<AppState>,
@@ -438,6 +440,29 @@ async fn set_user_quota(
 #[cfg(test)]
 mod tests {
     use super::{human_bytes, parse_gib};
+
+    #[test]
+    fn gib_text_round_trips_exactly() {
+        use super::gib_text;
+        for b in [
+            0u64,
+            1,
+            40 << 20,
+            (5 << 28) + 12_345,
+            10 << 30,
+            1 << 50,
+            1_234_567_891,
+        ] {
+            assert_eq!(parse_gib(&gib_text(b)), Some(b), "{b} via {}", gib_text(b));
+        }
+        assert_eq!(gib_text(40 << 20), "0.0390625");
+        assert_eq!(gib_text(10 << 30), "10");
+    }
+
+    #[test]
+    fn parses_gib_with_decimal_comma() {
+        assert_eq!(parse_gib("1,5"), Some(3 << 29));
+    }
 
     #[test]
     fn parses_gib() {

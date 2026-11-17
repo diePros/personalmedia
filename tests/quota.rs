@@ -642,3 +642,31 @@ async fn quota_413_body_has_message_and_is_early() {
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/static/app.js")).unwrap();
     assert!(js.contains("data.message || data.error || resp.status"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_custom_quota_resubmit_is_a_no_op() {
+    let t = TestApp::new();
+    let admin = t.admin_session_for("root");
+    t.session_for("bob");
+    let bob = uid(&t, "bob");
+    let path = format!("/admin/users/{bob}/quota");
+    for bytes in [40u64 << 20, (5 << 28) + 12_345] {
+        t.state
+            .sys
+            .set_user_quota(&bob, QuotaSetting::Custom(bytes))
+            .unwrap();
+        let html = body_string(t.get("/admin", &admin).await).await;
+        let marker = format!("id=\"quota-gib-{bob}\" name=\"gib\" inputmode=\"decimal\" value=\"");
+        let from = html.find(&marker).expect("quota field") + marker.len();
+        let shown = &html[from..from + html[from..].find('"').unwrap()];
+        let r = t
+            .post_form(&path, &[("mode", "custom"), ("gib", shown)], &admin)
+            .await;
+        assert_eq!(r.status(), 303, "{shown}");
+        assert_eq!(
+            t.state.sys.user_by_id(&bob).unwrap().unwrap().quota,
+            QuotaSetting::Custom(bytes),
+            "re-submitting {shown} changed the quota"
+        );
+    }
+}
