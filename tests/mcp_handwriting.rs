@@ -563,3 +563,55 @@ async fn notes_searchable_at_metadata_level() {
         .await;
     assert!(hits.as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn list_documents_needs_transcription_filter() {
+    let f = Fx::new();
+    let todo = f.two_page_pdf(Level::Full).await;
+    let done = f.two_page_pdf(Level::Full).await;
+    f.doc(
+        "plain.bin",
+        "application/octet-stream",
+        b"plain",
+        &["diary"],
+        Level::Full,
+    )
+    .await;
+    let rw = f.token(Access::ReadWrite, Content::FullText, None);
+    f.call(
+        &rw,
+        "set_transcription",
+        json!({"id": done, "text": "Done"}),
+    )
+    .await;
+
+    let (err, v) = f
+        .call(&rw, "list_documents", json!({"needs_transcription": true}))
+        .await;
+    assert!(!err, "{v}");
+    let got: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, [todo.as_str()]);
+    let (_, all) = f.call(&rw, "list_documents", json!({})).await;
+    assert_eq!(all.as_array().unwrap().len(), 3);
+
+    // A tag allow-list without `handwritten` still gates everything.
+    let diary = f.token(Access::Read, Content::FullText, Some(&["diary"]));
+    let (_, v) = f
+        .call(
+            &diary,
+            "list_documents",
+            json!({"needs_transcription": true}),
+        )
+        .await;
+    assert!(v.as_array().unwrap().is_empty());
+    let hw = f.token(Access::Read, Content::FullText, Some(&["handwritten"]));
+    let (_, v) = f
+        .call(&hw, "list_documents", json!({"needs_transcription": true}))
+        .await;
+    assert_eq!(v.as_array().unwrap().len(), 1);
+}

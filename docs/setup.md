@@ -294,13 +294,14 @@ PMS cannot read handwriting itself yet. Instead your own AI assistant (claude.ai
 2. Scan or upload the handwritten pages and tag them (for example `handwritten`). The document's own MCP setting must not be limited below `full`.
 3. Ask the assistant, for example in claude.ai:
 
-   > Find my documents tagged handwritten, read each page with get_page_image, and save a faithful transcription with set_transcription.
+   > Find my documents that need transcription (list_documents with needs_transcription), read each page with get_page_image, and save a faithful transcription with set_transcription.
 
 Tools involved:
 
-- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute.
+- `get_page_image { id, page? }` returns one page as an image: PDF pages are rendered at up to 1568 px on the long side; image documents are returned as stored (so camera metadata such as EXIF location, if the photo has any, goes along) when they are at most 3.5 MiB. At most 20 page images per token (or connected app) per minute; this limit is kept in memory, so it resets when the server restarts.
 - `set_transcription { id, text, mode? }` stores the text (`replace`, the default, or `append`). It becomes the searchable text, is marked "transcribed by an AI assistant" on the document page and is indexed for semantic search again if that is enabled for the document.
 - `set_notes { id, notes }` sets the document's notes (see below).
+- `list_documents { needs_transcription: true }` lists only documents tagged `handwritten` that have no transcription yet. The documents page has the same **Needs transcription** filter. Your token's tag allow-list still applies, so it must include `handwritten`.
 
 **Privacy:** page images leave your server and go to the AI provider of the assistant you connected, but only for documents that your token or app may read in full and whose MCP setting is `full`. Documents set to `metadata` or `off` for MCP, and tokens without full text access, never get page images. Images are rendered on demand in memory-backed scratch space, never cached and deleted right after.
 

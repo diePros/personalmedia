@@ -41,6 +41,9 @@
 <label for="to">To</label>
 <input type="date" id="to" name="to" value="{{ to }}" hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
 </div>
+<div class="check">
+<label><input type="checkbox" name="needs_transcription" value="1"{% if needs_transcription %} checked{% endif %} hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Needs transcription</label>
+</div>
 </div>
 <fieldset class="mode">
 <legend>Search</legend>

@@ -788,3 +788,55 @@ async fn notes_edit_roundtrip_web() {
     let html = body_string(t.get(&path, &c).await).await;
     assert!(html.contains("transcribed by an AI assistant"), "{html}");
 }
+
+#[tokio::test]
+async fn needs_transcription_filter_and_pagination_url() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let hw = upload(
+        &t,
+        &c,
+        "a.bin",
+        "application/octet-stream",
+        b"hand",
+        &[("tags", "handwritten")],
+    )
+    .await;
+    upload_id(&t, &c, "b.bin", "application/octet-stream", b"other").await;
+    let hw_id = hw["id"].as_str().unwrap();
+
+    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    assert_eq!(html.matches("doc-item").count(), 1, "{html}");
+    assert!(html.contains("name=\"needs_transcription\""));
+    assert!(html.contains("checked"));
+    let all = body_string(t.get("/documents", &c).await).await;
+    assert_eq!(all.matches("doc-item").count(), 2);
+
+    let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
+    u.with_db(|conn| personal_media::user_db::set_transcription(conn, hw_id, "text", 5))
+        .unwrap();
+    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    assert_eq!(html.matches("doc-item").count(), 0);
+}
+
+#[tokio::test]
+async fn needs_transcription_kept_in_pagination() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    for i in 0..51 {
+        upload(
+            &t,
+            &c,
+            "f.bin",
+            "application/octet-stream",
+            format!("hw {i}").as_bytes(),
+            &[("tags", "handwritten")],
+        )
+        .await;
+    }
+    let html = body_string(t.get("/documents?needs_transcription=1", &c).await).await;
+    assert!(
+        html.contains("href=\"/documents?needs_transcription=1&#38;page=2\""),
+        "{html}"
+    );
+}

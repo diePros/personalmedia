@@ -860,3 +860,46 @@ fn metadata_and_notes_update_together() {
     assert_eq!(ids(&search(&conn, "kochbuch", &all()).unwrap()), ["d1"]);
     assert_eq!(ids(&search(&conn, "neuer", &all()).unwrap()), ["d1"]);
 }
+
+#[test]
+fn needs_transcription_filter() {
+    let (_d, conn) = db();
+    add(&conn, "a1", "tagged none", &["handwritten"], "x");
+    add(&conn, "b2", "tagged done", &["handwritten", "diary"], "x");
+    add(&conn, "c3", "untagged", &["diary"], "x");
+    add(&conn, "d4", "wrong case", &["Handwritten"], "x");
+    set_transcription(&conn, "b2", "typed text", 9).unwrap();
+
+    let f = ListFilter {
+        needs_transcription: true,
+        ..web()
+    };
+    let got: Vec<String> = list_documents(&conn, &f)
+        .unwrap()
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+    assert_eq!(got, ["a1"]);
+
+    // Combines with tags_all and the allow-list (only narrows).
+    let both = ListFilter {
+        tags_all: vec!["diary".into()],
+        ..f.clone()
+    };
+    assert!(list_documents(&conn, &both).unwrap().is_empty());
+    let allow_other = ListFilter {
+        tag_allow: Some(tag_ids(&conn, &["diary".to_string()]).unwrap()),
+        ..f.clone()
+    };
+    assert!(list_documents(&conn, &allow_other).unwrap().is_empty());
+    let allow_hw = ListFilter {
+        tag_allow: Some(tag_ids(&conn, &["handwritten".to_string()]).unwrap()),
+        ..f.clone()
+    };
+    assert_eq!(list_documents(&conn, &allow_hw).unwrap().len(), 1);
+
+    // Off by default; search honours it too.
+    assert_eq!(list_documents(&conn, &web()).unwrap().len(), 4);
+    let hits = search(&conn, "x", &f).unwrap();
+    assert_eq!(ids(&hits), ["a1"]);
+}

@@ -112,6 +112,9 @@ pub struct ListFilter {
     pub tag_allow: Option<Vec<i64>>,
     pub date_from: Option<String>,
     pub date_to: Option<String>,
+    /// Only documents tagged `handwritten` whose text is not yet a
+    /// transcription (`text_source` is not `transcription`). Needs a v3+ index.
+    pub needs_transcription: bool,
     /// `None` = no switchboard restrictions (export/recovery only).
     pub access: Option<AccessFilter>,
     /// 0 means 50.
@@ -413,6 +416,12 @@ fn filter_conditions(f: &ListFilter, sql: &mut String, params: &mut Vec<Value>) 
     if let Some(to) = &f.date_to {
         sql.push_str(" AND d.document_date <= ?");
         params.push(Value::Text(to.clone()));
+    }
+    if f.needs_transcription {
+        sql.push_str(
+            " AND d.text_source != 'transcription' AND EXISTS (SELECT 1 FROM document_tags dt \
+             JOIN tags t ON t.id = dt.tag_id WHERE dt.document_id = d.id AND t.name = 'handwritten')",
+        );
     }
 }
 

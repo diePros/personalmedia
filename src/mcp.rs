@@ -375,6 +375,7 @@ fn tool_definitions(can_write: bool, full_text: bool) -> Value {
             "description": "List documents, newest first.",
             "inputSchema": {"type": "object", "properties": {
                 "tags": tags, "date_from": date, "date_to": date,
+                "needs_transcription": {"type": "boolean", "description": "Only documents tagged handwritten that have no transcription yet."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 "offset": {"type": "integer", "minimum": 0}
             }}
@@ -467,6 +468,7 @@ struct ListArgs {
     tags: Vec<String>,
     date_from: Option<String>,
     date_to: Option<String>,
+    needs_transcription: Option<bool>,
     limit: Option<u32>,
     offset: Option<u32>,
 }
@@ -732,6 +734,7 @@ async fn list_docs(p: &Principal, a: ListArgs) -> Result<Value, String> {
     f.tags_all = a.tags;
     f.date_from = clean(a.date_from);
     f.date_to = clean(a.date_to);
+    f.needs_transcription = a.needs_transcription.unwrap_or(false);
     f.limit = a.limit.unwrap_or(50).clamp(1, 100);
     f.offset = a.offset.unwrap_or(0);
     let p2 = p.clone();
