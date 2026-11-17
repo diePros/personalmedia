@@ -83,6 +83,24 @@ Review focus for the milestone: memory bound on the N150, no plaintext page crop
   - Edge on iOS is labelled Safari. iPadOS with a desktop user agent is labelled Mac.
   - setup.md:250 still says `mem_limit: 1536m`; it is now `${MEM_LIMIT:-1536m}`.
 
+## Update after v1.6.3 (2026-11-18)
+
+- **v1.6.2:** separate `/search` page (best match / newest), and `/documents` grouped by day (`pm_tz` cookie).
+- **v1.6.3:** automatic document dates.
+  - `src/dates.rs` rule-based de/en finder.
+  - Index DB is now **v5** (`documents.date_source` user|detected|ai).
+  - Detection runs after extraction, outside the DB lock.
+  - One-time backfill per user (`settings.date_backfill='v1'`, Weak<Unlocked>).
+  - AI is told to set dates for handwriting.
+  - The local-HTR index migration (v1.7) becomes **v6**.
+- **Deferred minors:**
+  - A short table header ending in a label word ("Betrag Text Datum") promotes the next line's date.
+  - Version-like numbers ("Version 1.2.2026") parse as dates.
+  - No test for the backfill stopping when the Weak upgrade fails, or for a scan upload's `user` tag.
+  - Desktop header lacks `aria-current`.
+  - `/search` focus+scrollIntoView on every empty load.
+  - The app.css:465 comment still says "up to 40rem".
+
 ## Open deferred minors (from earlier reviews; optional cleanup batch)
 
 - Per-token MCP rate limit (v1.2 M3) and the user-DB mutex held during the vector scan (v1.2 M4).
