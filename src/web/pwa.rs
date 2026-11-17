@@ -63,8 +63,8 @@ const CHUNK: usize = 64 * 1024;
 
 /// Colors match `static/app.css`: `--accent` (light) and `--bg` (light).
 pub const MANIFEST: &str = r##"{
-  "name": "Personal Media",
-  "short_name": "Media",
+  "name": "Personal Media System",
+  "short_name": "PMS",
   "start_url": "/documents",
   "scope": "/",
   "display": "standalone",
