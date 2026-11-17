@@ -776,18 +776,20 @@ async fn upload_document(
         document_date: clean(a.date),
     };
     let filter = p.filter();
+    let size = bytes.len() as u64;
     let body = stream::once(std::future::ready(Ok::<_, anyhow::Error>(Bytes::from(
         bytes,
     ))));
     match state
         .docs
-        .store(
+        .store_sized(
             &p.unlocked,
             meta,
             Box::pin(body),
             OnDuplicate::Skip,
             Some(&filter),
             now(),
+            Some(size),
         )
         .await
     {

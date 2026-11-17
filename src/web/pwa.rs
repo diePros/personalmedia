@@ -438,13 +438,14 @@ async fn save_share(
         );
         let outcome = state
             .docs
-            .store(
+            .store_sized(
                 &session.unlocked,
                 meta,
                 body,
                 OnDuplicate::Skip,
                 Some(&filter),
                 now(),
+                Some(file.bytes.len() as u64),
             )
             .await;
         outcomes.push(match outcome {

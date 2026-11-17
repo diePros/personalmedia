@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use crate::crypto::stream::{DecryptReader, EncryptWriter};
 use crate::crypto::{Key32, aad, unwrap_key, wrap_key};
 use crate::keyring::{Unlocked, user_dir};
-use crate::quota::{QuotaError, Quotas, Reservation, UPLOAD_OVERHEAD};
+use crate::quota::{QuotaError, Quotas, Reservation, UPLOAD_OVERHEAD, upload_reservation};
 use crate::user_db::{
     Document, ListFilter, NewDocument, TextStatus, delete_document, find_by_sha256_visible,
     get_document, insert_document, set_text, update_document_meta,
@@ -233,7 +233,7 @@ impl Documents {
         &self,
         u: &Arc<Unlocked>,
         meta: UploadMeta,
-        mut body: S,
+        body: S,
         on_dup: OnDuplicate,
         visibility: Option<&ListFilter>,
         now: i64,
@@ -242,11 +242,39 @@ impl Documents {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<anyhow::Error>,
     {
+        self.store_sized(u, meta, body, on_dup, visibility, now, None)
+            .await
+    }
+
+    /// [`Documents::store`] with the expected size of the upload. The quota
+    /// is reserved for the whole hinted size (plus the ciphertext overhead)
+    /// before anything is written, so parallel uploads that do not fit
+    /// together fail early instead of starving each other. Without a hint the
+    /// reservation grows chunk by chunk. The hint is an upper bound for
+    /// reserving (the request length of a multipart upload is fine); the real
+    /// size is what gets committed.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn store_sized<S, E>(
+        &self,
+        u: &Arc<Unlocked>,
+        meta: UploadMeta,
+        mut body: S,
+        on_dup: OnDuplicate,
+        visibility: Option<&ListFilter>,
+        now: i64,
+        size_hint: Option<u64>,
+    ) -> Result<StoreOutcome, DocError>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Into<anyhow::Error>,
+    {
         if let Some(d) = &meta.document_date {
             validate_date(d)?;
         }
-        // Reserve before anything touches the disk; the writer grows it per chunk.
-        let reservation = self.quotas.reserve(&u.user_id, UPLOAD_OVERHEAD).await?;
+        // Reserve before anything touches the disk; the writer grows it only
+        // past the hint (or per chunk without one).
+        let initial = size_hint.map_or(UPLOAD_OVERHEAD, upload_reservation);
+        let reservation = self.quotas.reserve(&u.user_id, initial).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let final_path = blob_path(&self.data_dir, &u.user_id, &id);
         let part_path = final_path.with_file_name(format!("{id}.part"));
@@ -272,7 +300,7 @@ impl Documents {
                     if size > max {
                         return Err(DocError::TooLarge);
                     }
-                    reservation.grow(chunk.len() as u64)?;
+                    reservation.ensure(upload_reservation(size))?;
                     hasher.update(&chunk);
                     w.write_all(&chunk)?;
                 }

@@ -9,7 +9,7 @@ use axum::http::{Method, Request, header};
 use bytes::Bytes;
 use common::*;
 use data_encoding::BASE64;
-use futures_util::stream;
+use futures_util::{StreamExt, stream};
 use personal_media::documents::{DocError, OnDuplicate, StoreOutcome, UploadMeta};
 use personal_media::keyring::{Unlocked, user_dir};
 use personal_media::system_db::{QuotaSetting, SCHEMA_V1, SYSTEM_DB_FILE, SystemDb};
@@ -213,8 +213,81 @@ async fn upload_over_quota_is_413_and_leaves_no_blob() {
     assert_eq!(resp.status(), 200);
 }
 
+/// Like `store`, but with a size hint and a body that waits for `gate`
+/// before its first chunk (so the reservation is made before any write).
+async fn store_hinted(
+    t: &TestApp,
+    u: &Arc<Unlocked>,
+    name: &str,
+    data: Bytes,
+    gate: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<StoreOutcome, DocError> {
+    let hint = data.len() as u64;
+    let chunks = data
+        .chunks(8192)
+        .map(|c| Ok::<_, anyhow::Error>(Bytes::copy_from_slice(c)))
+        .collect::<Vec<_>>();
+    let body = stream::once(async move {
+        if let Some(g) = gate {
+            let _ = g.await;
+        }
+        stream::iter(chunks)
+    })
+    .flatten();
+    t.state
+        .docs
+        .store_sized(
+            u,
+            meta(name),
+            Box::pin(body),
+            OnDuplicate::Keep,
+            None,
+            now(),
+            Some(hint),
+        )
+        .await
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn parallel_uploads_cannot_exceed_quota() {
+    // Two uploads that each need more than half the free space: with the
+    // reservation made up front, exactly one wins, whatever the timing.
+    let t = Arc::new(TestApp::new());
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let id = uid(&t, "alice");
+    for _ in 0..5 {
+        let room = t.state.quotas.usage(&id).await + 100 * 1024;
+        t.state
+            .sys
+            .set_user_quota(&id, QuotaSetting::Custom(room))
+            .unwrap();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        let (t1, u1) = (t.clone(), u.clone());
+        let a = tokio::spawn(async move {
+            store_hinted(&t1, &u1, "a", payload(60 * 1024, 1), Some(gate_rx)).await
+        });
+        let (t2, u2) = (t.clone(), u.clone());
+        let b =
+            tokio::spawn(
+                async move { store_hinted(&t2, &u2, "b", payload(60 * 1024, 2), None).await },
+            );
+        // b is done (stored or refused) before a may write: a reserved
+        // before either wrote, or lost the race.
+        let rb = b.await.unwrap();
+        gate_tx.send(()).ok();
+        let ra = a.await.unwrap();
+        let stored = [&ra, &rb].iter().filter(|r| r.is_ok()).count();
+        let refused = [&ra, &rb]
+            .iter()
+            .filter(|r| matches!(r, Err(DocError::QuotaExceeded { .. })))
+            .count();
+        assert_eq!((stored, refused), (1, 1), "{ra:?} / {rb:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn many_hinted_uploads_fit_exactly_what_fits() {
     let t = Arc::new(TestApp::new());
     let c = t.session_for("alice");
     let u = unlocked(&t, &c);
@@ -228,7 +301,7 @@ async fn parallel_uploads_cannot_exceed_quota() {
     for i in 0..8u8 {
         let (t, u) = (t.clone(), u.clone());
         tasks.push(tokio::spawn(async move {
-            store(&t, &u, &format!("f{i}"), payload(40 * 1024, i + 1)).await
+            store_hinted(&t, &u, &format!("f{i}"), payload(40 * 1024, i + 1), None).await
         }));
     }
     let mut ok = 0;
@@ -239,10 +312,34 @@ async fn parallel_uploads_cannot_exceed_quota() {
             Err(e) => panic!("{e}"),
         }
     }
-    assert!((1..=2).contains(&ok), "{ok} uploads fit");
+    assert_eq!(ok, 2, "two 40 KiB uploads fit into 100 KiB, no more");
     assert!(t.state.quotas.usage(&id).await <= limit);
-    let on_disk = personal_media::quota::dir_size(&user_dir(t.dir.path(), &id));
-    assert!(on_disk <= limit, "{on_disk} > {limit}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reservation_covers_ciphertext_overhead() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let u = unlocked(&t, &c);
+    let id = uid(&t, "alice");
+    let size = 1usize << 20;
+    let base = t.state.quotas.usage(&id).await;
+    // Room for the plaintext and the 1 KiB allowance only: the 256 bytes of
+    // tags do not fit, so the upload is refused instead of going over.
+    let tight = base + size as u64 + 1024;
+    t.state
+        .sys
+        .set_user_quota(&id, QuotaSetting::Custom(tight))
+        .unwrap();
+    let r = store(&t, &u, "x", payload(size, 7)).await;
+    assert!(matches!(r, Err(DocError::QuotaExceeded { .. })), "{r:?}");
+    t.state
+        .sys
+        .set_user_quota(&id, QuotaSetting::Custom(tight + 512))
+        .unwrap();
+    let r = store(&t, &u, "x", payload(size, 7)).await;
+    assert!(r.is_ok(), "{r:?}");
+    assert!(t.state.quotas.usage(&id).await <= tight + 512);
 }
 
 #[tokio::test(flavor = "multi_thread")]

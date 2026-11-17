@@ -296,17 +296,23 @@ async fn upload(
         }
         Err(e) => return e.into_response(),
     };
+    // The request length bounds the file; it is what the quota reserves.
+    let size_hint = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
     let multipart = match Multipart::from_request(Request::from_parts(parts, body), &state).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
     match principal {
-        None => handle_upload(&state, unlocked, multipart).await,
+        None => handle_upload(&state, unlocked, multipart, size_hint).await,
         Some(p) => {
             if !p.can_write() {
                 return json_error(StatusCode::FORBIDDEN, "token is read-only");
             }
-            handle_upload_inner(&state, unlocked, multipart, Some(&p)).await
+            handle_upload_inner(&state, unlocked, multipart, Some(&p), size_hint).await
         }
     }
 }
@@ -323,8 +329,9 @@ pub async fn handle_upload(
     state: &AppState,
     unlocked: Arc<Unlocked>,
     multipart: Multipart,
+    size_hint: Option<u64>,
 ) -> Response {
-    handle_upload_inner(state, unlocked, multipart, None).await
+    handle_upload_inner(state, unlocked, multipart, None, size_hint).await
 }
 
 /// With a `principal` (bearer upload): duplicate detection only sees what the
@@ -334,6 +341,7 @@ async fn handle_upload_inner(
     unlocked: Arc<Unlocked>,
     mut multipart: Multipart,
     principal: Option<&crate::tokens::Principal>,
+    size_hint: Option<u64>,
 ) -> Response {
     let (mut title, mut tags, mut date, mut on_dup) = (None, Vec::new(), None, OnDuplicate::Skip);
     loop {
@@ -380,13 +388,14 @@ async fn handle_upload_inner(
                 field.map(move |chunk| chunk.inspect_err(|_| flag.store(true, Ordering::Relaxed)));
             return match state
                 .docs
-                .store(
+                .store_sized(
                     &unlocked,
                     meta,
                     Box::pin(body),
                     on_dup,
                     Some(&filter),
                     now(),
+                    size_hint,
                 )
                 .await
             {

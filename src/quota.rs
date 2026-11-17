@@ -18,7 +18,21 @@ use crate::system_db::{QuotaSetting, SystemDb};
 
 /// Extra bytes reserved up front for every upload (stream headers, tags).
 pub const UPLOAD_OVERHEAD: u64 = 1024;
+/// Plaintext bytes per encrypted chunk and the tag each chunk adds.
+const CHUNK_PLAIN: u64 = 65536;
+const CHUNK_TAG: u64 = 16;
 const REFRESH: Duration = Duration::from_secs(300);
+
+/// Size of the ciphertext for `plain` bytes (one tag per chunk, without the
+/// stream header, which [`UPLOAD_OVERHEAD`] covers).
+pub fn cipher_len(plain: u64) -> u64 {
+    plain.saturating_add(CHUNK_TAG * plain.div_ceil(CHUNK_PLAIN))
+}
+
+/// What an upload of `plain` bytes holds on disk, at most.
+pub fn upload_reservation(plain: u64) -> u64 {
+    cipher_len(plain).saturating_add(UPLOAD_OVERHEAD)
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("Storage quota reached ({} of {} used)", human_bytes(*used), human_bytes(*limit))]
@@ -202,6 +216,15 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// Make sure at least `total` bytes are held in all; grows by the
+    /// difference (and never shrinks).
+    pub fn ensure(&mut self, total: u64) -> Result<(), QuotaError> {
+        match total.checked_sub(self.held) {
+            Some(more) if more > 0 => self.grow(more),
+            _ => Ok(()),
+        }
+    }
+
     /// Hold `n` more bytes; fails (holding nothing more) when that would
     /// push the user over the limit.
     pub fn grow(&mut self, n: u64) -> Result<(), QuotaError> {
