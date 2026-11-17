@@ -6,7 +6,8 @@ use common::*;
 use personal_media::crypto::Key32;
 use personal_media::user_db::{
     DateSource, TextStatus, apply_detected_date, backfill_detected_dates, get_document,
-    get_setting, insert_document, open_user_db, set_text, update_document_meta_sourced,
+    get_setting, insert_document, open_user_db, set_text, set_transcription,
+    update_document_meta_sourced,
 };
 use rusqlite::Connection;
 
@@ -163,6 +164,9 @@ fn backfill_runs_once() {
     doc(&conn, "a", Some(TEXT));
     doc(&conn, "b", Some("Brief vom 3. März 2025"));
     doc(&conn, "c", None);
+    // A transcription is left to the AI: no detection, even with a date in it.
+    doc(&conn, "t", Some(TEXT));
+    set_transcription(&conn, "t", TEXT, 100).unwrap();
     let n = backfill_detected_dates(&conn, today(), 9).unwrap();
     assert_eq!(n, 2);
     let get = |id: &str| get_document(&conn, id).unwrap().unwrap();
@@ -170,6 +174,7 @@ fn backfill_runs_once() {
     assert_eq!(get("b").document_date.as_deref(), Some("2025-03-03"));
     assert_eq!(get("b").date_source, Some(DateSource::Detected));
     assert_eq!(get("c").document_date, None);
+    assert_eq!(get("t").document_date, None);
     assert_eq!(
         get_setting(&conn, "date_backfill").unwrap().as_deref(),
         Some("v1")
@@ -194,7 +199,7 @@ async fn unlock_runs_the_backfill_once_in_the_background() {
     let sys = Arc::new(SystemDb::open(&dir.path().join(SYSTEM_DB_FILE)).unwrap());
     let (queue, _rx) = ExtractQueue::channel();
     let keyring = Arc::new(Keyring::new(dir.path().to_path_buf(), Arc::new(queue)));
-    let accounts = Accounts::new(&cfg, sys, keyring);
+    let accounts = Accounts::new(&cfg, sys, keyring.clone());
     let url = accounts.create_invite(Role::User, 1_000).unwrap();
     let token = url.rsplit('/').next().unwrap().to_string();
     let (u, _, _) = accounts
@@ -220,7 +225,10 @@ async fn unlock_runs_the_backfill_once_in_the_background() {
         Ok::<_, anyhow::Error>(())
     })
     .unwrap();
+    let uid = u.user_id.clone();
     drop(u);
+    // A still-running backfill must not keep the old Unlocked alive.
+    wait_locked(&keyring, &uid).await;
     let (u, _) = accounts
         .login("sebi", "correct horse battery", None)
         .unwrap();

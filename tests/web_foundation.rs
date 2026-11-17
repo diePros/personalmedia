@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
-use common::{Client, TestApp, body_string, builder, header_str};
+use common::{Client, TestApp, body_string, builder, header_str, wait_locked};
 use personal_media::web::ratelimit::{RateLimiter, client_ip, ip_key, user_key};
 
 const CSP: &str = "default-src 'self'; img-src 'self' data:; object-src 'self'; \
@@ -242,7 +242,7 @@ async fn session_store_removal_and_pending_totp() {
     assert!(app.state.sessions.get(&a1.cookie).is_none());
     assert!(app.state.sessions.get(&bob.cookie).is_some());
     // The session held the last reference to alice's unlocked state.
-    assert!(app.state.keyring.get(&user_id).is_none());
+    wait_locked(&app.state.keyring, &user_id).await;
 
     app.state.sessions.remove(&bob.cookie);
     assert!(app.state.sessions.get(&bob.cookie).is_none());
@@ -287,7 +287,7 @@ async fn sweep_drops_expired_sessions_and_their_keys() {
     assert!(app.state.keyring.get(&user_id).is_some());
     tokio::time::sleep(Duration::from_millis(300)).await;
     app.state.sessions.sweep();
-    assert!(app.state.keyring.get(&user_id).is_none());
+    wait_locked(&app.state.keyring, &user_id).await;
 }
 
 #[test]

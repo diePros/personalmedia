@@ -683,8 +683,9 @@ pub fn set_detected_date(conn: &Connection, id: &str, iso: &str, now: i64) -> Re
     Ok(n > 0)
 }
 
-/// [`detect_date_iso`] then [`set_detected_date`] (detection runs under the
-/// caller's connection; the background paths split the two).
+/// Convenience wrapper: [`detect_date_iso`] then [`set_detected_date`] on one
+/// connection. Production paths (extraction, backfill) do not use it, since
+/// they detect with the database lock released; tests do.
 pub fn apply_detected_date(
     conn: &Connection,
     id: &str,
