@@ -368,6 +368,20 @@
     });
   }
 
+  // The browser's UTC offset (minutes east of UTC) for the day headings on
+  // the Documents list. Refreshed on every page load: it follows DST and travel.
+  function setTimeZoneCookie() {
+    try {
+      var secure = location.protocol === "https:" ? "; Secure" : "";
+      document.cookie =
+        "pm_tz=" +
+        -new Date().getTimezoneOffset() +
+        "; Path=/; SameSite=Lax; Max-Age=31536000" +
+        secure;
+    } catch (e) {}
+  }
+  setTimeZoneCookie();
+
   markStandalone();
 
   if (document.readyState === "loading") {

@@ -1,5 +1,7 @@
 mod common;
 
+use axum::body::Body;
+use axum::http::{Method, header};
 use common::*;
 use personal_media::user_db::{Channel, Level, document_overrides};
 use personal_media::web::docs::content_disposition;
@@ -817,7 +819,10 @@ async fn needs_transcription_filter_and_pagination_url() {
     assert!(checkbox_checked(&html));
     let all = body_string(t.get("/documents", &c).await).await;
     assert_eq!(all.matches("doc-item").count(), 2);
-    assert!(!checkbox_checked(&all));
+    // The filter lives on /search only; the list has no such control.
+    assert!(!all.contains("name=\"needs_transcription\""));
+    let search = body_string(t.get("/search", &c).await).await;
+    assert!(!checkbox_checked(&search));
 
     let u = t.state.sessions.get(&c.cookie).unwrap().unlocked;
     u.with_db(|conn| personal_media::user_db::set_transcription(conn, hw_id, "text", 5))
@@ -1112,4 +1117,89 @@ async fn search_pagination_keeps_sort_and_filters() {
     ] {
         assert!(next.contains(p), "{p} missing from {next}");
     }
+}
+
+#[tokio::test]
+async fn documents_page_has_no_search_form() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let html = body_string(t.get("/documents", &c).await).await;
+    assert!(!html.contains("role=\"search\""), "{html}");
+    assert!(!html.contains("id=\"q\""), "{html}");
+    assert!(!html.contains("name=\"tag\""), "{html}");
+    assert!(html.contains("id=\"dropzone\""), "{html}");
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[tokio::test]
+async fn documents_list_grouped_by_day() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    let fresh = upload_at(&t, &c, "fresh.txt", b"fresh", "").await;
+    let old = upload_at(&t, &c, "old.txt", b"old", "").await;
+    set_created(&t, &c, &fresh, now_secs());
+    let old_ts = now_secs() - 40 * 86_400;
+    set_created(&t, &c, &old, old_ts);
+    let html = body_string(t.get("/documents", &c).await).await;
+    let old_month = {
+        let d = time::OffsetDateTime::from_unix_timestamp(old_ts).unwrap();
+        format!("{} {}", d.month(), d.year())
+    };
+    let today = html
+        .find("<h2 class=\"day-group\">Today</h2>")
+        .expect(&html);
+    let month = html
+        .find(&format!("<h2 class=\"day-group\">{old_month}</h2>"))
+        .expect(&html);
+    assert!(today < month, "{html}");
+    assert!(
+        today < html.find(&format!("/documents/{fresh}")).unwrap()
+            && html.find(&format!("/documents/{fresh}")).unwrap() < month
+            && month < html.find(&format!("/documents/{old}")).unwrap(),
+        "{html}"
+    );
+    // One heading per group, not per row.
+    assert_eq!(html.matches("day-group").count(), 2, "{html}");
+    // Search results stay ungrouped.
+    let s = body_string(t.get("/search?tag=", &c).await).await;
+    assert!(!s.contains("day-group"), "{s}");
+}
+
+#[tokio::test]
+async fn day_groups_ignore_bad_tz_cookie() {
+    let t = TestApp::new();
+    let c = t.session_for("alice");
+    // 23:30 UTC yesterday is "Yesterday" in UTC but "Today" at +30.
+    let id = upload_at(&t, &c, "late.txt", b"late", "").await;
+    let now = now_secs();
+    let ts = now - now.rem_euclid(86_400) - 1_800;
+    set_created(&t, &c, &id, ts);
+    let get = |cookie: &'static str| {
+        let t = &t;
+        let c = &c;
+        async move {
+            let req = builder(Method::GET, "/documents", c)
+                .header(
+                    header::COOKIE,
+                    format!("__Host-pm_session={}; {cookie}", c.cookie),
+                )
+                .body(Body::empty())
+                .unwrap();
+            let resp = t.request(req).await;
+            assert_eq!(resp.status(), 200, "{cookie}");
+            body_string(resp).await
+        }
+    };
+    for bad in ["pm_tz=abc", "pm_tz=999999"] {
+        let html = get(bad).await;
+        assert!(html.contains(">Yesterday</h2>"), "{bad}: {html}");
+    }
+    let html = get("pm_tz=30").await;
+    assert!(html.contains(">Today</h2>"), "{html}");
 }

@@ -5,6 +5,9 @@
 {% else -%}
 <ul class="doc-list">
 {% for row in results.rows -%}
+{% if let Some(h) = row.heading -%}
+<li class="day-heading"><h2 class="day-group">{{ h }}</h2></li>
+{% endif -%}
 <li class="doc-item">
 <a class="doc-title" href="/documents/{{ row.id }}">{{ row.title }}</a>
 <div class="muted doc-meta">

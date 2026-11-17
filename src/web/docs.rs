@@ -595,6 +595,9 @@ struct Row {
     /// Search by meaning only: the relative match, 0-100.
     match_pct: Option<u32>,
     created_at: i64,
+    /// The day heading shown before this row (the Documents list only: set on
+    /// the first row of each group).
+    heading: Option<String>,
 }
 
 struct ResultsView {
@@ -618,13 +621,6 @@ struct ResultsPartial {
 struct DocumentsPage {
     page: Page,
     results: ResultsView,
-    tags: Vec<String>,
-    q: String,
-    tag: String,
-    from: String,
-    to: String,
-    needs_transcription: bool,
-    meaning: bool,
 }
 
 #[derive(Template)]
@@ -915,23 +911,17 @@ async fn list_page(
         let to = format!("/search?{}", raw.unwrap_or_default());
         return Redirect::to(&to).into_response();
     }
-    let (results, tags) = match run_query(&state, &session, &query, Surface::Documents).await {
+    let (mut results, _tags) = match run_query(&state, &session, &query, Surface::Documents).await {
         Ok(v) => v,
         Err(r) => return r,
     };
+    add_day_headings(&mut results.rows, now(), tz_offset_from(&headers));
     vary_htmx(if is_htmx(&headers) {
         render(&ResultsPartial { results })
     } else {
         render(&DocumentsPage {
             page: Page::for_session(&session),
             results,
-            tags,
-            q: String::new(),
-            tag: String::new(),
-            from: String::new(),
-            to: String::new(),
-            needs_transcription: false,
-            meaning: false,
         })
     })
 }
@@ -984,6 +974,55 @@ fn row_of(d: Document) -> Row {
         metadata_only: false,
         match_pct: None,
         created_at: d.created_at,
+        heading: None,
+    }
+}
+
+/// The browser's UTC offset in minutes east of UTC, from the `pm_tz` cookie.
+/// Anything that is not an integer within +-840 (UTC+14 / UTC-14 and a bit
+/// more) counts as UTC.
+fn tz_offset_from(headers: &HeaderMap) -> i32 {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|kv| kv.trim().strip_prefix("pm_tz="))
+        .and_then(|v| v.trim().parse::<i32>().ok())
+        .filter(|m| (-840..=840).contains(m))
+        .unwrap_or(0)
+}
+
+/// The Documents list heading for a document created at `created_at`, in the
+/// viewer's local days (`tz_offset_min`: minutes east of UTC): `Today`,
+/// `Yesterday`, `This week`, then `<Month> <YYYY>`. `This week` means the
+/// last 7 local days (today included) minus today and yesterday, so 2 to 6
+/// days back. A date in the future counts as today.
+fn day_group(created_at: i64, now: i64, tz_offset_min: i32) -> String {
+    let shift = i64::from(tz_offset_min) * 60;
+    let day = |ts: i64| (ts + shift).div_euclid(86_400);
+    match day(now) - day(created_at) {
+        ..=0 => "Today".to_owned(),
+        1 => "Yesterday".to_owned(),
+        2..=6 => "This week".to_owned(),
+        _ => {
+            let d = time::OffsetDateTime::from_unix_timestamp(created_at + shift)
+                .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+            format!("{} {}", d.month(), d.year())
+        }
+    }
+}
+
+/// Mark the first row of each run of equal headings. Per page of results, so
+/// a heading can repeat on the next page.
+fn add_day_headings(rows: &mut [Row], now: i64, tz_offset_min: i32) {
+    let mut last: Option<String> = None;
+    for row in rows {
+        let g = day_group(row.created_at, now, tz_offset_min);
+        if last.as_deref() != Some(&g) {
+            row.heading = Some(g.clone());
+            last = Some(g);
+        }
     }
 }
 
@@ -1442,6 +1481,59 @@ async fn set_access(
 #[cfg(test)]
 mod meaning_tests {
     use super::*;
+
+    /// 2026-11-17 12:28:00 UTC.
+    const NOW: i64 = 1_794_918_480;
+    const DAY: i64 = 86_400;
+
+    #[test]
+    fn day_group_labels() {
+        // Offset +60: local time is 13:28 on 2026-11-17.
+        assert_eq!(day_group(NOW, NOW, 60), "Today");
+        assert_eq!(day_group(NOW - 3600, NOW, 60), "Today");
+        assert_eq!(day_group(NOW - DAY, NOW, 60), "Yesterday");
+        assert_eq!(day_group(NOW - 3 * DAY, NOW, 60), "This week");
+        // "This week" is 2 to 6 local days back, today and yesterday excluded.
+        assert_eq!(day_group(NOW - 2 * DAY, NOW, 60), "This week");
+        assert_eq!(day_group(NOW - 6 * DAY, NOW, 60), "This week");
+        assert_eq!(day_group(NOW - 7 * DAY, NOW, 60), "November 2026");
+        assert_eq!(day_group(NOW - 40 * DAY, NOW, 60), "October 2026");
+        // A future date is today.
+        assert_eq!(day_group(NOW + 5 * DAY, NOW, 60), "Today");
+    }
+
+    #[test]
+    fn day_group_uses_the_local_day() {
+        // 23:30 UTC on the 16th is 01:30 on the 17th at +120: Today, and the
+        // UTC reading (Yesterday) differs.
+        let ts = NOW - 13 * 3600; // 2026-11-16 23:28 UTC
+        assert_eq!(day_group(ts, NOW, 0), "Yesterday");
+        assert_eq!(day_group(ts, NOW, 120), "Today");
+        // Month boundary in local time: 2026-11-30 23:30 UTC is 1 December at +60.
+        let nov30 = 1_796_081_400; // 2026-11-30 23:30 UTC
+        let later = nov30 + 20 * DAY;
+        assert_eq!(day_group(nov30, later, 0), "November 2026");
+        assert_eq!(day_group(nov30, later, 60), "December 2026");
+    }
+
+    #[test]
+    fn tz_cookie_parsing() {
+        let h = |v: &str| {
+            let mut m = HeaderMap::new();
+            m.insert(header::COOKIE, HeaderValue::from_str(v).unwrap());
+            m
+        };
+        assert_eq!(tz_offset_from(&HeaderMap::new()), 0);
+        assert_eq!(tz_offset_from(&h("a=b; pm_tz=60; c=d")), 60);
+        assert_eq!(tz_offset_from(&h("pm_tz=-300")), -300);
+        assert_eq!(tz_offset_from(&h("pm_tz=840")), 840);
+        assert_eq!(tz_offset_from(&h("pm_tz=841")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=-841")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=abc")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=999999")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=99999999999999999999")), 0);
+        assert_eq!(tz_offset_from(&h("pm_tz=")), 0);
+    }
 
     #[test]
     fn passage_cut_on_char_boundary_with_ellipsis() {

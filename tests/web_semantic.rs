@@ -322,7 +322,7 @@ async fn web_semantic_query_not_in_access_log() {
 #[tokio::test(flavor = "multi_thread")]
 async fn meaning_toggle_rendered() {
     let f = Fx::new(None);
-    let html = body_string(f.t.get("/documents", &f.c).await).await;
+    let html = body_string(f.t.get("/search", &f.c).await).await;
     assert!(
         html.contains("name=\"mode\" value=\"words\" checked"),
         "{html}"
@@ -336,7 +336,7 @@ async fn meaning_toggle_rendered() {
 #[tokio::test(flavor = "multi_thread")]
 async fn meaning_form_replaces_in_flight_requests() {
     let f = Fx::new(None);
-    let html = body_string(f.t.get("/documents", &f.c).await).await;
+    let html = body_string(f.t.get("/search", &f.c).await).await;
     let form = &html[html.find("<form class=\"search\"").unwrap()..];
     let form = &form[..form.find('>').unwrap()];
     assert!(form.contains("hx-sync=\"this:replace\""), "{form}");

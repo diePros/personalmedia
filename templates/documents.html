@@ -18,41 +18,6 @@
 <ul id="upload-status" class="upload-status" aria-live="polite"></ul>
 </section>
 
-<form class="search" method="get" action="/documents" role="search" hx-get="/documents" hx-target="#results" hx-push-url="false" hx-sync="this:replace">
-<div>
-<label for="q">Search</label>
-<input type="search" id="q" name="q" value="{{ q }}" autocomplete="off" hx-get="/documents" hx-trigger="input changed delay:300ms, search" hx-target="#results" hx-push-url="false" hx-include="closest form">
-</div>
-<div class="filters">
-<div>
-<label for="tag">Tag</label>
-<select id="tag" name="tag" hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
-<option value="">Any</option>
-{% for t in tags -%}
-<option value="{{ t }}"{% if *t == tag %} selected{% endif %}>{{ t }}</option>
-{% endfor -%}
-</select>
-</div>
-<div>
-<label for="from">From</label>
-<input type="date" id="from" name="from" value="{{ from }}" hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
-</div>
-<div>
-<label for="to">To</label>
-<input type="date" id="to" name="to" value="{{ to }}" hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form">
-</div>
-<div class="check">
-<label><input type="checkbox" name="needs_transcription" value="1"{% if needs_transcription %} checked{% endif %} hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Needs transcription</label>
-</div>
-</div>
-<fieldset class="mode">
-<legend>Search</legend>
-<div class="check"><label><input type="radio" name="mode" value="words"{% if !meaning %} checked{% endif %} hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Words</label></div>
-<div class="check"><label><input type="radio" name="mode" value="meaning"{% if meaning %} checked{% endif %} hx-get="/documents" hx-trigger="change" hx-target="#results" hx-push-url="false" hx-include="closest form"> Meaning</label></div>
-</fieldset>
-<button type="submit">Search</button>
-</form>
-
 <div id="results" aria-live="polite">
 {% include "_results.html" %}
 </div>
