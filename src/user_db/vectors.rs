@@ -8,6 +8,21 @@ use super::access::{Channel, Level, effective_level};
 use super::documents::{Document, ListFilter, load_tags, semantic_candidates};
 use crate::embed::{Chunk, MODEL};
 
+/// `text[start..end]` by character offsets, at most `max` characters long
+/// (cut on a char boundary); when cut, the last character is `…`.
+pub fn passage(text: &str, start: usize, end: usize, max: usize) -> String {
+    let end = end.max(start);
+    let mut it = text.chars().skip(start).take(end - start);
+    let out: String = it.by_ref().take(max).collect();
+    if it.next().is_none() || max == 0 {
+        return out;
+    }
+    // The ellipsis takes the last slot, so the cap holds.
+    let mut cut: String = out.chars().take(max - 1).collect();
+    cut.push('…');
+    cut
+}
+
 /// f32 little-endian.
 fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);

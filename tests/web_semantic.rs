@@ -289,7 +289,29 @@ async fn web_semantic_query_not_in_access_log() {
     let f = Fx::new(None);
     let (status, _) = f.search("q=Steuergeheimnis").await;
     assert_eq!(status, 200);
+    // The model path too: a real query that embeds and searches.
+    if let Some(m) = models_dir() {
+        let g = Fx::new(Some(m));
+        g.doc(
+            "tax.txt",
+            "The quarterly corporate tax return must be filed before the deadline.",
+            &[],
+            None,
+            F,
+            F,
+        )
+        .await;
+        let (status, html) = g.search("q=Geheimwort-Nachtigall").await;
+        assert_eq!(status, 200, "{html}");
+        assert!(html.contains("title of tax.txt"), "{html}");
+        let (status, _) = g.search("q=Geheimwort-Nachtigall&tag=Zaunkoenig").await;
+        assert_eq!(status, 200);
+    } else {
+        panic!("PM_TEST_MODELS_DIR must point at the test models (no SKIP allowed)");
+    }
     let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(!out.contains("Geheimwort"), "{out}");
+    assert!(!out.contains("Nachtigall"), "{out}");
     assert!(!out.contains("Steuergeheimnis"), "{out}");
     assert!(!out.contains("meaning"), "{out}");
     assert!(
@@ -311,4 +333,30 @@ async fn meaning_toggle_rendered() {
     assert!(html.contains("Meaning"), "{html}");
     // The toggle is part of the htmx-driven search form, history stays off.
     assert!(html.contains("hx-push-url=\"false\""));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn meaning_form_replaces_in_flight_requests() {
+    let f = Fx::new(None);
+    let html = body_string(f.t.get("/documents", &f.c).await).await;
+    let form = &html[html.find("<form class=\"search\"").unwrap()..];
+    let form = &form[..form.find('>').unwrap()];
+    assert!(form.contains("hx-sync=\"this:replace\""), "{form}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn meaning_empty_with_filters_says_no_matches_for_filters() {
+    let Some(m) = models_dir() else {
+        panic!("PM_TEST_MODELS_DIR must point at the test models (no SKIP allowed)");
+    };
+    let f = Fx::new(Some(m));
+    // Nothing is indexed and no filter: the index hint.
+    let (_, html) = f.search("q=cat").await;
+    assert!(html.contains("No documents are indexed"), "{html}");
+    // With a tag filter the hint must not claim that nothing is indexed.
+    let (_, html) = f.search("q=cat&tag=Steuer").await;
+    assert!(html.contains("No matches for these filters."), "{html}");
+    assert!(!html.contains("No documents are indexed"), "{html}");
+    let (_, html) = f.search("q=cat&from=2020-01-01").await;
+    assert!(html.contains("No matches for these filters."), "{html}");
 }

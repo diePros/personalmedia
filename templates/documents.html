@@ -12,7 +12,7 @@
 <ul id="upload-status" class="upload-status" aria-live="polite"></ul>
 </section>
 
-<form class="search" method="get" action="/documents" role="search" hx-get="/documents" hx-target="#results" hx-push-url="false">
+<form class="search" method="get" action="/documents" role="search" hx-get="/documents" hx-target="#results" hx-push-url="false" hx-sync="this:replace">
 <div>
 <label for="q">Search</label>
 <input type="search" id="q" name="q" value="{{ q }}" autocomplete="off" hx-get="/documents" hx-trigger="input changed delay:300ms, search" hx-target="#results" hx-push-url="false" hx-include="closest form">

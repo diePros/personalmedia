@@ -36,7 +36,7 @@ use crate::documents::{DocError, OnDuplicate, UploadMeta, validate_meta};
 use crate::keyring::Unlocked;
 use crate::user_db::documents::get_document_text;
 use crate::user_db::vectors::embed_status_words;
-use crate::user_db::vectors::{has_candidates, search as vectors_search};
+use crate::user_db::vectors::{has_candidates, passage, search as vectors_search};
 use crate::user_db::{
     AccessFilter, Channel, Document, Level, ListFilter, TextStatus, document_overrides,
     effective_level, get_access_defaults, get_document, list_documents, list_tags_visible, search,
@@ -546,6 +546,7 @@ struct DocumentsPage {
 
 const MEANING_NO_MODEL: &str = "Search by meaning isn't available yet. Turn on the semantic index in Settings → Access defaults (or per document); the model downloads on first indexing.";
 const MEANING_NO_INDEX: &str = "No documents are indexed for meaning search yet.";
+const MEANING_NO_MATCH: &str = "No matches for these filters.";
 const MEANING_BUSY: &str = "A search by meaning is already running. Try again in a moment.";
 /// Documents shown for a meaning query (no paging: every document has a score).
 const MEANING_LIMIT: usize = 20;
@@ -553,18 +554,6 @@ const MEANING_LIMIT: usize = 20;
 const MEANING_QUERY_MAX: usize = 1000;
 /// Longest passage shown, in characters.
 const MEANING_PASSAGE_MAX: usize = 300;
-
-/// `text[start..end]` by character offsets, cut to [`MEANING_PASSAGE_MAX`]
-/// characters (on a char boundary) with `…` appended when cut.
-fn passage_preview(text: &str, start: usize, end: usize) -> String {
-    let end = end.max(start);
-    let mut it = text.chars().skip(start).take(end - start);
-    let mut out: String = it.by_ref().take(MEANING_PASSAGE_MAX).collect();
-    if it.next().is_some() {
-        out.push('…');
-    }
-    out
-}
 
 /// A cosine score as a percentage. e5 scores are compressed (roughly
 /// 0.75-0.92 for related text), so this is only a relative indicator of how
@@ -619,13 +608,20 @@ async fn meaning_results(
     }
     filter.limit = 0;
     filter.offset = 0;
+    // With a tag or date filter, "nothing indexed" would mislead.
+    let filtered =
+        !filter.tags_all.is_empty() || filter.date_from.is_some() || filter.date_to.is_some();
     // Nothing visible: answer without loading the model.
     let f1 = filter.clone();
     let any = db(&session.unlocked, move |c| has_candidates(c, &f1))
         .await?
         .map_err(internal)?;
     if !any {
-        results.notice = Some(MEANING_NO_INDEX);
+        results.notice = Some(if filtered {
+            MEANING_NO_MATCH
+        } else {
+            MEANING_NO_INDEX
+        });
         return Ok(results);
     }
     let text: String = text.chars().take(MEANING_QUERY_MAX).collect();
@@ -646,7 +642,12 @@ async fn meaning_results(
         for (doc, score, chunk) in hits {
             let text = get_document_text(c, &doc.id)?.unwrap_or_default();
             rows.push(Row {
-                snippet: Some(escape_html(&passage_preview(&text, chunk.start, chunk.end))),
+                snippet: Some(escape_html(&passage(
+                    &text,
+                    chunk.start,
+                    chunk.end,
+                    MEANING_PASSAGE_MAX,
+                ))),
                 match_pct: Some(match_pct(score)),
                 ..row_of(doc)
             });
@@ -657,7 +658,11 @@ async fn meaning_results(
     .map_err(internal)?;
     if rows.is_empty() {
         // Every document with vectors scores; none means nothing is indexed.
-        results.notice = Some(MEANING_NO_INDEX);
+        results.notice = Some(if filtered {
+            MEANING_NO_MATCH
+        } else {
+            MEANING_NO_INDEX
+        });
     }
     results.rows = rows;
     Ok(results)
@@ -1212,10 +1217,14 @@ mod meaning_tests {
     #[test]
     fn passage_cut_on_char_boundary_with_ellipsis() {
         let text = "ä".repeat(400);
-        let p = passage_preview(&text, 0, 400);
-        assert_eq!(p.chars().count(), MEANING_PASSAGE_MAX + 1);
+        let p = passage(&text, 0, 400, MEANING_PASSAGE_MAX);
+        assert_eq!(p.chars().count(), MEANING_PASSAGE_MAX);
         assert!(p.ends_with('…'));
-        assert_eq!(passage_preview("abcdef", 1, 3), "bc");
+        // Exactly at the cap is not cut.
+        let exact = passage(&text, 0, MEANING_PASSAGE_MAX, MEANING_PASSAGE_MAX);
+        assert_eq!(exact.chars().count(), MEANING_PASSAGE_MAX);
+        assert!(!exact.ends_with('…'));
+        assert_eq!(passage("abcdef", 1, 3, MEANING_PASSAGE_MAX), "bc");
     }
 
     #[test]

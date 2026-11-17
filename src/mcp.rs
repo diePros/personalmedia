@@ -556,21 +556,6 @@ struct SemanticArgs {
     limit: Option<u32>,
 }
 
-/// `text[start..end]` by character offsets, cut to [`PASSAGE_MAX_CHARS`]
-/// with `…` appended when cut.
-fn passage(text: &str, start: usize, end: usize) -> String {
-    let end = end.max(start);
-    let mut it = text.chars().skip(start).take(end - start);
-    let out: String = it.by_ref().take(PASSAGE_MAX_CHARS).collect();
-    if it.next().is_none() {
-        return out;
-    }
-    // Total length stays within the cap: the ellipsis takes the last slot.
-    let mut cut: String = out.chars().take(PASSAGE_MAX_CHARS - 1).collect();
-    cut.push('…');
-    cut
-}
-
 async fn semantic_search(
     state: &AppState,
     p: &Principal,
@@ -636,7 +621,11 @@ async fn semantic_search(
             let mut docs = [doc];
             restrict_tags(&p2, c, &mut docs)?;
             let [doc] = docs;
-            out.push((doc, score, passage(&text, chunk.start, chunk.end)));
+            out.push((
+                doc,
+                score,
+                crate::user_db::vectors::passage(&text, chunk.start, chunk.end, PASSAGE_MAX_CHARS),
+            ));
         }
         Ok(out)
     })
