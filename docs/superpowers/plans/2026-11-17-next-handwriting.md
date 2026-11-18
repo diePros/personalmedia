@@ -83,7 +83,9 @@ Review focus for the milestone: memory bound on the N150, no plaintext page crop
   - Edge on iOS is labelled Safari. iPadOS with a desktop user agent is labelled Mac.
   - setup.md:250 still says `mem_limit: 1536m`; it is now `${MEM_LIMIT:-1536m}`.
 
-## Update after v1.6.3 (2026-11-18)
+## Update after v1.6.3 / v1.6.4 (2026-11-18)
+
+- **v1.6.3 has no image** (CI failed on two racy tests); **v1.6.4** is the same app with the tests fixed. CI runs `cargo test --release` at default parallelism, which exposes races the local `--test-threads=2` gate misses: loop new timing-sensitive tests before tagging.
 
 - **v1.6.2:** separate `/search` page (best match / newest), and `/documents` grouped by day (`pm_tz` cookie).
 - **v1.6.3:** automatic document dates.
