@@ -25,7 +25,7 @@ pub use devices::{
 };
 pub use documents::{
     DateSource, Document, ListFilter, NOTES_MAX_CHARS, NewDocument, SearchHit, TextSource,
-    TextStatus, apply_detected_date, backfill_detected_dates, backfill_mark_done,
+    TextStatus, apply_detected_date, backfill_detected_dates, backfill_is_done, backfill_mark_done,
     backfill_read_batch, backfill_write_batch, delete_document, detect_date_iso, find_by_sha256,
     find_by_sha256_visible, get_document, get_document_text, hidden_from, insert_document,
     insert_document_sourced, list_documents, list_tags, list_tags_visible, pending_document_ids,
