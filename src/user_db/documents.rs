@@ -756,6 +756,11 @@ pub fn backfill_mark_done(conn: &Connection) -> Result<()> {
     super::set_setting(conn, BACKFILL_KEY, BACKFILL_VALUE)
 }
 
+/// Whether the one-time backfill has finished for this index.
+pub fn backfill_is_done(conn: &Connection) -> Result<bool> {
+    Ok(super::get_setting(conn, BACKFILL_KEY)?.as_deref() == Some(BACKFILL_VALUE))
+}
+
 /// The one-time backfill in one go: dates every dateless document that has
 /// text, then marks the index done. Returns how many were dated; zero (and
 /// nothing touched) when it already ran.

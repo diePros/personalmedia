@@ -113,9 +113,14 @@ async fn search_partial_for_htmx() {
 }
 
 async fn wait_extracted(t: &TestApp, c: &Client, q: &str) {
+    wait_extracted_n(t, c, q, 1).await;
+}
+
+/// Waits until a words search for `q` finds at least `n` documents.
+async fn wait_extracted_n(t: &TestApp, c: &Client, q: &str, n: usize) {
     for _ in 0..100 {
         let html = body_string(t.hx_get(&format!("/search?q={q}"), c).await).await;
-        if html.contains("doc-item") {
+        if html.matches("class=\"doc-item\"").count() >= n {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -984,7 +989,7 @@ async fn search_words_best_match_then_newest() {
         "",
     )
     .await;
-    wait_extracted(&t, &c, "zebra").await;
+    wait_extracted_n(&t, &c, "zebra", 2).await;
     set_created(&t, &c, &old, 1_000_000);
     set_created(&t, &c, &new, 2_000_000);
     for url in ["/search?q=zebra", "/search?q=zebra&sort=best"] {

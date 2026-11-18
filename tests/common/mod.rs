@@ -137,6 +137,7 @@ impl TestApp {
             .accounts
             .signup(token, username, PASSWORD, now())
             .unwrap();
+        wait_date_backfill(&unlocked);
         let (cookie, csrf) = self
             .state
             .sessions
@@ -357,4 +358,19 @@ pub async fn wait_locked(keyring: &personal_media::keyring::Keyring, user_id: &s
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("user is still unlocked");
+}
+
+/// Waits (bounded) until the one-time date backfill that every unlock starts
+/// in the background has written its marker, so tests that measure the index
+/// (quota, WAL size) start from a settled state. Returns quietly after the
+/// bound when no backfill runs (e.g. an app built without the hook).
+pub fn wait_date_backfill(u: &personal_media::keyring::Unlocked) {
+    for _ in 0..200 {
+        if u.with_db(personal_media::user_db::backfill_is_done)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
